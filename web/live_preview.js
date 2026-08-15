@@ -3,6 +3,7 @@ import { api } from "../../scripts/api.js";
 
 const TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const DISK_JOIN_TARGET = "MiniMaxH3MotionContextDiskJoin";
+const EXTENDER_TARGET = "MiniMaxH3Extender";
 
 function stripFinalDecodeOutputs(node) {
     if (!node?.outputs?.length) return;
@@ -134,6 +135,86 @@ function mediaUrl(info) {
     return api.apiURL("/view?" + params.toString());
 }
 
+
+function findUpstreamExtenderId(node) {
+    const graph = node?.graph || app.graph;
+    if (!graph) return null;
+
+    const cacheInput = (node.inputs || []).find((input) => input?.name === "cache");
+    const linkId = cacheInput?.link;
+    if (linkId == null) return null;
+
+    const link = graph.links?.[linkId];
+    if (!link) return null;
+
+    const origin = graph.getNodeById?.(link.origin_id)
+        || (graph._nodes || []).find((n) => String(n?.id) === String(link.origin_id));
+    if (!origin) return null;
+
+    if (
+        origin?.comfyClass === EXTENDER_TARGET ||
+        origin?.type === EXTENDER_TARGET
+    ) {
+        return origin.id;
+    }
+
+    return null;
+}
+
+async function restorePreviewOnLoad(node, state, attempt = 0) {
+    if (!node || !state || state.liveLoaded || state.restoreLoaded) return;
+
+    const ownerId = findUpstreamExtenderId(node);
+    if (ownerId == null) {
+        // Workflow links may be restored a little after node.configure().
+        if (attempt < 12) {
+            setTimeout(() => restorePreviewOnLoad(node, state, attempt + 1), 80);
+        }
+        return;
+    }
+
+    if (state.restoreRequestRunning) return;
+    state.restoreRequestRunning = true;
+
+    try {
+        const params = new URLSearchParams();
+        params.set("owner_id", String(ownerId));
+        params.set("final_id", String(node.id));
+
+        const response = await fetch(
+            api.apiURL("/h3_extender/restored_preview?" + params.toString())
+        );
+        if (!response.ok) return;
+
+        const payload = await response.json();
+        if (!payload?.found || !payload?.video?.filename) return;
+        if (state.liveLoaded) return;
+
+        const clips = Number(payload.clip_count || 0);
+        const frames = Number(payload.frame_count || 0);
+        state.label.textContent =
+            `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
+
+        state.video.src = mediaUrl(payload.video) + "&t=" + Date.now();
+        state.video.load();
+
+        // Browsers can block autoplay after a page reload. The preview is still
+        // immediately visible and ready; play() succeeds when policy allows it.
+        state.video.play().catch(() => {});
+        state.restoreLoaded = true;
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                syncPlayerToNode(node, state, true);
+            });
+        });
+    } catch (_) {
+        // Startup preview is convenience only; never break workflow loading.
+    } finally {
+        state.restoreRequestRunning = false;
+    }
+}
+
 function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
     if (!node || !state?.widget) return;
 
@@ -232,6 +313,9 @@ function makePlayer(node) {
         video,
         widget: null,
         currentHeight: PLAYER_MIN_HEIGHT,
+        liveLoaded: false,
+        restoreLoaded: false,
+        restoreRequestRunning: false,
     };
 
     const widget = node.addDOMWidget("h3_live_preview", "preview", box, {
@@ -316,6 +400,7 @@ app.registerExtension({
                 requestAnimationFrame(() => {
                     stripFinalDecodeOutputs(this);
                     syncPlayerToNode(this, state, true);
+                    restorePreviewOnLoad(this, state);
                 });
             });
 
@@ -331,7 +416,11 @@ app.registerExtension({
                 : undefined;
 
             stripFinalDecodeOutputs(this);
-            requestAnimationFrame(() => stripFinalDecodeOutputs(this));
+            const state = makePlayer(this);
+            requestAnimationFrame(() => {
+                stripFinalDecodeOutputs(this);
+                restorePreviewOnLoad(this, state);
+            });
             return r;
         };
 
@@ -343,6 +432,7 @@ app.registerExtension({
             if (!info?.filename) return;
 
             const state = makePlayer(this);
+            state.liveLoaded = true;
             const meta = message?.h3_preview_info?.[0];
 
             if (meta?.mode === "clip_by_clip") {

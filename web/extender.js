@@ -206,6 +206,51 @@ function serializeState(state) {
     return JSON.stringify({ version: 1, clips: state.clips });
 }
 
+function validatedPrefixFromState(state) {
+    let count = 0;
+    for (const clip of state?.clips || []) {
+        if (!clip?.validated) break;
+        count += 1;
+    }
+    return count;
+}
+
+async function restoreCacheState(node, runtime) {
+    if (!node || !runtime || runtime.cacheStateRequestRunning) return;
+
+    runtime.cacheStateRequestRunning = true;
+    try {
+        const params = new URLSearchParams();
+        params.set("owner_id", String(node.id));
+        const response = await fetch(
+            api.apiURL("/h3_extender/cache_state?" + params.toString())
+        );
+        if (!response.ok) return;
+
+        const payload = await response.json();
+        if (!payload?.found) return;
+
+        // Do not overwrite live execution information if generation started
+        // while the startup request was in flight.
+        if (["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""))) {
+            return;
+        }
+
+        runtime.cachedCount = Number(payload.cached_count || 0);
+        runtime.validatedCount = Number(payload.validated_count || 0);
+        runtime.cacheStateRestored = true;
+        runtime.statusText =
+            `Restored cache | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
+            `validated ${runtime.validatedCount}`;
+        render(node, runtime);
+        node.graph?.setDirtyCanvas(true, true);
+    } catch (_) {
+        // Cache-state restoration is visual convenience only. Never block UI load.
+    } finally {
+        runtime.cacheStateRequestRunning = false;
+    }
+}
+
 function getWidget(node, name) {
     return node?.widgets?.find((w) => w?.name === name);
 }
@@ -645,6 +690,7 @@ function buildUi(node) {
 
     root.append(toolbar, cards);
 
+    const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
         state,
         jsonWidget,
@@ -655,11 +701,17 @@ function buildUi(node) {
         status,
         domWidget: null,
         domHeight: UI_MIN_HEIGHT,
-        cachedCount: 0,
-        validatedCount: 0,
-        statusText: "Ready",
+        // clips_json already preserves the validated flags. Seed the visual state
+        // immediately, then replace it with the authoritative disk manifest below.
+        cachedCount: restoredValidatedPrefix,
+        validatedCount: restoredValidatedPrefix,
+        statusText: restoredValidatedPrefix
+            ? `Restoring cache | validated ${restoredValidatedPrefix}`
+            : "Ready",
         activeClipIndex: -1,
         activePhase: "idle",
+        cacheStateRequestRunning: false,
+        cacheStateRestored: false,
         ready: false,
     };
 
@@ -688,7 +740,11 @@ function buildUi(node) {
             compactRefInputConnections(this);
             syncDynamicRefInputs(this);
             runtime.state = parseState(runtime.jsonWidget.value);
+            const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
+            runtime.cachedCount = restoredValidatedPrefix;
+            runtime.validatedCount = restoredValidatedPrefix;
             render(this, runtime);
+            restoreCacheState(this, runtime);
             syncDomHeight(this, runtime, true);
         });
     };
@@ -698,6 +754,7 @@ function buildUi(node) {
             compactRefInputConnections(node);
             syncDynamicRefInputs(node);
             runtime.ready = true;
+            restoreCacheState(node, runtime);
             syncDomHeight(node, runtime, true);
         });
     });
