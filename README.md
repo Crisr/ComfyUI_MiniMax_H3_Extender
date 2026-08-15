@@ -98,6 +98,8 @@ The intended workflow is therefore:
 
 This allows long MiniMax H3 sequences to be created progressively without repeatedly regenerating clips that are already approved.
 
+---
+
 # Installation
 
 ## ComfyUI Manager
