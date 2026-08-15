@@ -13,30 +13,30 @@ When using image references, it is strongly recommended to place a `subject_defi
 
 This helps MiniMax H3 keep the same subjects, identities, clothing, visual roles and even the environment associated with a reference image from one clip to the next.
 
-Example:
+### Example
 
-    subject_definitions:
-    <Picture 1> is the reference image defining the exact visual appearance, identity, face, hairstyle, body proportions, clothing, accessories, and overall look of <Subject 1>, as well as the established environment and visual context of the scene.
-    <Picture 2> is the reference image defining the exact visual appearance, identity, face, hairstyle, body proportions, clothing, accessories, and overall look of <Subject 2>.
-    <Subject 1> is the exact same woman shown in <Picture 1>.
-    <Subject 2> is her friend, the exact same woman shown in <Picture 2>.
-    <Subject 3> is the same street environment and scene context established in <Picture 1>.
+> **subject_definitions:**  
+> `<Picture 1>` is the reference image defining the exact visual appearance, identity, face, hairstyle, body proportions, clothing, accessories, and overall look of `<Subject 1>`, as well as the established environment and visual context of the scene.  
+> `<Picture 2>` is the reference image defining the exact visual appearance, identity, face, hairstyle, body proportions, clothing, accessories, and overall look of `<Subject 2>`.  
+> `<Subject 1>` is the exact same woman shown in `<Picture 1>`.  
+> `<Subject 2>` is her friend, the exact same woman shown in `<Picture 2>`.  
+> `<Subject 3>` is the same street environment and scene context established in `<Picture 1>`.
 
-Place this block at the very beginning of every clip prompt.
+Place this `subject_definitions` block at the **very beginning of every clip prompt**.
 
 The important point is that a reference image does not have to represent only a character.
 
-A reference can also define the environment, location or visual context of the sequence.
+A reference can also define the **environment, location or visual context** of the sequence.
 
 In the example above:
 
-    <Picture 1> → defines <Subject 1>
-    <Picture 2> → defines <Subject 2>
-    <Picture 1> → also defines the street environment used as <Subject 3>
+- `<Picture 1>` defines the appearance of `<Subject 1>`
+- `<Picture 2>` defines the appearance of `<Subject 2>`
+- `<Picture 1>` also defines the street environment used as `<Subject 3>`
 
-This makes it possible to keep the same characters while also preserving the environment established by one of the reference images across multiple clips.
+So the same reference image can be used both to preserve a character **and** to preserve the environment established by that image.
 
-The image references connected to the Extender are shared across the sequence, but repeating the `subject_definitions` block in every prompt helps MiniMax H3 understand exactly what each reference is supposed to represent in that specific clip.
+Repeating these definitions at the beginning of each clip prompt helps MiniMax H3 maintain the intended reference roles throughout the entire sequence.
 
 ## Features
 
