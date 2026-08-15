@@ -7,13 +7,11 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 ---
 <img width="2557" height="1212" alt="Capture d&#39;écran 2026-08-15 083401" src="https://github.com/user-attachments/assets/99ca1fc4-d8b9-4662-a869-1fa06e5e58e1" />
 
-## Keeping Image References Consistent Across Clips
+## Keeping References Consistent Across Clips
 
-When using image references, it is strongly recommended to define the subjects explicitly at the beginning of **every clip prompt**.
+When using image references, it is strongly recommended to place a `subject_definitions` block at the **beginning of every clip prompt**.
 
-MiniMax H3 does not automatically remember the semantic role of each reference from one prompt to the next.
-
-To keep the same characters, identities, clothing and environment consistent across multiple generated clips, repeat the same `subject_definitions` block at the beginning of each prompt.
+This helps MiniMax H3 keep the same subjects, identities, clothing, visual roles and even the environment associated with a reference image from one clip to the next.
 
 Example:
 
@@ -24,22 +22,21 @@ Example:
     <Subject 2> is her friend, the exact same woman shown in <Picture 2>.
     <Subject 3> is the same street environment and scene context established in <Picture 1>.
 
-This block should be placed at the **very beginning of every clip prompt**.
+Place this block at the very beginning of every clip prompt.
 
+The important point is that a reference image does not have to represent only a character.
 
-The definitions should stay identical from clip to clip unless you intentionally want to change the role of a reference.
+A reference can also define the environment, location or visual context of the sequence.
 
-This is especially important when several image references are connected.
+In the example above:
 
-For example:
+    <Picture 1> → defines <Subject 1>
+    <Picture 2> → defines <Subject 2>
+    <Picture 1> → also defines the street environment used as <Subject 3>
 
-    <Picture 1> → <Subject 1>
-    <Picture 2> → <Subject 2>
-    <Picture 3> → <Subject 3>
+This makes it possible to keep the same characters while also preserving the environment established by one of the reference images across multiple clips.
 
-Keeping these mappings explicit in every prompt helps MiniMax H3 preserve the intended identity and role of each reference throughout the whole sequence.
-
-The image references themselves are shared by the Extender across all clips. The `subject_definitions` block tells MiniMax H3 how those references should be interpreted in each individual clip.
+The image references connected to the Extender are shared across the sequence, but repeating the `subject_definitions` block in every prompt helps MiniMax H3 understand exactly what each reference is supposed to represent in that specific clip.
 
 ## Features
 
