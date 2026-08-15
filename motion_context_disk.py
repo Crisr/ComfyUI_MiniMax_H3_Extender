@@ -35,6 +35,13 @@ import comfy.nested_tensor
 import comfy.utils
 
 try:
+    from aiohttp import web
+    from server import PromptServer
+except Exception:  # static tests outside ComfyUI
+    web = None
+    PromptServer = None
+
+try:
     import folder_paths
 except Exception:  # static tests outside ComfyUI
     folder_paths = None
@@ -51,7 +58,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.17-clip-by-clip-autosave"
+BUILD = "motion-context-disk-v14.19-restore-clip-ui-state"
 CACHE_VERSION = 12
 
 class _FinalDecodeNativeProgress:
@@ -1760,6 +1767,185 @@ def _export_live_candidate_preview(
                     Path(p).unlink()
             except Exception:
                 pass
+
+
+
+def _restore_cached_preview_without_decode(owner_id, final_id):
+    """
+    Rebuild the current full preview using ONLY already cached decoded MP4 blobs.
+
+    This is used when ComfyUI starts and the workflow is restored. No sampler,
+    video VAE or audio VAE is executed. The cache owner is derived from the
+    upstream MiniMax H3 Extender node id.
+    """
+    owner = _safe_name(owner_id)
+    final = _safe_name(final_id)
+
+    data_path, manifest_path = _chain_paths(f"extender_{owner}")
+    if not data_path.exists() or not manifest_path.exists():
+        return None
+
+    manifest = _load_manifest_from_paths(data_path, manifest_path)
+    if manifest is None:
+        return None
+
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    if not segments:
+        return None
+
+    preview_path = _preview_temp_path(final)
+    committed_path = _decoded_preview_cache_path(data_path)
+    committed_count = int(manifest.get("preview_committed_count", 0))
+
+    # Fastest path: the persistent committed preview already contains every
+    # cached clip. Just republish it to ComfyUI temp for /view.
+    if committed_count >= len(segments) and committed_path.exists():
+        if preview_path.exists():
+            try:
+                preview_path.unlink()
+            except OSError:
+                pass
+        try:
+            os.link(committed_path, preview_path)
+        except Exception:
+            shutil.copy2(committed_path, preview_path)
+
+        return {
+            "path": preview_path,
+            "clip_count": int(len(segments)),
+            "frame_count": int(manifest.get("final_frame_count", 0)),
+            "fps": float(manifest.get("fps", FPS)),
+            "cache_mode": "committed_preview",
+        }
+
+    # Otherwise rebuild the full current preview from the per-clip decoded MP4
+    # blobs already stored inside .h3cache. This is a stream-copy operation only.
+    # It remains available even if the last clip was only a candidate when the
+    # application was closed.
+    root = _ensure_cache_root()
+    token = f"restore_{final}_{uuid.uuid4().hex[:8]}"
+    segment_files = []
+    concat_log = root / f"_{token}.log"
+    temp_preview = root / f"_{token}.mp4"
+
+    try:
+        for i, desc in enumerate(segments):
+            blob = desc.get("decoded_mp4_blob")
+            if blob is None:
+                # Old cache created before decoded candidate blobs existed:
+                # restoring it would require a VAE decode, which must never
+                # happen automatically just by opening ComfyUI.
+                return None
+
+            segment_path = root / f"_{token}_{i:04d}.mp4"
+            _copy_blob_to_file(data_path, blob, segment_path)
+            segment_files.append(segment_path)
+
+        ffmpeg = _find_ffmpeg()
+        _concat_mp4_stream_copy(
+            ffmpeg,
+            segment_files,
+            temp_preview,
+            concat_log,
+        )
+
+        if preview_path.exists():
+            try:
+                preview_path.unlink()
+            except OSError:
+                pass
+        os.replace(temp_preview, preview_path)
+
+        return {
+            "path": preview_path,
+            "clip_count": int(len(segments)),
+            "frame_count": int(manifest.get("final_frame_count", 0)),
+            "fps": float(manifest.get("fps", FPS)),
+            "cache_mode": "decoded_blobs",
+        }
+    finally:
+        for tmp in segment_files:
+            try:
+                if Path(tmp).exists():
+                    Path(tmp).unlink()
+            except OSError:
+                pass
+        for tmp in (temp_preview, concat_log, concat_log.with_suffix(".concat.txt")):
+            try:
+                if Path(tmp).exists():
+                    Path(tmp).unlink()
+            except OSError:
+                pass
+
+
+if web is not None and PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.get("/h3_extender/cache_state")
+    async def h3_extender_cache_state(request):
+        """Restore Extender card cache/validation UI state without execution."""
+        owner_id = request.query.get("owner_id", "")
+        if not owner_id:
+            return web.json_response({"found": False, "reason": "missing_id"})
+
+        try:
+            data_path, manifest_path = _chain_paths(
+                f"extender_{_safe_name(owner_id)}"
+            )
+            if not data_path.exists() or not manifest_path.exists():
+                return web.json_response({"found": False})
+
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if manifest is None:
+                return web.json_response({"found": False})
+
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            validated_count = _validated_prefix_count(segments)
+            return web.json_response({
+                "found": True,
+                "cached_count": int(len(segments)),
+                "validated_count": int(validated_count),
+                "frame_count": int(manifest.get("final_frame_count", 0)),
+            })
+        except Exception as exc:
+            _LOG.warning("H3 restore Extender cache state failed: %s", exc)
+            return web.json_response({
+                "found": False,
+                "reason": "restore_failed",
+            })
+
+    @PromptServer.instance.routes.get("/h3_extender/restored_preview")
+    async def h3_extender_restored_preview(request):
+        """
+        Frontend startup helper. It exposes only the deterministic cache belonging
+        to an Extender node id; it never accepts an arbitrary filesystem path.
+        """
+        owner_id = request.query.get("owner_id", "")
+        final_id = request.query.get("final_id", "")
+        if not owner_id or not final_id:
+            return web.json_response({"found": False, "reason": "missing_id"})
+
+        try:
+            restored = _restore_cached_preview_without_decode(owner_id, final_id)
+            if restored is None:
+                return web.json_response({"found": False})
+
+            item = _comfy_media_item(
+                restored["path"],
+                restored["fps"],
+                "temp",
+            )
+            return web.json_response({
+                "found": True,
+                "video": item,
+                "clip_count": restored["clip_count"],
+                "frame_count": restored["frame_count"],
+                "cache_mode": restored["cache_mode"],
+            })
+        except Exception as exc:
+            _LOG.warning("H3 restore preview on load failed: %s", exc)
+            return web.json_response({
+                "found": False,
+                "reason": "restore_failed",
+            })
 
 
 

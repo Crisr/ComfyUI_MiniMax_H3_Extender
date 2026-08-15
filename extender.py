@@ -37,7 +37,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.17-clip-by-clip-autosave"
+BUILD = "minimax-h3-extender-v14.19-restore-clip-ui-state"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
