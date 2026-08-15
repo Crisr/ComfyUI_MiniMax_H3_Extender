@@ -51,7 +51,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.13-no-outputs-migration"
+BUILD = "motion-context-disk-v14.17-clip-by-clip-autosave"
 CACHE_VERSION = 12
 
 class _FinalDecodeNativeProgress:
@@ -896,6 +896,29 @@ def _next_output_path(output_dir, prefix, extension):
         if not p.exists():
             return p
     raise RuntimeError("Disk Final Decode: could not allocate output filename.")
+
+
+def _replace_output_from_preview(preview_path, output_dir, filename_prefix):
+    """Atomically update the clip-by-clip autosave from the current full preview.
+
+    The progressive preview is already a complete H.264/AAC MP4 containing the
+    validated prefix plus the current candidate. Reusing it avoids any second
+    VAE decode or sampling pass just to persist the current sequence.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    destination = output_dir / f"{_safe_name(filename_prefix)}.mp4"
+    tmp = output_dir / f".{destination.name}.{uuid.uuid4().hex[:10]}.tmp"
+    try:
+        shutil.copy2(Path(preview_path), tmp)
+        os.replace(tmp, destination)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    return destination
 
 
 def _start_video_encoder(ffmpeg, temp_video, width, height, fps, codec, crf, preset, log_path):
@@ -1790,14 +1813,21 @@ class MiniMaxH3MotionContextDiskFinalDecode:
 
         ffmpeg = _find_ffmpeg()
 
-        # clip_by_clip = immediate current-clip preview only.
-        # This is deliberately BEFORE the full-chain export path, otherwise a
-        # 50-clip validated prefix would be re-decoded every time clip 51 is tested.
+        if str(output_directory).strip():
+            out_dir = Path(str(output_directory).strip()).expanduser().resolve()
+        elif folder_paths is not None:
+            out_dir = Path(folder_paths.get_output_directory()).resolve()
+        else:
+            out_dir = (Path.cwd() / "output").resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # clip_by_clip keeps its fast progressive-preview path, but now also
+        # persists that complete current sequence after every rendered clip.
+        # The already encoded preview is reused directly: no extra sampling and
+        # no second VAE decode are performed for the autosave.
         effective_mode = str(cache.get("run_mode", "full_batch")) if isinstance(cache, dict) else "full_batch"
         if effective_mode == "clip_by_clip":
-            # Start at 20% immediately; _render_one_final_segment advances once
-            # after the real video VAE decode and once after the real audio decode.
-            progress = _FinalDecodeNativeProgress(unique_id, total=5)
+            progress = _FinalDecodeNativeProgress(unique_id, total=6)
             (
                 preview_path,
                 last_frame,
@@ -1818,6 +1848,14 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 progress=progress,
             )
             progress.advance()  # preview encode/cache/concat completed
+
+            # Keep one continuously updated real file in the requested output
+            # directory.  Re-rendering the same candidate replaces it atomically,
+            # so clip-by-clip testing never creates a pile of numbered files.
+            autosave_path = _replace_output_from_preview(
+                preview_path, out_dir, filename_prefix
+            )
+            progress.advance()
 
             total_frames = int(manifest.get("final_frame_count", 0))
             total_duration = float(total_frames / float(fps))
@@ -1841,18 +1879,11 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         "cache_mode": str(preview_cache_mode),
                         "preview_frames": int(preview_frames),
                         "total_clips": int(len(segments)),
+                        "autosave_path": str(autosave_path),
                     }],
                 },
                 "result": (),
             }
-
-        if str(output_directory).strip():
-            out_dir = Path(str(output_directory).strip()).expanduser().resolve()
-        elif folder_paths is not None:
-            out_dir = Path(folder_paths.get_output_directory()).resolve()
-        else:
-            out_dir = (Path.cwd() / "output").resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
 
         extension = "mkv" if str(codec) == "FFV1 lossless" else "mp4"
         output_path = _next_output_path(out_dir, filename_prefix, extension)
