@@ -7,6 +7,40 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 ---
 <img width="2557" height="1212" alt="Capture d&#39;écran 2026-08-15 083401" src="https://github.com/user-attachments/assets/99ca1fc4-d8b9-4662-a869-1fa06e5e58e1" />
 
+## Keeping Image References Consistent Across Clips
+
+When using image references, it is strongly recommended to define the subjects explicitly at the beginning of **every clip prompt**.
+
+MiniMax H3 does not automatically remember the semantic role of each reference from one prompt to the next.
+
+To keep the same characters, identities, clothing and environment consistent across multiple generated clips, repeat the same `subject_definitions` block at the beginning of each prompt.
+
+Example:
+
+    subject_definitions:
+    <Picture 1> is the reference image defining the exact visual appearance, identity, face, hairstyle, body proportions, clothing, accessories, and overall look of <Subject 1>, as well as the established environment and visual context of the scene.
+    <Picture 2> is the reference image defining the exact visual appearance, identity, face, hairstyle, body proportions, clothing, accessories, and overall look of <Subject 2>.
+    <Subject 1> is the exact same woman shown in <Picture 1>.
+    <Subject 2> is her friend, the exact same woman shown in <Picture 2>.
+    <Subject 3> is the same street environment and scene context established in <Picture 1>.
+
+This block should be placed at the **very beginning of every clip prompt**.
+
+
+The definitions should stay identical from clip to clip unless you intentionally want to change the role of a reference.
+
+This is especially important when several image references are connected.
+
+For example:
+
+    <Picture 1> → <Subject 1>
+    <Picture 2> → <Subject 2>
+    <Picture 3> → <Subject 3>
+
+Keeping these mappings explicit in every prompt helps MiniMax H3 preserve the intended identity and role of each reference throughout the whole sequence.
+
+The image references themselves are shared by the Extender across all clips. The `subject_definitions` block tells MiniMax H3 how those references should be interpreted in each individual clip.
+
 ## Features
 
 - Multi-clip MiniMax H3 generation
