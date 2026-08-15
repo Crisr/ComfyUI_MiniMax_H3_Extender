@@ -58,7 +58,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.19-restore-clip-ui-state"
+BUILD = "motion-context-disk-v14.23-strict-comfy-compat"
 CACHE_VERSION = 12
 
 class _FinalDecodeNativeProgress:

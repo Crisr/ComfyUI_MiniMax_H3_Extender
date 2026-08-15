@@ -11,12 +11,14 @@ The implementation follows the public H3 Motion Context research by
 NikoDemon80, but removes disk Save/Load because this workflow keeps clip A
 and clip B in the same ComfyUI DAG.
 """
+import inspect
 import logging
 import math
 
 import torch
 import node_helpers
 import comfy.nested_tensor
+import comfy.ldm.minimax.model as minimax_model
 
 from .patch_motion_layout import (
     MC_KEY,
@@ -34,11 +36,31 @@ AUDIO_HZ = 40.0
 FRAME_RESCALE = 5.0 / 3.0
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 
-BUILD = "motion-context-ram-v14.2-padded-cond"
+BUILD = "motion-context-ram-v14.23-native-api-compat-only"
 _LOG = logging.getLogger("minimax_h3_tail_from_latent.motion_context")
 
 
+def _native_guide_api_supported():
+    """Detect ComfyUI's native arbitrary MiniMax H3 guide API.
+
+    Older builds expose PackedLayout(..., frame_count=...) and need the
+    compatibility patches below. Newer builds removed frame_count and accept
+    arbitrary resolved_frame_index values directly.
+    """
+    cls = getattr(minimax_model, "PackedLayout", None)
+    if cls is None:
+        return False
+    try:
+        params = inspect.signature(cls.__init__).parameters
+    except Exception:
+        return False
+    return "frame_count" not in params
+
+
 def _ensure_patches():
+    if _native_guide_api_supported():
+        return "native"
+
     if not _layout_patch_applied():
         if not _apply_layout_patch():
             raise RuntimeError(
@@ -52,6 +74,7 @@ def _ensure_patches():
                 "MiniMax H3 Motion Context RAM: could not enable Ref2VA "
                 "keyframe/reference coexistence. Check the ComfyUI log."
             )
+    return "compat"
 
 
 def _streams_from_latent(latent, name):
@@ -601,7 +624,7 @@ class MiniMaxH3MotionContextRAM:
         context_length,
         audio_context_length,
     ):
-        _ensure_patches()
+        guide_api = _ensure_patches()
 
         target_video, _ = _streams_from_latent(
             latent, "latent"
@@ -650,21 +673,26 @@ class MiniMaxH3MotionContextRAM:
                 block,
                 target_video,
             )
-            keyframes.append(
-                {
-                    # Stock H3 only accepts first/last here. The real temporal
-                    # coordinate rides in MC_KEY and is rewritten after stock
-                    # PackedLayout construction.
-                    "resolved_frame_index": 0,
-                    MC_KEY: int(pixel_index),
-                    "latent": block,
-                }
-            )
-
-        values = {
-            "minimax_keyframes": keyframes,
-            "minimax_frame_count": int(target_frame_count),
-        }
+            if guide_api == "native":
+                # Same one-token block, same pixel offset, same order as v14.21.
+                # New ComfyUI can express the interior anchor directly.
+                keyframes.append(
+                    {
+                        "resolved_frame_index": int(pixel_index),
+                        "latent": block,
+                    }
+                )
+            else:
+                keyframes.append(
+                    {
+                        # Old stock H3 only accepts first/last here. The exact
+                        # temporal coordinate rides in MC_KEY and is rewritten
+                        # after stock PackedLayout construction.
+                        "resolved_frame_index": 0,
+                        MC_KEY: int(pixel_index),
+                        "latent": block,
+                    }
+                )
 
         # Carry audio from the SAME previous sampled AV latent.
         a_frames = int(audio_context_length) or span
@@ -672,27 +700,52 @@ class MiniMaxH3MotionContextRAM:
             context_latent, a_frames
         )
 
-        audio_ref = {
-            "kind": "audio",
-            "ref_audio_t": int(audio_t),
-            "audio_latent": audio_latent,
-        }
-
-        # The carried audio must END where the carried picture ends on the
-        # new clip timeline. Snap to H3's integer audio grid (40 Hz).
+        # EXACT v14.21 end-alignment calculation.
         end_frame = float(span) + overhang / FRAME_RESCALE
         end_coord = round(FRAME_RESCALE * end_frame)
         end_frame = end_coord / FRAME_RESCALE
-        audio_ref[MC_AUDIO_KEY] = float(end_frame)
 
-        out = node_helpers.conditioning_set_values(
-            conditioning, values
-        )
-        out = node_helpers.conditioning_set_values(
-            out,
-            {"minimax_refs": [audio_ref]},
-            append=True,
-        )
+        if guide_api == "native":
+            # New PackedLayout starts native guide audio at:
+            # target_origin + FRAME_RESCALE * resolved_frame_index.
+            # Choose the start index so its END is exactly the same position
+            # as v14.21's _fixup_audio():
+            # target_origin + FRAME_RESCALE * end_frame - audio_t.
+            audio_start_frame = (
+                float(end_frame)
+                - float(audio_t) / FRAME_RESCALE
+            )
+            keyframes.append(
+                {
+                    "resolved_frame_index": float(audio_start_frame),
+                    "audio_latent": audio_latent,
+                }
+            )
+            out = node_helpers.conditioning_set_values(
+                conditioning,
+                {"minimax_keyframes": keyframes},
+            )
+        else:
+            values = {
+                "minimax_keyframes": keyframes,
+                "minimax_frame_count": int(target_frame_count),
+            }
+
+            audio_ref = {
+                "kind": "audio",
+                "ref_audio_t": int(audio_t),
+                "audio_latent": audio_latent,
+            }
+            audio_ref[MC_AUDIO_KEY] = float(end_frame)
+
+            out = node_helpers.conditioning_set_values(
+                conditioning, values
+            )
+            out = node_helpers.conditioning_set_values(
+                out,
+                {"minimax_refs": [audio_ref]},
+                append=True,
+            )
 
         _LOG.info(
             "MiniMax H3 Motion Context RAM: %d video frames -> %d latent "
