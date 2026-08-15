@@ -38,6 +38,8 @@ So the same reference image can be used both to preserve a character **and** to 
 
 Repeating these definitions at the beginning of each clip prompt helps MiniMax H3 maintain the intended reference roles throughout the entire sequence.
 
+---
+
 ## Features
 
 - Multi-clip MiniMax H3 generation
