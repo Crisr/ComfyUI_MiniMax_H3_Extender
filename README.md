@@ -96,3 +96,25 @@ The intended workflow is therefore:
     Generate → Preview → Retry if needed → Validate → Continue
 
 This allows long MiniMax H3 sequences to be created progressively without repeatedly regenerating clips that are already approved.
+
+# Installation
+
+## ComfyUI Manager
+
+Search for:
+
+    MiniMax H3 Extender
+
+and install it directly from ComfyUI Manager.
+
+## Manual Installation
+
+Open a terminal in:
+
+    ComfyUI/custom_nodes/
+
+Then run:
+
+    git clone https://github.com/tritant/ComfyUI_MiniMax_H3_Extender.git
+
+Restart ComfyUI after installation.
