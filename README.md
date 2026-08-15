@@ -5,6 +5,7 @@ A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous v
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
 
 ---
+<img width="2557" height="1212" alt="Capture d&#39;écran 2026-08-15 083401" src="https://github.com/user-attachments/assets/99ca1fc4-d8b9-4662-a869-1fa06e5e58e1" />
 
 ## Features
 
