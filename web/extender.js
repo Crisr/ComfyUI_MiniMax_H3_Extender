@@ -4,39 +4,26 @@ import { api } from "../../scripts/api.js";
 const TARGET = "MiniMaxH3Extender";
 const PROGRESS_EVENT = "h3_extender_progress";
 const CARD_WIDTH = 318;
-const UI_MIN_HEIGHT = 430;
+const UI_MIN_HEIGHT = 460;
+const NODES2_MIN_HEIGHT = 510;
+// Keep a real visual gap between the native Nodes 2.0 widgets and the CLIP
+// panel. This is internal padding only: we deliberately do NOT rewrite Vue
+// grid tracks or absolutely position the DOM widget.
+const NODES2_TOP_GAP = 28;
 const NODE_MIN_WIDTH = 980;
 const BOTTOM_PAD = 16;
+// Leave an empty gutter under each card so an overlay horizontal scrollbar
+// never covers the Validated/footer row.
+const CARD_SCROLLBAR_SPACE = 24;
+const CARD_MIN_HEIGHT = 355;
+const NODES2_CARDS_MIN_HEIGHT = CARD_MIN_HEIGHT + CARD_SCROLLBAR_SPACE;
 const MAX_IMAGE_REFS = 9;
 
-const INVALIDATING_WIDGETS = new Set([
-    "width",
-    "height",
-    "ref_image_size",
-    "steps",
-    "sampler_name",
-    "scheduler",
-    "denoise",
-    "context_length",
-    "audio_context_length",
-]);
-
-const INVALIDATING_INPUTS = new Set([
-    "model",
-    "clip",
-    "vae",
-    "audio_vae",
-    "ref_audio",
-    "ref_1",
-    "ref_2",
-    "ref_3",
-    "ref_4",
-    "ref_5",
-    "ref_6",
-    "ref_7",
-    "ref_8",
-    "ref_9",
-]);
+// Validation is intentionally explicit. Generation parameters and input
+// connections may be changed at any time without touching already validated
+// clips. To regenerate an accepted clip, the user explicitly unchecks its
+// Validated box; that is the ONLY action that invalidates that clip and every
+// dependent clip after it.
 
 
 function isRefInputName(name) {
@@ -255,9 +242,29 @@ function getWidget(node, name) {
     return node?.widgets?.find((w) => w?.name === name);
 }
 
-function hideNativeWidget(widget) {
+// Nodes 2.0 (Vue) can render the native multiline STRING row before our
+// onNodeCreated code gets a chance to touch the widget object. Hide that row
+// pre-emptively with CSS, using the same proven strategy as ComfyUI_Stem_Mixer.
+// MiniMaxH3Extender has a single native textarea: clips_json.
+(function injectClipsJsonHideRule() {
+    if (document.getElementById("h3-extender-hide-clips-json")) return;
+    const style = document.createElement("style");
+    style.id = "h3-extender-hide-clips-json";
+    style.textContent = `
+        .lg-node-widget:has(> [node-type="${TARGET}"] > textarea) {
+            display: none !important;
+        }
+    `;
+    document.head.appendChild(style);
+})();
+
+function hideNativeWidget(node, widget) {
     if (!widget) return;
-    widget.hidden = true;
+
+    // LiteGraph / Nodes 1.0: remove the logical footprint but keep the widget
+    // itself intact so its normal workflow serialization continues to work.
+    // Do NOT use canvasOnly/hidden here: Vue does not reliably honour those
+    // flags for native widgets, while the pre-emptive CSS above does.
     widget.computeSize = () => [0, -4];
     widget.computeLayoutSize = () => ({
         minWidth: 0,
@@ -265,6 +272,49 @@ function hideNativeWidget(widget) {
         maxWidth: 0,
         maxHeight: 0,
     });
+
+    // LiteGraph may recreate the textarea when the node leaves/re-enters the
+    // viewport, so re-hide the actual legacy DOM element on every foreground
+    // draw, exactly as Stem Mixer does for its state widget.
+    const oldDrawForeground = node?.onDrawForeground;
+    if (node) {
+        node.onDrawForeground = function (ctx) {
+            if (oldDrawForeground) oldDrawForeground.apply(this, arguments);
+            const inputEl = widget.inputEl;
+            if (inputEl) {
+                if (inputEl.style.display !== "none") inputEl.style.display = "none";
+                const parent = inputEl.parentElement;
+                if (parent && parent.style.display !== "none") {
+                    parent.style.display = "none";
+                }
+            }
+        };
+    }
+}
+
+function domWidgetRenderMode(element) {
+    // ComfyUI exposes the renderer state on LiteGraph.vueNodesMode. Use that
+    // as the authority, but wait while the DOM widget is being re-parented so
+    // we never apply Legacy sizing with a stale Vue last_y (or vice versa).
+    const LG = globalThis.LiteGraph;
+    const hasModeFlag = typeof LG?.vueNodesMode === "boolean";
+    if (!element?.isConnected) return "pending";
+
+    const insideVueRow = Boolean(element.closest?.(".lg-node-widget"));
+    if (hasModeFlag) {
+        if (LG.vueNodesMode && !insideVueRow) return "pending";
+        if (!LG.vueNodesMode && insideVueRow) return "pending";
+        return LG.vueNodesMode ? "nodes2" : "legacy";
+    }
+
+    // Older frontends may not expose vueNodesMode; fall back to the wrapper.
+    return insideVueRow ? "nodes2" : "legacy";
+}
+
+function obviouslyPoisonedHeight(height, minimumHeight) {
+    const h = Number(height);
+    if (!Number.isFinite(h) || h <= 0) return false;
+    return h > Math.max(1800, Number(minimumHeight || 0) * 3);
 }
 
 function invalidateFrom(state, index) {
@@ -272,6 +322,7 @@ function invalidateFrom(state, index) {
         state.clips[i].validated = false;
     }
 }
+
 
 function advanceSeedAfterGenerate(clip) {
     const mode = String(clip?.seed_mode || "randomize");
@@ -359,7 +410,7 @@ function render(node, runtime) {
         card.style.border = "1px solid rgba(255,255,255,.13)";
         card.style.display = "flex";
         card.style.flexDirection = "column";
-        card.style.minHeight = "355px";
+        card.style.minHeight = `${CARD_MIN_HEIGHT}px`;
 
         const st = cardStatus(runtime, clip, index);
         if (st === "rendering") {
@@ -425,7 +476,6 @@ function render(node, runtime) {
         prompt.addEventListener("input", () => {
             if (prompt.value === clip.prompt) return;
             clip.prompt = prompt.value;
-            invalidateFrom(state, index);
             updateHidden(node, runtime);
             // Do not rebuild the DOM while typing: that would steal focus.
         });
@@ -449,7 +499,6 @@ function render(node, runtime) {
             const v = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(Number(seed.value || 0))));
             if (v !== clip.seed) {
                 clip.seed = v;
-                invalidateFrom(state, index);
                 updateHidden(node, runtime);
                 render(node, runtime);
             }
@@ -461,7 +510,6 @@ function render(node, runtime) {
         dice.addEventListener("click", (e) => {
             e.preventDefault();
             clip.seed = randomSeed();
-            invalidateFrom(state, index);
             updateHidden(node, runtime);
             render(node, runtime);
         });
@@ -503,7 +551,6 @@ function render(node, runtime) {
             const v = Math.max(0.25, Math.min(150, Number(duration.value || 10)));
             if (Math.abs(v - clip.duration) > 1e-9) {
                 clip.duration = v;
-                invalidateFrom(state, index);
                 updateHidden(node, runtime);
                 render(node, runtime);
             }
@@ -558,43 +605,149 @@ function render(node, runtime) {
 }
 
 function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
-    const y = Number(runtime.domWidget?.last_y);
-    if (!Number.isFinite(y) || y <= 0) {
-        if (retry < 5) requestAnimationFrame(() => syncDomHeight(node, runtime, forceMin, retry + 1));
+    if (!node || !runtime?.domWidget || runtime.syncingDomHeight) return;
+
+    const mode = domWidgetRenderMode(runtime.root);
+    if (mode === "pending") {
+        if (retry < 12) {
+            requestAnimationFrame(() => syncDomHeight(node, runtime, forceMin, retry + 1));
+        }
         return;
     }
 
-    let w = Math.max(NODE_MIN_WIDTH, Number(node.size?.[0] || NODE_MIN_WIDTH));
-    let h = Number(node.size?.[1] || 0);
-    const minNodeH = y + UI_MIN_HEIGHT + BOTTOM_PAD;
-    if (forceMin && h < minNodeH) h = minNodeH;
-    if (w !== Number(node.size?.[0]) || h !== Number(node.size?.[1])) node.setSize([w, h]);
+    // Nodes 2.0 owns the DOM-widget row height. Never derive a new getHeight
+    // value from node.size here: node.size -> DOM getHeight -> node.size is the
+    // feedback loop that created the infinite-height nodes.
+    if (mode === "nodes2") {
+        const currentH = Number(node.size?.[1] || 0);
+        const y = Number(runtime.domWidget.last_y);
+        const fallbackH = Number.isFinite(y) && y > 0
+            ? y + NODES2_MIN_HEIGHT + BOTTOM_PAD
+            : NODES2_MIN_HEIGHT + 180;
 
-    const available = Math.max(UI_MIN_HEIGHT, Number(node.size?.[1] || h) - y - BOTTOM_PAD);
-    runtime.root.style.height = `${available}px`;
-    runtime.cards.style.height = `${Math.max(340, available - 55)}px`;
-    runtime.domHeight = available;
-    runtime.domWidget.getHeight = () => runtime.domHeight;
-    if (runtime.domWidget.options) runtime.domWidget.options.getHeight = () => runtime.domHeight;
-    node.graph?.setDirtyCanvas(true, true);
+        // One-time recovery for workflows that were already saved with a
+        // runaway height by an older build. This is not DOM-driven resizing;
+        // it only removes a clearly corrupted value.
+        if (
+            runtime.lastRenderMode !== "nodes2" &&
+            obviouslyPoisonedHeight(currentH, fallbackH)
+        ) {
+            runtime.syncingDomHeight = true;
+            try {
+                const rememberedLegacyH = Number(runtime.legacyNodeHeight);
+                const targetH = (
+                    Number.isFinite(rememberedLegacyH) &&
+                    !obviouslyPoisonedHeight(rememberedLegacyH, fallbackH)
+                )
+                    ? Math.max(fallbackH, rememberedLegacyH)
+                    : fallbackH;
+                const targetW = Math.max(
+                    NODE_MIN_WIDTH,
+                    Number(node.size?.[0] || NODE_MIN_WIDTH)
+                );
+                node.setSize([targetW, targetH]);
+            } finally {
+                runtime.syncingDomHeight = false;
+            }
+        }
+
+        runtime.lastRenderMode = "nodes2";
+
+        // Nodes 2.0 mounts this element inside WidgetDOM.vue's flex wrapper
+        // (`flex flex-col *:flex-1`) and NodeWidgets.vue owns the grid row.
+        // Do NOT use percentage heights here. A `height: 100%` has no stable
+        // intrinsic size while CSS Grid is resolving an `auto` row; after a
+        // manual resize that row can collapse to 0 and WidgetDOM will not
+        // remount the element until a page refresh. Keep a real intrinsic
+        // minimum instead and let Vue stretch the row/child naturally.
+        runtime.root.style.height = "auto";
+        runtime.root.style.minHeight = `${NODES2_MIN_HEIGHT}px`;
+        runtime.root.style.setProperty("--comfy-widget-min-height", `${NODES2_MIN_HEIGHT}px`);
+        runtime.root.style.maxHeight = "none";
+        runtime.root.style.flex = "1 1 auto";
+        runtime.root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
+        // Avoid a second vertical clipping boundary at fractional canvas zooms.
+        // Horizontal clipping/scrolling is still owned by `cards`.
+        runtime.root.style.overflow = "visible";
+
+        runtime.cards.style.height = "auto";
+        runtime.cards.style.flex = "1 1 auto";
+        // The horizontal scrollbar has reserved space below the cards. Give the
+        // row enough intrinsic height for both the card and that gutter so the
+        // top/bottom cannot be shaved off by grid rounding at certain zooms.
+        runtime.cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
+        return;
+    }
+
+    const y = Number(runtime.domWidget.last_y);
+    if (!Number.isFinite(y) || y <= 0) {
+        if (retry < 12) {
+            requestAnimationFrame(() => syncDomHeight(node, runtime, forceMin, retry + 1));
+        }
+        return;
+    }
+
+    // Remove Nodes 2.0-only intrinsic sizing when returning to Legacy.
+    runtime.root.style.paddingTop = "5px";
+    runtime.root.style.minHeight = "0";
+    runtime.root.style.setProperty("--comfy-widget-min-height", `${UI_MIN_HEIGHT}px`);
+    runtime.root.style.maxHeight = "none";
+    runtime.root.style.flex = "0 0 auto";
+    runtime.root.style.overflow = "hidden";
+
+    runtime.syncingDomHeight = true;
+    try {
+        let w = Math.max(NODE_MIN_WIDTH, Number(node.size?.[0] || NODE_MIN_WIDTH));
+        let h = Number(node.size?.[1] || 0);
+        const minNodeH = y + UI_MIN_HEIGHT + BOTTOM_PAD;
+        const returningFromNodes2 = runtime.lastRenderMode === "nodes2";
+
+        if (returningFromNodes2) {
+            // Restore the last real Legacy height. If this node was first opened
+            // in Nodes 2.0 (so there is no stored Legacy size), start from the
+            // calculated Legacy minimum instead of inheriting a Vue runaway.
+            const rememberedLegacyH = Number(runtime.legacyNodeHeight);
+            h = (
+                Number.isFinite(rememberedLegacyH) &&
+                !obviouslyPoisonedHeight(rememberedLegacyH, minNodeH)
+            )
+                ? Math.max(minNodeH, rememberedLegacyH)
+                : minNodeH;
+        } else if (
+            runtime.lastRenderMode == null &&
+            obviouslyPoisonedHeight(h, minNodeH)
+        ) {
+            // Also heal workflows that are opened directly in Legacy after an
+            // older version serialized an absurd height.
+            h = minNodeH;
+        } else if (forceMin && h < minNodeH) {
+            h = minNodeH;
+        }
+
+        if (w !== Number(node.size?.[0]) || h !== Number(node.size?.[1])) {
+            node.setSize([w, h]);
+        }
+
+        const actualH = Number(node.size?.[1] || h);
+        const available = Math.max(UI_MIN_HEIGHT, actualH - y - BOTTOM_PAD);
+        runtime.root.style.height = `${available}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55)}px`;
+        runtime.cards.style.flex = "0 0 auto";
+        runtime.cards.style.minHeight = "";
+        runtime.domHeight = available;
+        if (!obviouslyPoisonedHeight(actualH, minNodeH)) {
+            runtime.legacyNodeHeight = actualH;
+        }
+        runtime.lastRenderMode = "legacy";
+        node.graph?.setDirtyCanvas(true, true);
+    } finally {
+        runtime.syncingDomHeight = false;
+    }
 }
 
 function installInvalidationHooks(node, runtime) {
-    for (const widget of node.widgets || []) {
-        if (!INVALIDATING_WIDGETS.has(widget?.name) || widget.__h3ExtenderWrapped) continue;
-        const cb = widget.callback;
-        widget.callback = function () {
-            const r = cb ? cb.apply(this, arguments) : undefined;
-            if (runtime.ready) {
-                invalidateFrom(runtime.state, 0);
-                updateHidden(node, runtime);
-                render(node, runtime);
-            }
-            return r;
-        };
-        widget.__h3ExtenderWrapped = true;
-    }
-
+    // No parameter/input change is allowed to alter clip validation. The only
+    // special connection handling kept here is the dynamic ref socket UI.
     const oldConnections = node.onConnectionsChange;
     node.onConnectionsChange = function (type, index, connected, linkInfo, inputInfo) {
         if (oldConnections) oldConnections.apply(this, arguments);
@@ -606,28 +759,27 @@ function installInvalidationHooks(node, runtime) {
             compactRefInputConnections(this);
             syncDynamicRefInputs(this);
         }
-
-        if (!runtime.ready || type !== 1) return;
-        if (slot && INVALIDATING_INPUTS.has(slot.name)) {
-            invalidateFrom(runtime.state, 0);
-            updateHidden(this, runtime);
-            render(this, runtime);
-        }
     };
 }
+
 
 function buildUi(node) {
     if (node.__h3Extender) return node.__h3Extender;
 
     const jsonWidget = getWidget(node, "clips_json");
     if (!jsonWidget) return null;
-    hideNativeWidget(jsonWidget);
+    hideNativeWidget(node, jsonWidget);
 
     const state = parseState(jsonWidget.value);
 
     const root = document.createElement("div");
     root.style.width = "100%";
     root.style.height = `${UI_MIN_HEIGHT}px`;
+    root.style.minHeight = `${UI_MIN_HEIGHT}px`;
+    // Official DOMWidgetImpl.computeLayoutSize() reads this CSS variable as a
+    // fallback to getMinHeight. Keeping both makes the intrinsic contract clear
+    // to current and slightly older Nodes 2.0 frontends.
+    root.style.setProperty("--comfy-widget-min-height", `${NODES2_MIN_HEIGHT}px`);
     root.style.boxSizing = "border-box";
     root.style.display = "flex";
     root.style.flexDirection = "column";
@@ -683,10 +835,12 @@ function buildUi(node) {
     cards.style.gap = "9px";
     cards.style.overflowX = "auto";
     cards.style.overflowY = "hidden";
-    cards.style.padding = "0 0 8px 0";
+    cards.style.padding = `0 0 ${CARD_SCROLLBAR_SPACE}px 0`;
+    cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
     cards.style.height = `${UI_MIN_HEIGHT - 55}px`;
+    cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
 
     root.append(toolbar, cards);
 
@@ -701,6 +855,9 @@ function buildUi(node) {
         status,
         domWidget: null,
         domHeight: UI_MIN_HEIGHT,
+        syncingDomHeight: false,
+        lastRenderMode: null,
+        legacyNodeHeight: null,
         // clips_json already preserves the validated flags. Seed the visual state
         // immediately, then replace it with the authoritative disk manifest below.
         cachedCount: restoredValidatedPrefix,
@@ -718,20 +875,40 @@ function buildUi(node) {
     const domWidget = node.addDOMWidget("h3_extender_timeline", "timeline", root, {
         serialize: false,
         hideOnZoom: false,
-        getMinHeight: () => UI_MIN_HEIGHT,
+        // DOMWidgetImpl.computeLayoutSize() is the official size contract.
+        // Give Nodes 2.0 a little more intrinsic room, while keeping the old
+        // Legacy minimum unchanged.
+        getMinHeight: () =>
+            globalThis.LiteGraph?.vueNodesMode ? NODES2_MIN_HEIGHT : UI_MIN_HEIGHT,
         getHeight: () => runtime.domHeight,
+        afterResize: (resizedNode) => {
+            const mode = domWidgetRenderMode(root);
+            if (mode === "nodes2") {
+                // Re-assert only intrinsic CSS. Never derive anything from
+                // node.size while Vue is resolving its grid.
+                root.style.height = "auto";
+                root.style.minHeight = `${NODES2_MIN_HEIGHT}px`;
+                root.style.setProperty("--comfy-widget-min-height", `${NODES2_MIN_HEIGHT}px`);
+                root.style.maxHeight = "none";
+                root.style.flex = "1 1 auto";
+                root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
+                root.style.overflow = "visible";
+                cards.style.height = "auto";
+                cards.style.flex = "1 1 auto";
+                cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
+                runtime.lastRenderMode = "nodes2";
+            } else if (mode === "legacy") {
+                requestAnimationFrame(() => syncDomHeight(resizedNode, runtime, false));
+            } else {
+                requestAnimationFrame(() => syncDomHeight(resizedNode, runtime, false));
+            }
+        },
     });
     runtime.domWidget = domWidget;
     node.__h3Extender = runtime;
 
     installInvalidationHooks(node, runtime);
     render(node, runtime);
-
-    const oldResize = node.onResize;
-    node.onResize = function () {
-        if (oldResize) oldResize.apply(this, arguments);
-        requestAnimationFrame(() => syncDomHeight(this, runtime, false));
-    };
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {

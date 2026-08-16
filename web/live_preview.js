@@ -127,6 +127,26 @@ const PLAYER_MIN_HEIGHT = 220;
 const LABEL_HEIGHT = 22;
 const BOTTOM_PAD = 14;
 
+function previewDomRenderMode(element) {
+    const LG = globalThis.LiteGraph;
+    const hasModeFlag = typeof LG?.vueNodesMode === "boolean";
+    if (!element?.isConnected) return "pending";
+
+    const insideVueRow = Boolean(element.closest?.(".lg-node-widget"));
+    if (hasModeFlag) {
+        if (LG.vueNodesMode && !insideVueRow) return "pending";
+        if (!LG.vueNodesMode && insideVueRow) return "pending";
+        return LG.vueNodesMode ? "nodes2" : "legacy";
+    }
+    return insideVueRow ? "nodes2" : "legacy";
+}
+
+function previewHeightIsPoisoned(height, minimumHeight) {
+    const h = Number(height);
+    if (!Number.isFinite(h) || h <= 0) return false;
+    return h > Math.max(1400, Number(minimumHeight || 0) * 4);
+}
+
 function mediaUrl(info) {
     const params = new URLSearchParams();
     params.set("filename", info.filename || "");
@@ -216,13 +236,11 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 }
 
 function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
-    if (!node || !state?.widget) return;
+    if (!node || !state?.widget || state.syncingPlayer) return;
 
-    const widgetY = Number(state.widget.last_y);
-
-    // LiteGraph only knows the real widget Y after layout/draw.
-    if (!Number.isFinite(widgetY) || widgetY <= 0) {
-        if (retry < 5) {
+    const mode = previewDomRenderMode(state.box);
+    if (mode === "pending") {
+        if (retry < 12) {
             requestAnimationFrame(() =>
                 syncPlayerToNode(node, state, growNodeIfNeeded, retry + 1)
             );
@@ -230,44 +248,127 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         return;
     }
 
-    let nodeW = Number(node.size?.[0] || PLAYER_MIN_WIDTH);
-    let nodeH = Number(node.size?.[1] || 0);
+    if (mode === "nodes2") {
+        const currentH = Number(node.size?.[1] || 0);
+        const widgetY = Number(state.widget.last_y);
+        const fallbackH = Number.isFinite(widgetY) && widgetY > 0
+            ? widgetY + PLAYER_MIN_HEIGHT + BOTTOM_PAD
+            : PLAYER_MIN_HEIGHT + 180;
 
-    if (nodeW < PLAYER_MIN_WIDTH) {
-        nodeW = PLAYER_MIN_WIDTH;
+        // Recover a node that was already poisoned by the old resize feedback
+        // loop, but otherwise never write Vue's allocated height back to size.
+        if (
+            state.lastRenderMode !== "nodes2" &&
+            previewHeightIsPoisoned(currentH, fallbackH)
+        ) {
+            state.syncingPlayer = true;
+            try {
+                const rememberedLegacyH = Number(state.legacyNodeHeight);
+                const targetH = (
+                    Number.isFinite(rememberedLegacyH) &&
+                    !previewHeightIsPoisoned(rememberedLegacyH, fallbackH)
+                )
+                    ? Math.max(fallbackH, rememberedLegacyH)
+                    : fallbackH;
+                const targetW = Math.max(
+                    PLAYER_MIN_WIDTH,
+                    Number(node.size?.[0] || PLAYER_MIN_WIDTH)
+                );
+                node.setSize([targetW, targetH]);
+            } finally {
+                state.syncingPlayer = false;
+            }
+        }
+
+        state.lastRenderMode = "nodes2";
+
+        // WidgetDOM.vue places the element in a flex child of an auto grid row.
+        // Percentage heights are unstable during Nodes 2.0 resize and can make
+        // the row collapse until WidgetDOM remounts on page refresh. Preserve an
+        // intrinsic minimum and let Vue stretch the player naturally.
+        state.box.style.height = "auto";
+        state.box.style.minHeight = `${PLAYER_MIN_HEIGHT}px`;
+        state.box.style.maxHeight = "none";
+        state.box.style.flex = "1 1 auto";
+        state.box.style.overflow = "visible";
+        state.video.style.height = "auto";
+        state.video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - 4)}px`;
+        state.video.style.flex = "1 1 auto";
+        return;
     }
 
-    const minimumNodeH = widgetY + PLAYER_MIN_HEIGHT + BOTTOM_PAD;
+    const widgetY = Number(state.widget.last_y);
 
-    // At creation/execution ensure enough room for a useful player.
-    // During manual resize, DO NOT force a fixed height: use the user's node height.
-    if (growNodeIfNeeded && nodeH < minimumNodeH) {
-        nodeH = minimumNodeH;
-        node.setSize([nodeW, nodeH]);
-    } else if (Number(node.size?.[0] || 0) < PLAYER_MIN_WIDTH) {
-        node.setSize([nodeW, nodeH]);
+    // LiteGraph only knows the real widget Y after layout/draw.
+    if (!Number.isFinite(widgetY) || widgetY <= 0) {
+        if (retry < 12) {
+            requestAnimationFrame(() =>
+                syncPlayerToNode(node, state, growNodeIfNeeded, retry + 1)
+            );
+        }
+        return;
     }
 
-    const availableH = Math.max(
-        PLAYER_MIN_HEIGHT,
-        Number(node.size?.[1] || nodeH) - widgetY - BOTTOM_PAD
-    );
+    // Restore the explicit Legacy sizing contract.
+    state.box.style.minHeight = "0";
+    state.box.style.maxHeight = "none";
+    state.box.style.flex = "0 0 auto";
+    state.box.style.overflow = "hidden";
+    state.video.style.minHeight = "0";
+    state.video.style.flex = "0 0 auto";
 
-    state.currentHeight = availableH;
+    state.syncingPlayer = true;
+    try {
+        let nodeW = Math.max(
+            PLAYER_MIN_WIDTH,
+            Number(node.size?.[0] || PLAYER_MIN_WIDTH)
+        );
+        let nodeH = Number(node.size?.[1] || 0);
+        const minimumNodeH = widgetY + PLAYER_MIN_HEIGHT + BOTTOM_PAD;
+        const returningFromNodes2 = state.lastRenderMode === "nodes2";
 
-    state.box.style.height = `${availableH}px`;
-    state.video.style.height =
-        `${Math.max(80, availableH - LABEL_HEIGHT - 4)}px`;
+        if (returningFromNodes2) {
+            const rememberedLegacyH = Number(state.legacyNodeHeight);
+            nodeH = (
+                Number.isFinite(rememberedLegacyH) &&
+                !previewHeightIsPoisoned(rememberedLegacyH, minimumNodeH)
+            )
+                ? Math.max(minimumNodeH, rememberedLegacyH)
+                : minimumNodeH;
+        } else if (
+            state.lastRenderMode == null &&
+            previewHeightIsPoisoned(nodeH, minimumNodeH)
+        ) {
+            nodeH = minimumNodeH;
+        } else if (growNodeIfNeeded && nodeH < minimumNodeH) {
+            nodeH = minimumNodeH;
+        }
 
-    // Keep the DOM widget's logical height synchronized with the actual player.
-    // This makes LiteGraph clipping/hit-testing agree with what is visible.
-    if (state.widget.options) {
-        state.widget.options.getMinHeight = () => PLAYER_MIN_HEIGHT;
-        state.widget.options.getHeight = () => state.currentHeight;
+        if (
+            nodeW !== Number(node.size?.[0]) ||
+            nodeH !== Number(node.size?.[1])
+        ) {
+            node.setSize([nodeW, nodeH]);
+        }
+
+        const actualH = Number(node.size?.[1] || nodeH);
+        const availableH = Math.max(
+            PLAYER_MIN_HEIGHT,
+            actualH - widgetY - BOTTOM_PAD
+        );
+
+        state.currentHeight = availableH;
+        if (!previewHeightIsPoisoned(actualH, minimumNodeH)) {
+            state.legacyNodeHeight = actualH;
+        }
+        state.lastRenderMode = "legacy";
+        state.box.style.height = `${availableH}px`;
+        state.video.style.height =
+            `${Math.max(80, availableH - LABEL_HEIGHT - 4)}px`;
+        node.graph?.setDirtyCanvas(true, true);
+    } finally {
+        state.syncingPlayer = false;
     }
-    state.widget.getHeight = () => state.currentHeight;
-
-    node.graph?.setDirtyCanvas(true, true);
 }
 
 function makePlayer(node) {
@@ -276,7 +377,11 @@ function makePlayer(node) {
     const box = document.createElement("div");
     box.style.width = "100%";
     box.style.height = `${PLAYER_MIN_HEIGHT}px`;
+    box.style.minHeight = `${PLAYER_MIN_HEIGHT}px`;
+    box.style.setProperty("--comfy-widget-min-height", `${PLAYER_MIN_HEIGHT}px`);
     box.style.boxSizing = "border-box";
+    box.style.display = "flex";
+    box.style.flexDirection = "column";
     box.style.padding = "4px 0 0 0";
     box.style.background = "transparent";
     box.style.overflow = "hidden";
@@ -300,6 +405,8 @@ function makePlayer(node) {
     video.style.display = "block";
     video.style.width = "100%";
     video.style.height = `${PLAYER_MIN_HEIGHT - LABEL_HEIGHT - 4}px`;
+    video.style.flex = "1 1 auto";
+    video.style.minHeight = "0";
     video.style.objectFit = "contain";
     video.style.background = "#000";
     video.style.borderRadius = "4px";
@@ -313,6 +420,9 @@ function makePlayer(node) {
         video,
         widget: null,
         currentHeight: PLAYER_MIN_HEIGHT,
+        syncingPlayer: false,
+        lastRenderMode: null,
+        legacyNodeHeight: null,
         liveLoaded: false,
         restoreLoaded: false,
         restoreRequestRunning: false,
@@ -323,20 +433,30 @@ function makePlayer(node) {
         hideOnZoom: false,
         getMinHeight: () => PLAYER_MIN_HEIGHT,
         getHeight: () => state.currentHeight,
+        afterResize: (resizedNode) => {
+            const mode = previewDomRenderMode(box);
+            if (mode === "nodes2") {
+                // Current WidgetDOM.vue already stretches its child. Keep only
+                // an intrinsic minimum; never write a percentage height back.
+                box.style.height = "auto";
+                box.style.minHeight = `${PLAYER_MIN_HEIGHT}px`;
+                box.style.maxHeight = "none";
+                box.style.flex = "1 1 auto";
+                box.style.overflow = "visible";
+                video.style.height = "auto";
+                video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - 4)}px`;
+                video.style.flex = "1 1 auto";
+                state.lastRenderMode = "nodes2";
+            } else {
+                requestAnimationFrame(() =>
+                    syncPlayerToNode(resizedNode, state, false)
+                );
+            }
+        },
     });
     state.widget = widget;
 
     node.__h3LivePreview = state;
-
-    // User resizes node -> player immediately consumes all available height.
-    const oldResize = node.onResize;
-    node.onResize = function () {
-        if (oldResize) oldResize.apply(this, arguments);
-
-        requestAnimationFrame(() => {
-            syncPlayerToNode(this, state, false);
-        });
-    };
 
     const oldRemove = node.onRemoved;
     node.onRemoved = function () {
