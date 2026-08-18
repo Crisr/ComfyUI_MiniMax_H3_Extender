@@ -2,146 +2,136 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 const TARGET = "MiniMaxH3Extender";
+const FINAL_TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const PROGRESS_EVENT = "h3_extender_progress";
 const CARD_WIDTH = 318;
-const UI_MIN_HEIGHT = 460;
-const NODES2_MIN_HEIGHT = 510;
+const UI_MIN_HEIGHT = 600;
+const NODES2_MIN_HEIGHT = 650;
 // Keep a real visual gap between the native Nodes 2.0 widgets and the CLIP
 // panel. This is internal padding only: we deliberately do NOT rewrite Vue
 // grid tracks or absolutely position the DOM widget.
 const NODES2_TOP_GAP = 28;
-const NODE_MIN_WIDTH = 980;
+const NODE_MIN_WIDTH = 520;
 const BOTTOM_PAD = 16;
 // Leave an empty gutter under each card so an overlay horizontal scrollbar
 // never covers the Validated/footer row.
 const CARD_SCROLLBAR_SPACE = 24;
 const CARD_MIN_HEIGHT = 355;
 const NODES2_CARDS_MIN_HEIGHT = CARD_MIN_HEIGHT + CARD_SCROLLBAR_SPACE;
+const REF_SLOT_WIDTH = 96;
+const REF_THUMB_HEIGHT = 96;
+// Reserve the scrollbar inside the existing reference section only.
+// Do not grow the DOM widget or alter card sizing/layout for this.
+const REF_SCROLLBAR_SPACE = 14;
+const REF_SECTION_HEIGHT = 160;
 const MAX_IMAGE_REFS = 9;
+const MAX_RESOLUTION = 4096;
+const DEFAULT_MEGAPIXELS = 0.40;
 
-// Validation is intentionally explicit. Generation parameters and input
-// connections may be changed at any time without touching already validated
-// clips. To regenerate an accepted clip, the user explicitly unchecks its
-// Validated box; that is the ONLY action that invalidates that clip and every
-// dependent clip after it.
+const PROJECT_WIDGETS = [
+    "run_mode",
+    "width",
+    "height",
+    "ref_image_size",
+    "steps",
+    "sampler_name",
+    "scheduler",
+    "denoise",
+    "context_length",
+    "audio_context_length",
+    "clips_json",
+    "resolution_mode",
+    "megapixels",
+    "refs_json",
+];
+
+const FINAL_PROJECT_WIDGETS = [
+    "fps",
+    "filename_prefix",
+    "output_directory",
+    "codec",
+    "crf",
+    "preset",
+    "audio_bitrate",
+];
+
+// Validation and reference semantics are user-controlled. The Extender never
+// associates Ref N with Clip N and never decides which clip a reference edit
+// invalidates. Existing validation flags stay exactly as the user left them.
+// The one unavoidable global exception is RESOLUTION: cached latents cannot be
+// reused at another geometry, so an effective width/height change immediately
+// clears validation for the whole chain.
 
 
-function isRefInputName(name) {
-    return /^ref_\d+$/.test(String(name || ""));
+function emptyRefsState() {
+    return { version: 1, refs: Array(MAX_IMAGE_REFS).fill(null) };
 }
 
-function refInputNumber(name) {
-    const m = /^ref_(\d+)$/.exec(String(name || ""));
-    return m ? Number(m[1]) : NaN;
+function normalizeRefDescriptor(value) {
+    if (!value || typeof value !== "object") return null;
+    const id = String(value.id || value.ref_id || "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(id)) return null;
+    return {
+        id,
+        original_name: String(value.original_name || value.name || "reference.png"),
+        width: Math.max(0, Number(value.width || 0)),
+        height: Math.max(0, Number(value.height || 0)),
+        size_bytes: Math.max(0, Number(value.size_bytes || 0)),
+    };
 }
 
-function refInputConnected(input) {
-    return input && input.link != null;
-}
-
-function findInputIndexByName(node, name) {
-    return (node?.inputs || []).findIndex((input) => input?.name === name);
-}
-
-function getOriginNodeForLink(node, linkId) {
-    const graph = node?.graph;
-    const link = graph?.links?.[linkId];
-    if (!graph || !link) return null;
-    if (typeof graph.getNodeById === "function") return graph.getNodeById(link.origin_id);
-    return (graph._nodes || []).find((n) => String(n?.id) === String(link.origin_id)) || null;
-}
-
-function moveRefConnection(node, fromNum, toNum) {
-    if (!node || fromNum === toNum) return false;
-
-    const fromIdx = findInputIndexByName(node, `ref_${fromNum}`);
-    const toIdx = findInputIndexByName(node, `ref_${toNum}`);
-    if (fromIdx < 0 || toIdx < 0) return false;
-
-    const fromInput = node.inputs?.[fromIdx];
-    if (!refInputConnected(fromInput)) return false;
-
-    const linkId = fromInput.link;
-    const originNode = getOriginNodeForLink(node, linkId);
-    const link = node?.graph?.links?.[linkId];
-    const originSlot = link?.origin_slot;
-    if (!originNode || originSlot == null) return false;
-
-    // Recreate the link on the earlier socket, then drop the old one.
-    if (refInputConnected(node.inputs?.[toIdx])) {
-        node.disconnectInput(toIdx);
+function normalizeRefsArray(values) {
+    // Ref slots are stable logical identities. Never compact holes: moving Ref 3
+    // into Ref 2 would silently break prompts that intentionally use <Picture 3>.
+    const refs = Array(MAX_IMAGE_REFS).fill(null);
+    const source = Array.isArray(values) ? values : [];
+    for (let i = 0; i < Math.min(MAX_IMAGE_REFS, source.length); i++) {
+        refs[i] = normalizeRefDescriptor(source[i]);
     }
-
-    const created = originNode.connect(originSlot, node, toIdx);
-    if (!created) return false;
-
-    // If the original connection still remains on the old slot, remove it now.
-    if (refInputConnected(node.inputs?.[fromIdx])) {
-        node.disconnectInput(fromIdx);
-    }
-    return true;
+    return refs;
 }
 
-function compactRefInputConnections(node) {
-    if (!node || node.__h3RefCompacting) return;
-
-    node.__h3RefCompacting = true;
+function parseRefsState(raw) {
     try {
-        // Ensure the full range exists temporarily so we can target early slots safely.
-        for (let i = 1; i <= MAX_IMAGE_REFS; i++) {
-            if (findInputIndexByName(node, `ref_${i}`) < 0) {
-                node.addInput(`ref_${i}`, "IMAGE", { forceInput: true });
-            }
-        }
-
-        let targetNum = 1;
-        for (let sourceNum = 1; sourceNum <= MAX_IMAGE_REFS; sourceNum++) {
-            const sourceIdx = findInputIndexByName(node, `ref_${sourceNum}`);
-            const sourceInput = sourceIdx >= 0 ? node.inputs?.[sourceIdx] : null;
-            if (!refInputConnected(sourceInput)) continue;
-            if (sourceNum !== targetNum) {
-                moveRefConnection(node, sourceNum, targetNum);
-            }
-            targetNum += 1;
-        }
-    } finally {
-        node.__h3RefCompacting = false;
+        const parsed = typeof raw === "string" ? JSON.parse(raw || "{}") : raw;
+        const refs = Array.isArray(parsed) ? parsed : parsed?.refs;
+        return { version: 1, refs: normalizeRefsArray(Array.isArray(refs) ? refs : []) };
+    } catch (_) {
+        return emptyRefsState();
     }
 }
 
-function syncDynamicRefInputs(node) {
-    if (!node) return;
+function serializeRefsState(state) {
+    return JSON.stringify({ version: 1, refs: normalizeRefsArray(state?.refs || []) });
+}
 
-    // When the backend creates the node, all ref_1..ref_9 sockets exist.
-    // Keep only the connected prefix plus exactly one empty socket.
-    let highestConnected = 0;
-    for (const input of node.inputs || []) {
-        if (isRefInputName(input?.name) && refInputConnected(input)) {
-            highestConnected = Math.max(highestConnected, refInputNumber(input.name));
+function refCount(runtime) {
+    return (runtime?.refsState?.refs || []).filter(Boolean).length;
+}
+
+function refImageUrl(ref) {
+    if (!ref?.id) return "";
+    return api.apiURL("/h3_extender/ref/image?id=" + encodeURIComponent(String(ref.id)));
+}
+
+function sameRefContent(a, b) {
+    return String(a?.id || "") === String(b?.id || "");
+}
+
+function removeLegacyImageRefInputs(node) {
+    if (!node?.inputs) return false;
+    let removed = false;
+    for (let index = node.inputs.length - 1; index >= 0; index--) {
+        const name = String(node.inputs[index]?.name || "");
+        if (/^ref_[1-9]$/.test(name)) {
+            try {
+                node.removeInput(index);
+                removed = true;
+            } catch (_) {}
         }
     }
-
-    const wanted = Math.max(1, Math.min(MAX_IMAGE_REFS, highestConnected + 1));
-
-    // Remove trailing unneeded ref sockets from the end first.
-    for (let i = MAX_IMAGE_REFS; i > wanted; i--) {
-        const idx = findInputIndexByName(node, `ref_${i}`);
-        if (idx >= 0) {
-            const input = node.inputs[idx];
-            if (!refInputConnected(input)) {
-                node.removeInput(idx);
-            }
-        }
-    }
-
-    // Ensure the visible contiguous range exists.
-    for (let i = 1; i <= wanted; i++) {
-        if (findInputIndexByName(node, `ref_${i}`) < 0) {
-            node.addInput(`ref_${i}`, "IMAGE", { forceInput: true });
-        }
-    }
-
-    node.graph?.setDirtyCanvas(true, true);
+    if (removed) node.graph?.setDirtyCanvas(true, true);
+    return removed;
 }
 
 function randomSeed() {
@@ -158,6 +148,7 @@ function randomSeed() {
 function newClip(index) {
     return {
         id: `clip_${index + 1}_${Date.now().toString(36)}`,
+        name: "",
         prompt: "",
         seed: randomSeed(),
         seed_mode: "randomize",
@@ -173,8 +164,10 @@ function parseState(raw) {
         if (Array.isArray(clips) && clips.length) {
             return {
                 version: 1,
+                load_token: String(p?.project_load_token || ""),
                 clips: clips.map((c, i) => ({
                     id: String(c?.id || `clip_${i + 1}`),
+                    name: String(c?.name || ""),
                     prompt: String(c?.prompt || ""),
                     seed: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Number(c?.seed || 0))),
                     seed_mode: ["randomize", "fixed", "increment", "decrement"].includes(String(c?.seed_mode))
@@ -186,11 +179,13 @@ function parseState(raw) {
             };
         }
     } catch (_) {}
-    return { version: 1, clips: [newClip(0)] };
+    return { version: 1, load_token: "", clips: [newClip(0)] };
 }
 
 function serializeState(state) {
-    return JSON.stringify({ version: 1, clips: state.clips });
+    const payload = { version: 1, clips: state.clips };
+    if (state?.load_token) payload.project_load_token = String(state.load_token);
+    return JSON.stringify(payload);
 }
 
 function validatedPrefixFromState(state) {
@@ -225,10 +220,22 @@ async function restoreCacheState(node, runtime) {
 
         runtime.cachedCount = Number(payload.cached_count || 0);
         runtime.validatedCount = Number(payload.validated_count || 0);
+        const restoredW = Number(payload.resolved_width || 0);
+        const restoredH = Number(payload.resolved_height || 0);
+        if (restoredW > 0 && restoredH > 0) {
+            // Cache restore is informational only. Do not overwrite live
+            // resolution controls: outside an explicit .ext Load the user is
+            // free to change Auto/MP or Manual width/height at any time.
+            runtime.expectedResolution = { width: restoredW, height: restoredH };
+        }
         runtime.cacheStateRestored = true;
+        const resolutionText = restoredW > 0 && restoredH > 0
+            ? ` | project ${restoredW}x${restoredH}`
+            : "";
         runtime.statusText =
-            `Restored cache | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
+            `Restored cache${resolutionText} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
             `validated ${runtime.validatedCount}`;
+        syncResolutionAndInvalidate(node, runtime);
         render(node, runtime);
         node.graph?.setDirtyCanvas(true, true);
     } catch (_) {
@@ -242,14 +249,235 @@ function getWidget(node, name) {
     return node?.widgets?.find((w) => w?.name === name);
 }
 
+function effectiveManualResolution(width, height) {
+    const w = Math.max(16, Math.min(MAX_RESOLUTION, Math.floor(Number(width || 0) / 16) * 16));
+    const h = Math.max(16, Math.min(MAX_RESOLUTION, Math.floor(Number(height || 0) / 16) * 16));
+    return { width: w, height: h };
+}
+
+function pythonRound(value) {
+    // Python round() uses bankers rounding for exact .5 ties; match the
+    // backend so the visible mirror can never disagree by a latent-grid step.
+    const x = Number(value);
+    if (!Number.isFinite(x)) return 0;
+    const floor = Math.floor(x);
+    const frac = x - floor;
+    if (Math.abs(frac - 0.5) < 1e-12) return (floor % 2 === 0) ? floor : floor + 1;
+    return Math.round(x);
+}
+
+function autoResolutionFromDimensions(srcWidth, srcHeight, megapixels) {
+    const srcW = Number(srcWidth || 0);
+    const srcH = Number(srcHeight || 0);
+    if (!(srcW > 0) || !(srcH > 0)) return null;
+
+    const mp = Math.max(0.01, Math.min(16.0, Number(megapixels ?? DEFAULT_MEGAPIXELS)));
+    const total = mp * 1024.0 * 1024.0;
+    const scale = Math.sqrt(total / (srcW * srcH));
+    let scaledW = Math.max(1, pythonRound(srcW * scale));
+    let scaledH = Math.max(1, pythonRound(srcH * scale));
+
+    if (scaledW > MAX_RESOLUTION || scaledH > MAX_RESOLUTION) {
+        const shrink = Math.min(MAX_RESOLUTION / scaledW, MAX_RESOLUTION / scaledH);
+        scaledW = Math.max(1, pythonRound(scaledW * shrink));
+        scaledH = Math.max(1, pythonRound(scaledH * shrink));
+    }
+
+    return effectiveManualResolution(scaledW, scaledH);
+}
+
+function currentGuideRefNumber(runtime) {
+    const refs = runtime?.refsState?.refs || [];
+    if (refs[0]) return 1;
+    for (let i = 0; i < Math.min(MAX_IMAGE_REFS, refs.length); i++) {
+        if (refs[i]) return i + 1;
+    }
+    return null;
+}
+
+function dimensionsFromInternalRef(runtime, refNumber) {
+    const index = Number(refNumber) - 1;
+    if (!runtime || !Number.isInteger(index) || index < 0 || index >= MAX_IMAGE_REFS) return null;
+    const ref = runtime.refsState?.refs?.[index];
+    const width = Number(ref?.width || 0);
+    const height = Number(ref?.height || 0);
+    return width > 0 && height > 0 ? { width, height } : null;
+}
+
+function setResolutionMirrorValues(node, runtime, width, height) {
+    if (!runtime || !(width > 0) || !(height > 0)) return;
+    runtime.applyingResolutionMirror = true;
+    try {
+        setWidgetValue(node, "width", Number(width));
+        setWidgetValue(node, "height", Number(height));
+    } finally {
+        runtime.applyingResolutionMirror = false;
+    }
+}
+
+function rememberManualResolution(node, runtime, width, height) {
+    if (!runtime) return;
+    if (Number(width) > 0) runtime.manualWidth = Number(width);
+    if (Number(height) > 0) runtime.manualHeight = Number(height);
+    if (node) {
+        node.properties = node.properties || {};
+        if (runtime.manualWidth > 0) node.properties.h3_manual_width = runtime.manualWidth;
+        if (runtime.manualHeight > 0) node.properties.h3_manual_height = runtime.manualHeight;
+    }
+}
+
+function syncResolutionMirror(node, runtime) {
+    if (!node || !runtime) return;
+
+    const mode = String(getWidget(node, "resolution_mode")?.value || "auto_from_ref");
+    const widthWidget = getWidget(node, "width");
+    const heightWidget = getWidget(node, "height");
+    if (!widthWidget || !heightWidget) return;
+
+    if (mode === "manual") {
+        if (runtime.manualWidth > 0 && runtime.manualHeight > 0) {
+            setResolutionMirrorValues(node, runtime, runtime.manualWidth, runtime.manualHeight);
+        }
+        runtime.resolutionMirrorActive = false;
+        return;
+    }
+
+    const guideRef = currentGuideRefNumber(runtime);
+    if (guideRef == null) {
+        // Auto without a reference is deliberately the editable Manual fallback.
+        if (runtime.manualWidth > 0 && runtime.manualHeight > 0) {
+            setResolutionMirrorValues(node, runtime, runtime.manualWidth, runtime.manualHeight);
+        }
+        runtime.resolutionMirrorActive = false;
+        return;
+    }
+
+    let source = dimensionsFromInternalRef(runtime, guideRef);
+    const executedGuide = /^ref_(\d+)$/.exec(String(runtime.resolutionGuide || ""));
+    if (!source && executedGuide && Number(executedGuide[1]) === Number(guideRef)) {
+        if (runtime.guideSourceWidth > 0 && runtime.guideSourceHeight > 0) {
+            source = { width: runtime.guideSourceWidth, height: runtime.guideSourceHeight };
+        }
+    }
+
+    if (!source) {
+        // Internal metadata normally carries the exact source dimensions. Keep
+        // the last backend result as a defensive fallback for older saved state.
+        if (
+            executedGuide &&
+            Number(executedGuide[1]) === Number(guideRef) &&
+            runtime.resolvedWidth > 0 && runtime.resolvedHeight > 0
+        ) {
+            setResolutionMirrorValues(node, runtime, runtime.resolvedWidth, runtime.resolvedHeight);
+            runtime.resolutionMirrorActive = true;
+        }
+        return;
+    }
+
+    const resolved = autoResolutionFromDimensions(
+        source.width,
+        source.height,
+        Number(getWidget(node, "megapixels")?.value ?? DEFAULT_MEGAPIXELS),
+    );
+    if (!resolved) return;
+    runtime.guideSourceWidth = Number(source.width);
+    runtime.guideSourceHeight = Number(source.height);
+    setResolutionMirrorValues(node, runtime, resolved.width, resolved.height);
+    runtime.resolutionMirrorActive = true;
+    node.graph?.setDirtyCanvas(true, true);
+}
+
+function wrapResolutionWidgetCallbacks(node, runtime) {
+    if (!node || !runtime || runtime.resolutionCallbacksInstalled) return;
+    runtime.resolutionCallbacksInstalled = true;
+
+    const widthWidget = getWidget(node, "width");
+    const heightWidget = getWidget(node, "height");
+    const modeWidget = getWidget(node, "resolution_mode");
+    const mpWidget = getWidget(node, "megapixels");
+
+    const wrap = (widget, handler) => {
+        if (!widget) return;
+        const old = widget.callback;
+        widget.callback = function (value) {
+            const result = old ? old.apply(this, arguments) : undefined;
+            handler(value);
+            return result;
+        };
+    };
+
+    wrap(widthWidget, (value) => {
+        if (runtime.applyingResolutionMirror) return;
+        const mode = String(modeWidget?.value || "auto_from_ref");
+        if (mode === "manual" || currentGuideRefNumber(runtime) == null) {
+            // A loaded .ext is forced to its exact archived geometry only at
+            // load time. The first explicit resolution edit releases that
+            // one-shot project state immediately.
+            runtime.projectResolutionLoaded = false;
+            rememberManualResolution(
+                node,
+                runtime,
+                Number(value || widthWidget?.value || runtime.manualWidth || 896),
+                runtime.manualHeight,
+            );
+            invalidateForResolutionChange(node, runtime);
+        } else {
+            requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
+        }
+    });
+    wrap(heightWidget, (value) => {
+        if (runtime.applyingResolutionMirror) return;
+        const mode = String(modeWidget?.value || "auto_from_ref");
+        if (mode === "manual" || currentGuideRefNumber(runtime) == null) {
+            runtime.projectResolutionLoaded = false;
+            rememberManualResolution(
+                node,
+                runtime,
+                runtime.manualWidth,
+                Number(value || heightWidget?.value || runtime.manualHeight || 576),
+            );
+            invalidateForResolutionChange(node, runtime);
+        } else {
+            requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
+        }
+    });
+    wrap(modeWidget, (value) => {
+        runtime.projectResolutionLoaded = false;
+        const mode = String(value || modeWidget?.value || "auto_from_ref");
+        if (mode === "auto_from_ref" && !runtime.resolutionMirrorActive) {
+            rememberManualResolution(
+                node,
+                runtime,
+                Number(widthWidget?.value || runtime.manualWidth || 896),
+                Number(heightWidget?.value || runtime.manualHeight || 576),
+            );
+        }
+        requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
+    });
+    wrap(mpWidget, () => {
+        // Load Project deliberately enters Manual at the archived width/height
+        // so simply pressing Queue cannot invalidate the imported cache. But
+        // megapixels is an Auto-only control: if the user edits it after a
+        // project load, that is an explicit request to choose a new resolution.
+        // Re-enter Auto immediately instead of leaving the MP widget apparently
+        // ineffective. The backend will then restart the incompatible cache on
+        // the next generation, exactly like any other live resolution change.
+        if (runtime.projectResolutionLoaded) {
+            runtime.projectResolutionLoaded = false;
+            setWidgetValue(node, "resolution_mode", "auto_from_ref");
+        }
+        requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
+    });
+}
+
 // Nodes 2.0 (Vue) can render the native multiline STRING row before our
 // onNodeCreated code gets a chance to touch the widget object. Hide that row
 // pre-emptively with CSS, using the same proven strategy as ComfyUI_Stem_Mixer.
-// MiniMaxH3Extender has a single native textarea: clips_json.
-(function injectClipsJsonHideRule() {
-    if (document.getElementById("h3-extender-hide-clips-json")) return;
+// MiniMaxH3Extender keeps clips_json + refs_json as native serialized textareas.
+(function injectStateJsonHideRule() {
+    if (document.getElementById("h3-extender-hide-state-json")) return;
     const style = document.createElement("style");
-    style.id = "h3-extender-hide-clips-json";
+    style.id = "h3-extender-hide-state-json";
     style.textContent = `
         .lg-node-widget:has(> [node-type="${TARGET}"] > textarea) {
             display: none !important;
@@ -323,6 +551,49 @@ function invalidateFrom(state, index) {
     }
 }
 
+function currentResolutionFromWidgets(node) {
+    const width = Number(getWidget(node, "width")?.value || 0);
+    const height = Number(getWidget(node, "height")?.value || 0);
+    if (!(width > 0) || !(height > 0)) return null;
+    return effectiveManualResolution(width, height);
+}
+
+function invalidateForResolutionChange(node, runtime) {
+    if (!node || !runtime?.state) return false;
+    const expected = runtime.expectedResolution;
+    const current = currentResolutionFromWidgets(node);
+    if (!expected || !current) return false;
+
+    const expectedW = Number(expected.width || 0);
+    const expectedH = Number(expected.height || 0);
+    if (!(expectedW > 0) || !(expectedH > 0)) return false;
+    if (current.width === expectedW && current.height === expectedH) return false;
+
+    const hadValidated = runtime.state.clips.some((clip) => Boolean(clip?.validated));
+    const hadCached = Number(runtime.cachedCount || 0) > 0;
+
+    // Once the requested geometry differs from the cache/project geometry,
+    // every latent in that chain is incompatible. Reflect that immediately in
+    // the cards instead of waiting for the backend to discover it at Queue.
+    for (const clip of runtime.state.clips) clip.validated = false;
+    runtime.validatedCount = 0;
+    runtime.cachedCount = 0;
+    runtime.resolutionInvalidated = true;
+    runtime.statusText =
+        `Resolution changed: ${expectedW}x${expectedH} → ${current.width}x${current.height} | ` +
+        `clips invalidated; cache resets on next run`;
+
+    if (hadValidated || hadCached) updateHidden(node, runtime);
+    render(node, runtime);
+    node.graph?.setDirtyCanvas(true, true);
+    return hadValidated || hadCached;
+}
+
+function syncResolutionAndInvalidate(node, runtime) {
+    syncResolutionMirror(node, runtime);
+    invalidateForResolutionChange(node, runtime);
+}
+
 
 function advanceSeedAfterGenerate(clip) {
     const mode = String(clip?.seed_mode || "randomize");
@@ -364,6 +635,417 @@ function updateHidden(node, runtime) {
     node.graph?.setDirtyCanvas(true, true);
 }
 
+function updateRefsHidden(node, runtime) {
+    if (!runtime?.refsWidget) return;
+    runtime.refsState.refs = normalizeRefsArray(runtime.refsState?.refs || []);
+    runtime.refsWidget.value = serializeRefsState(runtime.refsState);
+    node.graph?.setDirtyCanvas(true, true);
+}
+
+function handleReferenceChange(node, runtime, message = "Image references changed") {
+    if (!node || !runtime?.state) return;
+
+    // Reference edits are deliberately user-controlled. Do not infer any
+    // Ref-to-Clip relationship and do not change validation automatically.
+    updateRefsHidden(node, runtime);
+
+    // Auto resolution still follows the active guide ref. If the ref edit changes
+    // the effective geometry, the existing resolution safety rule necessarily
+    // invalidates the whole latent chain; that is independent of ref semantics.
+    syncResolutionAndInvalidate(node, runtime);
+
+    if (!runtime.resolutionInvalidated) {
+        runtime.statusText = `${message} | validations unchanged`;
+        render(node, runtime);
+    }
+}
+
+function openReferencePreview(ref) {
+    if (!ref?.id) return;
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.zIndex = "100000";
+    overlay.style.background = "rgba(0,0,0,.86)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.padding = "28px";
+
+    const image = document.createElement("img");
+    image.src = refImageUrl(ref);
+    image.alt = ref.original_name || "Reference image";
+    image.style.maxWidth = "94vw";
+    image.style.maxHeight = "92vh";
+    image.style.objectFit = "contain";
+    image.style.borderRadius = "8px";
+    image.style.boxShadow = "0 12px 40px rgba(0,0,0,.55)";
+    overlay.appendChild(image);
+
+    const close = () => {
+        window.removeEventListener("keydown", onKey);
+        overlay.remove();
+    };
+    const onKey = (event) => {
+        if (event.key === "Escape") close();
+    };
+    overlay.addEventListener("click", close);
+    image.addEventListener("click", (event) => event.stopPropagation());
+    window.addEventListener("keydown", onKey);
+    document.body.appendChild(overlay);
+}
+
+async function uploadReference(node, runtime, slotIndex, file) {
+    if (!node || !runtime || !file) return;
+    if (projectBusy(runtime)) {
+        alert("Wait for the current clip generation to finish before changing a reference image.");
+        return;
+    }
+
+    runtime.refBusy = true;
+    runtime.statusText = `Loading Ref ${slotIndex + 1}: ${file.name}…`;
+    render(node, runtime);
+    try {
+        const form = new FormData();
+        form.append("ref_file", file, file.name);
+        const response = await fetch(api.apiURL("/h3_extender/ref/upload"), {
+            method: "POST",
+            body: form,
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok || !payload?.ref) {
+            throw new Error(payload?.error || `Reference upload failed (${response.status}).`);
+        }
+
+        const newRef = normalizeRefDescriptor(payload.ref);
+        if (!newRef) throw new Error("The backend returned invalid reference metadata.");
+        const previous = runtime.refsState.refs[slotIndex];
+        if (sameRefContent(previous, newRef)) {
+            runtime.refsState.refs[slotIndex] = newRef;
+            updateRefsHidden(node, runtime);
+            runtime.statusText = `Ref ${slotIndex + 1} unchanged`;
+            render(node, runtime);
+            return;
+        }
+
+        runtime.refsState.refs[slotIndex] = newRef;
+        handleReferenceChange(node, runtime, `Ref ${slotIndex + 1} loaded`);
+    } catch (error) {
+        runtime.statusText = "Reference load failed";
+        render(node, runtime);
+        alert(String(error?.message || error));
+    } finally {
+        runtime.refBusy = false;
+        render(node, runtime);
+    }
+}
+
+function removeReference(node, runtime, slotIndex) {
+    if (!runtime?.refsState?.refs?.[slotIndex]) return;
+    if (projectBusy(runtime)) {
+        alert("Wait for the current clip generation to finish before changing a reference image.");
+        return;
+    }
+    const oldName = runtime.refsState.refs[slotIndex]?.original_name || `Ref ${slotIndex + 1}`;
+    runtime.refsState.refs[slotIndex] = null;
+    handleReferenceChange(node, runtime, `${oldName} removed`);
+}
+
+function nodeIs(node, className) {
+    return node?.comfyClass === className || node?.type === className;
+}
+
+function connectedFinalDecode(node) {
+    const graph = node?.graph || app.graph;
+    if (!graph) return null;
+    const output = (node.outputs || []).find((o) => o?.name === "cache") || node.outputs?.[0];
+    for (const linkId of output?.links || []) {
+        const link = graph.links?.[linkId];
+        if (!link) continue;
+        const target = graph.getNodeById?.(link.target_id)
+            || (graph._nodes || []).find((n) => String(n?.id) === String(link.target_id));
+        if (target && nodeIs(target, FINAL_TARGET)) return target;
+    }
+    return null;
+}
+
+function collectWidgetValues(node, names) {
+    const out = {};
+    for (const name of names) {
+        const widget = getWidget(node, name);
+        if (widget) out[name] = widget.value;
+    }
+    return out;
+}
+
+function collectConnectionSummary(node) {
+    const out = {};
+    for (const input of node?.inputs || []) {
+        out[String(input?.name || "")] = input?.link != null;
+    }
+    return out;
+}
+
+function collectProjectPayload(node, runtime) {
+    updateHidden(node, runtime);
+    updateRefsHidden(node, runtime);
+    const finalNode = connectedFinalDecode(node);
+    const settings = collectWidgetValues(node, PROJECT_WIDGETS);
+    // In Auto mode the visible width/height widgets are mirrors of the active
+    // derived resolution. Preserve the user's Manual fallback separately so a
+    // later Auto -> Manual switch restores what they actually entered.
+    settings.width = Number(runtime.manualWidth || settings.width || 896);
+    settings.height = Number(runtime.manualHeight || settings.height || 576);
+    return {
+        schema_version: 2,
+        extender: {
+            class_name: TARGET,
+            node_title: String(node?.title || "MiniMax H3 Extender"),
+            settings,
+            resolution: {
+                mode: String(getWidget(node, "resolution_mode")?.value || "manual"),
+                megapixels: Number(getWidget(node, "megapixels")?.value ?? 0.40),
+                manual_width: Number(runtime.manualWidth || settings.width || 0),
+                manual_height: Number(runtime.manualHeight || settings.height || 0),
+                resolved_width: Number(runtime.resolvedWidth || runtime.expectedResolution?.width || 0),
+                resolved_height: Number(runtime.resolvedHeight || runtime.expectedResolution?.height || 0),
+                guide_ref: String(runtime.resolutionGuide || ""),
+                fallback: Boolean(runtime.resolutionFallback),
+            },
+            clips_json: serializeState(runtime.state),
+            clips: runtime.state.clips.map((clip) => ({ ...clip })),
+            refs_json: serializeRefsState(runtime.refsState),
+            references: runtime.refsState.refs.map((ref) => ref ? { ...ref } : null),
+            connections: collectConnectionSummary(node),
+        },
+        final_decode: finalNode ? {
+            class_name: FINAL_TARGET,
+            settings: collectWidgetValues(finalNode, FINAL_PROJECT_WIDGETS),
+        } : null,
+    };
+}
+
+function setWidgetValue(node, name, value) {
+    const widget = getWidget(node, name);
+    if (!widget || value === undefined) return false;
+    widget.value = value;
+    return true;
+}
+
+function applyProjectPayload(node, runtime, projectPayload) {
+    const extender = projectPayload?.extender || {};
+    const settings = extender?.settings || {};
+    if (typeof extender?.node_title === "string" && extender.node_title.trim()) {
+        node.title = extender.node_title;
+    }
+    for (const name of PROJECT_WIDGETS) {
+        if (name === "clips_json" || name === "refs_json") continue;
+        if (Object.prototype.hasOwnProperty.call(settings, name)) {
+            setWidgetValue(node, name, settings[name]);
+        }
+    }
+
+    // v14.24 and older .ext projects did not know about automatic resolution.
+    // Preserve their exact behavior instead of silently deriving a new size.
+    if (!Object.prototype.hasOwnProperty.call(settings, "resolution_mode")) {
+        setWidgetValue(node, "resolution_mode", "manual");
+    }
+
+    const savedResolution = extender?.resolution;
+    const savedManualW = Number(savedResolution?.manual_width || settings?.width || 0);
+    const savedManualH = Number(savedResolution?.manual_height || settings?.height || 0);
+    rememberManualResolution(node, runtime, savedManualW, savedManualH);
+    const savedW = Number(savedResolution?.resolved_width || 0);
+    const savedH = Number(savedResolution?.resolved_height || 0);
+    if (savedW > 0 && savedH > 0) {
+        runtime.expectedResolution = { width: savedW, height: savedH };
+        // Loading a portable project is the one place where the archived
+        // geometry is authoritative. Put that exact size in Manual mode so the
+        // imported latent cache can continue unchanged. The user can switch
+        // back to Auto or edit width/height afterwards; doing so starts a new
+        // cache at the newly requested resolution.
+        setWidgetValue(node, "width", savedW);
+        setWidgetValue(node, "height", savedH);
+        setWidgetValue(node, "resolution_mode", "manual");
+        rememberManualResolution(node, runtime, savedW, savedH);
+        runtime.projectResolutionLoaded = true;
+    }
+
+    const rawRefs =
+        extender?.refs_json
+        || settings?.refs_json
+        || JSON.stringify({ version: 1, refs: extender?.references || [] });
+    runtime.refsState = parseRefsState(rawRefs);
+    updateRefsHidden(node, runtime);
+
+    const rawClips = String(
+        extender?.clips_json
+        || settings?.clips_json
+        || JSON.stringify({ version: 1, clips: extender?.clips || [] })
+    );
+    runtime.state = parseState(rawClips);
+    // Loading a project mutates the disk cache outside ComfyUI's executor. A
+    // one-shot token forces the Extender input hash to change even if every
+    // visible setting happens to match the workflow that was previously run.
+    runtime.state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
+    updateHidden(node, runtime);
+
+    const finalSettings = projectPayload?.final_decode?.settings;
+    const finalNode = connectedFinalDecode(node);
+    if (finalNode && finalSettings && typeof finalSettings === "object") {
+        for (const name of FINAL_PROJECT_WIDGETS) {
+            if (Object.prototype.hasOwnProperty.call(finalSettings, name)) {
+                setWidgetValue(finalNode, name, finalSettings[name]);
+            }
+        }
+        finalNode.graph?.setDirtyCanvas(true, true);
+    }
+
+    node.graph?.setDirtyCanvas(true, true);
+}
+
+function projectBusy(runtime) {
+    return ["preparing", "sampling", "complete"].includes(String(runtime?.activePhase || ""));
+}
+
+function setProjectButtonsBusy(runtime, busy) {
+    if (!runtime) return;
+    runtime.projectOperationBusy = Boolean(busy);
+    if (runtime.saveProjectButton) runtime.saveProjectButton.disabled = Boolean(busy);
+    if (runtime.loadProjectButton) runtime.loadProjectButton.disabled = Boolean(busy);
+}
+
+async function saveProject(node, runtime) {
+    if (!node || !runtime) return;
+    if (projectBusy(runtime)) {
+        alert("Wait for the current clip generation to finish before saving the project.");
+        return;
+    }
+    if (runtime.resolutionInvalidated) {
+        alert(
+            "The resolution has changed and the previous cache is no longer compatible. " +
+            "Queue the Extender once to start the new-resolution cache before saving the project."
+        );
+        return;
+    }
+
+    const suggested = runtime.projectName || "MiniMax_H3_Project";
+    const requested = prompt("Project name (.ext)", suggested);
+    if (requested == null) return;
+    const projectName = String(requested || suggested).trim() || suggested;
+
+    setProjectButtonsBusy(runtime, true);
+    runtime.statusText = "Saving project…";
+    render(node, runtime);
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/project/prepare_save"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                owner_id: String(node.id),
+                project_name: projectName,
+                project: collectProjectPayload(node, runtime),
+            }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok || !payload?.token) {
+            throw new Error(payload?.error || `Save Project failed (${response.status}).`);
+        }
+
+        runtime.projectName = String(payload.filename || projectName).replace(/\.ext$/i, "");
+        node.properties = node.properties || {};
+        node.properties.h3_project_name = runtime.projectName;
+        runtime.statusText = `Project ready: ${payload.filename || projectName} | refs ${Number(payload?.references?.count ?? refCount(runtime))} embedded`;
+        render(node, runtime);
+
+        // Do not fetch the archive into a JS Blob: .ext files may be many GB.
+        // A normal browser download streams it directly from the backend.
+        const a = document.createElement("a");
+        a.href = api.apiURL(
+            "/h3_extender/project/download?token=" + encodeURIComponent(String(payload.token))
+        );
+        a.download = String(payload.filename || `${runtime.projectName}.ext`);
+        a.style.display = "none";
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => a.remove(), 0);
+    } catch (error) {
+        runtime.statusText = "Save Project failed";
+        render(node, runtime);
+        alert(String(error?.message || error));
+    } finally {
+        setProjectButtonsBusy(runtime, false);
+        render(node, runtime);
+    }
+}
+
+async function loadProjectFile(node, runtime, file) {
+    if (!node || !runtime || !file) return;
+    if (projectBusy(runtime)) {
+        alert("Wait for the current clip generation to finish before loading a project.");
+        return;
+    }
+    if (!confirm(
+        "Load this .ext project?\n\nThe current Extender cache, image references and project settings will be replaced."
+    )) return;
+
+    setProjectButtonsBusy(runtime, true);
+    runtime.statusText = `Loading ${file.name}…`;
+    render(node, runtime);
+    try {
+        const form = new FormData();
+        form.append("owner_id", String(node.id));
+        form.append("project_file", file, file.name);
+        const response = await fetch(api.apiURL("/h3_extender/project/load"), {
+            method: "POST",
+            body: form,
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Load Project failed (${response.status}).`);
+        }
+
+        applyProjectPayload(node, runtime, payload.project || {});
+        runtime.cachedCount = Number(payload?.cache?.cached_count || 0);
+        runtime.validatedCount = Number(payload?.cache?.validated_count || 0);
+        const loadedW = Number(payload?.cache?.resolved_width || runtime.expectedResolution?.width || 0);
+        const loadedH = Number(payload?.cache?.resolved_height || runtime.expectedResolution?.height || 0);
+        if (loadedW > 0 && loadedH > 0) {
+            runtime.expectedResolution = { width: loadedW, height: loadedH };
+            setWidgetValue(node, "width", loadedW);
+            setWidgetValue(node, "height", loadedH);
+            setWidgetValue(node, "resolution_mode", "manual");
+            rememberManualResolution(node, runtime, loadedW, loadedH);
+            runtime.resolutionMirrorActive = false;
+            runtime.projectResolutionLoaded = true;
+            runtime.resolutionInvalidated = false;
+        }
+        runtime.cacheStateRestored = true;
+        runtime.projectName = String(payload.project_name || file.name).replace(/\.ext$/i, "");
+        node.properties = node.properties || {};
+        node.properties.h3_project_name = runtime.projectName;
+        const resolutionText = loadedW > 0 && loadedH > 0 ? ` | ${loadedW}x${loadedH}` : "";
+        runtime.statusText =
+            `Loaded ${runtime.projectName}${resolutionText} | refs ${refCount(runtime)} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
+            `validated ${runtime.validatedCount}`;
+        render(node, runtime);
+        syncDomHeight(node, runtime, false);
+
+        // Final Decode / Preview can rebuild the full preview from decoded blobs
+        // already inside the imported cache, with no sampler or VAE execution.
+        window.dispatchEvent(new CustomEvent("h3-extender-project-loaded", {
+            detail: { owner_id: String(node.id) },
+        }));
+    } catch (error) {
+        runtime.statusText = "Load Project failed";
+        render(node, runtime);
+        alert(String(error?.message || error));
+    } finally {
+        setProjectButtonsBusy(runtime, false);
+        render(node, runtime);
+    }
+}
+
 function makeFieldLabel(text) {
     const label = document.createElement("div");
     label.textContent = text;
@@ -390,11 +1072,130 @@ function makeNumberInput(value, min, max, step) {
     return input;
 }
 
+function renderReferences(node, runtime) {
+    const row = runtime?.refsRow;
+    if (!row) return;
+    row.replaceChildren();
+
+    const refs = runtime.refsState?.refs || [];
+
+    for (let index = 0; index < MAX_IMAGE_REFS; index++) {
+        const ref = refs[index] || null;
+        const slot = document.createElement("div");
+        // Fill the whole available node width with nine equal reference slots.
+        // REF_SLOT_WIDTH is a hard minimum for each slot, not for the node.
+        // The node itself may shrink well below the combined strip width; once
+        // that happens this row owns the horizontal overflow and exposes its scrollbar.
+        slot.style.flex = "1 1 0px";
+        slot.style.minWidth = `${REF_SLOT_WIDTH}px`;
+        slot.style.boxSizing = "border-box";
+        slot.style.position = "relative";
+
+        const load = document.createElement("button");
+        load.textContent = ref ? `Replace Ref ${index + 1}` : `Load Ref ${index + 1}`;
+        load.title = ref
+            ? `Replace Ref ${index + 1}: ${ref.original_name || "reference"}`
+            : `Load image reference ${index + 1}`;
+        load.style.width = "100%";
+        load.style.height = "23px";
+        load.style.padding = "2px 4px";
+        load.style.fontSize = "10px";
+        load.disabled = Boolean(
+            runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime)
+        );
+        load.addEventListener("click", (event) => {
+            event.preventDefault();
+            if (load.disabled) return;
+            runtime.pendingRefSlot = index;
+            runtime.refFileInput?.click();
+        });
+        slot.appendChild(load);
+
+        const thumb = document.createElement("div");
+        thumb.style.marginTop = "2px";
+        thumb.style.width = "100%";
+        thumb.style.height = `${REF_THUMB_HEIGHT}px`;
+        thumb.style.boxSizing = "border-box";
+        thumb.style.border = "1px solid rgba(255,255,255,.15)";
+        thumb.style.borderRadius = "6px";
+        thumb.style.background = "rgba(0,0,0,.24)";
+        thumb.style.display = "flex";
+        thumb.style.alignItems = "center";
+        thumb.style.justifyContent = "center";
+        thumb.style.position = "relative";
+        thumb.style.overflow = "hidden";
+
+        if (ref) {
+            const img = document.createElement("img");
+            img.src = refImageUrl(ref);
+            img.alt = ref.original_name || `Ref ${index + 1}`;
+            img.title = `${ref.original_name || `Ref ${index + 1}`} — double-click to preview`;
+            img.style.width = "100%";
+            img.style.height = "100%";
+            img.style.objectFit = "contain";
+            img.style.cursor = "zoom-in";
+            img.draggable = false;
+            img.addEventListener("dblclick", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                openReferencePreview(ref);
+            });
+            thumb.appendChild(img);
+
+            const remove = document.createElement("button");
+            remove.textContent = "×";
+            remove.title = `Remove Ref ${index + 1}`;
+            remove.style.position = "absolute";
+            remove.style.top = "3px";
+            remove.style.right = "3px";
+            remove.style.width = "20px";
+            remove.style.height = "20px";
+            remove.style.minWidth = "20px";
+            remove.style.padding = "0";
+            remove.style.lineHeight = "16px";
+            remove.style.borderRadius = "10px";
+            remove.style.background = "rgba(0,0,0,.68)";
+            remove.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+            remove.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                removeReference(node, runtime, index);
+            });
+            thumb.appendChild(remove);
+        } else {
+            const empty = document.createElement("span");
+            empty.textContent = "+";
+            empty.style.fontSize = "24px";
+            empty.style.opacity = ".55";
+            thumb.appendChild(empty);
+        }
+        slot.appendChild(thumb);
+
+        const meta = document.createElement("div");
+        meta.style.marginTop = "1px";
+        meta.style.fontSize = "9px";
+        meta.style.lineHeight = "9px";
+        meta.style.opacity = ".6";
+        meta.style.textAlign = "center";
+        meta.style.whiteSpace = "nowrap";
+        meta.style.overflow = "hidden";
+        meta.style.textOverflow = "ellipsis";
+        meta.textContent = ref && ref.width > 0 && ref.height > 0
+            ? `${Math.trunc(ref.width)}×${Math.trunc(ref.height)}`
+            : "empty";
+        meta.title = ref?.original_name || "";
+        slot.appendChild(meta);
+
+        row.appendChild(slot);
+    }
+}
+
 function render(node, runtime) {
     const { state, cards, counter, status } = runtime;
+    renderReferences(node, runtime);
     cards.replaceChildren();
 
-    counter.textContent = `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""}`;
+    counter.textContent = `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}`;
     status.textContent = runtime.statusText || "Ready";
 
     state.clips.forEach((clip, index) => {
@@ -433,7 +1234,30 @@ function render(node, runtime) {
 
         const title = document.createElement("strong");
         title.textContent = `CLIP ${index + 1}`;
-        title.style.flex = "1";
+        title.style.flex = "0 0 auto";
+        title.style.whiteSpace = "nowrap";
+
+        const name = document.createElement("input");
+        name.type = "text";
+        name.value = clip.name || "";
+        name.placeholder = "name";
+        name.title = "Optional clip/card name";
+        name.style.flex = "1 1 0";
+        name.style.minWidth = "0";
+        name.style.height = "22px";
+        name.style.boxSizing = "border-box";
+        name.style.background = "rgba(0,0,0,.22)";
+        name.style.border = "1px solid rgba(255,255,255,.12)";
+        name.style.color = "inherit";
+        name.style.borderRadius = "4px";
+        name.style.padding = "2px 5px";
+        name.style.fontSize = "11px";
+        name.addEventListener("input", () => {
+            if (name.value === clip.name) return;
+            clip.name = name.value;
+            updateHidden(node, runtime);
+            // Keep focus while typing; no DOM rebuild here.
+        });
 
         const badge = document.createElement("span");
         badge.style.fontSize = "10px";
@@ -452,7 +1276,7 @@ function render(node, runtime) {
             st === "current" ? "● NEXT" :
             st === "cached" ? "CACHE" : "○";
 
-        head.append(title, badge);
+        head.append(title, name, badge);
         card.appendChild(head);
 
         card.appendChild(makeFieldLabel("Prompt"));
@@ -731,7 +1555,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         const actualH = Number(node.size?.[1] || h);
         const available = Math.max(UI_MIN_HEIGHT, actualH - y - BOTTOM_PAD);
         runtime.root.style.height = `${available}px`;
-        runtime.cards.style.height = `${Math.max(340, available - 55)}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT)}px`;
         runtime.cards.style.flex = "0 0 auto";
         runtime.cards.style.minHeight = "";
         runtime.domHeight = available;
@@ -746,20 +1570,8 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
 }
 
 function installInvalidationHooks(node, runtime) {
-    // No parameter/input change is allowed to alter clip validation. The only
-    // special connection handling kept here is the dynamic ref socket UI.
-    const oldConnections = node.onConnectionsChange;
-    node.onConnectionsChange = function (type, index, connected, linkInfo, inputInfo) {
-        if (oldConnections) oldConnections.apply(this, arguments);
-
-        const slot = this.inputs?.[index];
-        const slotName = slot?.name;
-
-        if (type === 1 && isRefInputName(slotName) && !this.__h3RefCompacting) {
-            compactRefInputConnections(this);
-            syncDynamicRefInputs(this);
-        }
-    };
+    // Image references are no longer graph sockets. Other input/parameter
+    // changes deliberately preserve explicit clip validation as before.
 }
 
 
@@ -767,13 +1579,17 @@ function buildUi(node) {
     if (node.__h3Extender) return node.__h3Extender;
 
     const jsonWidget = getWidget(node, "clips_json");
-    if (!jsonWidget) return null;
+    const refsWidget = getWidget(node, "refs_json");
+    if (!jsonWidget || !refsWidget) return null;
     hideNativeWidget(node, jsonWidget);
+    hideNativeWidget(node, refsWidget);
 
     const state = parseState(jsonWidget.value);
+    const refsState = parseRefsState(refsWidget.value);
 
     const root = document.createElement("div");
     root.style.width = "100%";
+    root.style.minWidth = "0";
     root.style.height = `${UI_MIN_HEIGHT}px`;
     root.style.minHeight = `${UI_MIN_HEIGHT}px`;
     // Official DOMWidgetImpl.computeLayoutSize() reads this CSS variable as a
@@ -788,6 +1604,7 @@ function buildUi(node) {
 
     const toolbar = document.createElement("div");
     toolbar.style.display = "flex";
+    toolbar.style.minWidth = "0";
     toolbar.style.gap = "7px";
     toolbar.style.alignItems = "center";
     toolbar.style.marginBottom = "7px";
@@ -814,6 +1631,36 @@ function buildUi(node) {
         render(node, runtime);
     });
 
+    const saveProjectButton = document.createElement("button");
+    saveProjectButton.textContent = "Save Project";
+    saveProjectButton.title = "Save settings + disk cache as a portable .ext project";
+    saveProjectButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        saveProject(node, runtime);
+    });
+
+    const loadProjectButton = document.createElement("button");
+    loadProjectButton.textContent = "Load Project";
+    loadProjectButton.title = "Load a .ext project into this Extender node";
+
+    const projectFileInput = document.createElement("input");
+    projectFileInput.type = "file";
+    projectFileInput.accept = ".ext,application/zip,application/octet-stream";
+    projectFileInput.style.display = "none";
+    projectFileInput.addEventListener("change", async () => {
+        const file = projectFileInput.files?.[0];
+        projectFileInput.value = "";
+        if (file) await loadProjectFile(node, runtime, file);
+    });
+    loadProjectButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (projectBusy(runtime)) {
+            alert("Wait for the current clip generation to finish before loading a project.");
+            return;
+        }
+        projectFileInput.click();
+    });
+
     const counter = document.createElement("span");
     counter.style.fontSize = "11px";
     counter.style.opacity = ".8";
@@ -827,10 +1674,47 @@ function buildUi(node) {
     status.style.textOverflow = "ellipsis";
     status.style.maxWidth = "55%";
 
-    toolbar.append(add, remove, counter, status);
+    toolbar.append(add, remove, saveProjectButton, loadProjectButton, counter, status, projectFileInput);
+
+    const refFileInput = document.createElement("input");
+    refFileInput.type = "file";
+    refFileInput.accept = "image/*,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff";
+    refFileInput.style.display = "none";
+
+    const refsSection = document.createElement("div");
+    refsSection.style.height = `${REF_SECTION_HEIGHT}px`;
+    refsSection.style.minWidth = "0";
+    refsSection.style.flex = `0 0 ${REF_SECTION_HEIGHT}px`;
+    refsSection.style.boxSizing = "border-box";
+    refsSection.style.marginBottom = "7px";
+
+    const refsHeader = document.createElement("div");
+    refsHeader.textContent = "REFERENCE IMAGES — double-click a thumbnail to preview";
+    refsHeader.style.fontSize = "10px";
+    refsHeader.style.fontWeight = "600";
+    refsHeader.style.opacity = ".75";
+    refsHeader.style.height = "13px";
+    refsHeader.style.lineHeight = "13px";
+    refsHeader.style.marginBottom = "1px";
+
+    const refsRow = document.createElement("div");
+    refsRow.style.display = "flex";
+    refsRow.style.flexDirection = "row";
+    refsRow.style.width = "100%";
+    refsRow.style.maxWidth = "100%";
+    refsRow.style.minWidth = "0";
+    refsRow.style.gap = "7px";
+    refsRow.style.overflowX = "auto";
+    refsRow.style.overflowY = "hidden";
+    refsRow.style.paddingBottom = `${REF_SCROLLBAR_SPACE}px`;
+    refsRow.style.boxSizing = "border-box";
+    refsRow.style.height = `${REF_SECTION_HEIGHT - 14}px`;
+    refsRow.style.scrollbarGutter = "stable";
+    refsSection.append(refsHeader, refsRow);
 
     const cards = document.createElement("div");
     cards.style.display = "flex";
+    cards.style.minWidth = "0";
     cards.style.flexDirection = "row";
     cards.style.gap = "9px";
     cards.style.overflowX = "auto";
@@ -839,20 +1723,32 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${UI_MIN_HEIGHT - 55}px`;
+    cards.style.height = `${UI_MIN_HEIGHT - 55 - REF_SECTION_HEIGHT}px`;
     cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
 
-    root.append(toolbar, cards);
+    root.append(toolbar, refsSection, cards, refFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
         state,
         jsonWidget,
+        refsState,
+        refsWidget,
         root,
         toolbar,
+        refsSection,
+        refsRow,
         cards,
         counter,
         status,
+        saveProjectButton,
+        loadProjectButton,
+        projectFileInput,
+        refFileInput,
+        pendingRefSlot: -1,
+        refBusy: false,
+        projectOperationBusy: false,
+        projectName: String(node?.properties?.h3_project_name || ""),
         domWidget: null,
         domHeight: UI_MIN_HEIGHT,
         syncingDomHeight: false,
@@ -869,8 +1765,38 @@ function buildUi(node) {
         activePhase: "idle",
         cacheStateRequestRunning: false,
         cacheStateRestored: false,
+        expectedResolution: null,
+        resolvedWidth: 0,
+        resolvedHeight: 0,
+        resolutionGuide: "",
+        guideSourceWidth: 0,
+        guideSourceHeight: 0,
+        resolutionFallback: false,
+        resolutionMismatch: false,
+        manualWidth: Number(node?.properties?.h3_manual_width || getWidget(node, "width")?.value || 896),
+        manualHeight: Number(node?.properties?.h3_manual_height || getWidget(node, "height")?.value || 576),
+        applyingResolutionMirror: false,
+        resolutionMirrorActive: false,
+        resolutionCallbacksInstalled: false,
+        // True only after an explicit .ext Load has imposed its archived
+        // geometry. Any user resolution edit clears it; editing megapixels
+        // also switches straight back to Auto because MP has no Manual meaning.
+        projectResolutionLoaded: false,
+        // True after a live resolution change has made the on-disk cache stale.
+        // The backend clears/rebuilds that cache on the next Queue.
+        resolutionInvalidated: false,
         ready: false,
     };
+
+    refFileInput.addEventListener("change", async () => {
+        const file = refFileInput.files?.[0];
+        const slot = Number(runtime.pendingRefSlot);
+        refFileInput.value = "";
+        runtime.pendingRefSlot = -1;
+        if (file && Number.isInteger(slot) && slot >= 0 && slot < MAX_IMAGE_REFS) {
+            await uploadReference(node, runtime, slot, file);
+        }
+    });
 
     const domWidget = node.addDOMWidget("h3_extender_timeline", "timeline", root, {
         serialize: false,
@@ -908,30 +1834,57 @@ function buildUi(node) {
     node.__h3Extender = runtime;
 
     installInvalidationHooks(node, runtime);
+    wrapResolutionWidgetCallbacks(node, runtime);
     render(node, runtime);
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {
         if (oldConfigure) oldConfigure.apply(this, arguments);
+
+        // Workflow widget arrays are positional. The two v14.25 resolution
+        // widgets were intentionally appended after clips_json so old values do
+        // not shift. If this is an older workflow, force Manual to preserve its
+        // historical width/height behavior. Newly-created nodes default to Auto.
+        const savedWidgetValues = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+        const hasSavedResolutionMode = Boolean(
+            savedWidgetValues?.some((value) => value === "auto_from_ref" || value === "manual")
+        );
+        if (savedWidgetValues && !hasSavedResolutionMode) {
+            setWidgetValue(this, "resolution_mode", "manual");
+        }
+
         requestAnimationFrame(() => {
-            compactRefInputConnections(this);
-            syncDynamicRefInputs(this);
+            const removedLegacyRefs = removeLegacyImageRefInputs(this);
             runtime.state = parseState(runtime.jsonWidget.value);
+            runtime.refsState = parseRefsState(runtime.refsWidget.value);
+            updateRefsHidden(this, runtime);
             const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
             runtime.cachedCount = restoredValidatedPrefix;
             runtime.validatedCount = restoredValidatedPrefix;
+            if (removedLegacyRefs && refCount(runtime) === 0) {
+                runtime.statusText = "Legacy image-ref sockets removed — load references in the Extender";
+            }
+            if (String(getWidget(this, "resolution_mode")?.value || "manual") === "manual") {
+                rememberManualResolution(
+                    this,
+                    runtime,
+                    Number(getWidget(this, "width")?.value || runtime.manualWidth || 896),
+                    Number(getWidget(this, "height")?.value || runtime.manualHeight || 576),
+                );
+            }
             render(this, runtime);
             restoreCacheState(this, runtime);
+            syncResolutionMirror(this, runtime);
             syncDomHeight(this, runtime, true);
         });
     };
 
     requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-            compactRefInputConnections(node);
-            syncDynamicRefInputs(node);
+            removeLegacyImageRefInputs(node);
             runtime.ready = true;
             restoreCacheState(node, runtime);
+            syncResolutionMirror(node, runtime);
             syncDomHeight(node, runtime, true);
         });
     });
@@ -974,10 +1927,57 @@ function scrollActiveCard(runtime, index) {
     });
 }
 
+// A cancelled/failed ComfyUI execution does not call this node's onExecuted
+// callback. Without an explicit terminal-event reset, the last custom progress
+// event (usually "sampling") leaves the active card permanently blue until a
+// page refresh. ComfyUI exposes official execution_interrupted/error/success
+// websocket events, so clear only the transient rendering state when a prompt
+// terminates. Cache/validation/card data are deliberately left untouched.
+function clearTransientRenderingState(statusText = null) {
+    const graph = app.graph;
+    if (!graph) return;
+
+    for (const node of graph._nodes || []) {
+        if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+
+        const runtime = node.__h3Extender;
+        if (!runtime) continue;
+
+        const wasActive =
+            Number(runtime.activeClipIndex) >= 0 ||
+            ["preparing", "sampling", "complete"].includes(
+                String(runtime.activePhase || "")
+            );
+        if (!wasActive) continue;
+
+        runtime.activeClipIndex = -1;
+        runtime.activePhase = "idle";
+        if (statusText) runtime.statusText = statusText;
+
+        render(node, runtime);
+        node.graph?.setDirtyCanvas(true, true);
+    }
+}
+
 app.registerExtension({
     name: "MiniMaxH3.Extender",
 
     setup() {
+        // Official ComfyUI terminal execution events. In particular, pressing
+        // Kill/Interrupt raises execution_interrupted and bypasses onExecuted.
+        api.addEventListener("execution_interrupted", () => {
+            clearTransientRenderingState("Rendering interrupted");
+        });
+        api.addEventListener("execution_error", () => {
+            clearTransientRenderingState("Execution stopped by error");
+        });
+        // Defensive cleanup: a successful prompt should never leave a stale
+        // rendering highlight even if another frontend/backend change prevents
+        // the expected node UI callback from arriving.
+        api.addEventListener("execution_success", () => {
+            clearTransientRenderingState();
+        });
+
         api.addEventListener(PROGRESS_EVENT, ({ detail }) => {
             const node = findExtenderNodeByExecutionId(detail?.node);
             if (!node) return;
@@ -1008,9 +2008,14 @@ app.registerExtension({
         const oldCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const r = oldCreated ? oldCreated.apply(this, arguments) : undefined;
+
+            // New nodes must start in Auto resolution mode. Older workflows are
+            // still migrated to Manual later in onConfigure when they do not
+            // contain the v14.25+ resolution widgets.
+            setWidgetValue(this, "resolution_mode", "auto_from_ref");
+
             const runtime = buildUi(this);
-            compactRefInputConnections(this);
-            syncDynamicRefInputs(this);
+            removeLegacyImageRefInputs(this);
             if (runtime) {
                 requestAnimationFrame(() => {
                     requestAnimationFrame(() => syncDomHeight(this, runtime, true));
@@ -1032,7 +2037,11 @@ app.registerExtension({
                 runtime.jsonWidget.value = info.clips_json;
                 runtime.state = parseState(info.clips_json);
             }
-
+            if (info.refs_json) {
+                runtime.refsWidget.value = info.refs_json;
+                runtime.refsState = parseRefsState(info.refs_json);
+            }
+    
             const generated = Array.isArray(info.generated) ? info.generated : [];
             for (const humanIndex of generated) {
                 const i = Number(humanIndex) - 1;
@@ -1052,9 +2061,30 @@ app.registerExtension({
 
             runtime.cachedCount = Number(info.cached_count || 0);
             runtime.validatedCount = Number(info.validated_count || 0);
+            runtime.resolvedWidth = Number(info.resolved_width || 0);
+            runtime.resolvedHeight = Number(info.resolved_height || 0);
+            runtime.resolutionGuide = String(info.resolution_guide || "");
+            runtime.guideSourceWidth = Number(info.resolution_guide_width || 0);
+            runtime.guideSourceHeight = Number(info.resolution_guide_height || 0);
+            runtime.resolutionFallback = Boolean(info.resolution_fallback);
+            runtime.resolutionMismatch = Boolean(info.resolution_mismatch);
+            if (runtime.resolvedWidth > 0 && runtime.resolvedHeight > 0) {
+                // Backend execution is authoritative. After a resolution-change
+                // run, this becomes the new baseline for future invalidation.
+                runtime.expectedResolution = {
+                    width: runtime.resolvedWidth,
+                    height: runtime.resolvedHeight,
+                };
+                runtime.resolutionInvalidated = false;
+            }
             runtime.activeClipIndex = -1;
             runtime.activePhase = "idle";
             runtime.statusText = String(info.status || "Ready");
+            if (runtime.resolutionMismatch && Number(info.cache_width || 0) > 0) {
+                runtime.statusText +=
+                    ` | WARNING cache ${Number(info.cache_width)}x${Number(info.cache_height)} differs`;
+            }
+            syncResolutionMirror(this, runtime);
             render(this, runtime);
             syncDomHeight(this, runtime, false);
         };

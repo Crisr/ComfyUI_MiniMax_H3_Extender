@@ -479,8 +479,38 @@ function makePlayer(node) {
     return state;
 }
 
+function refreshImportedProjectPreview(ownerId) {
+    const graph = app.graph;
+    if (!graph) return;
+    const wanted = String(ownerId);
+    for (const node of graph._nodes || []) {
+        if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+        if (String(findUpstreamExtenderId(node)) !== wanted) continue;
+
+        const state = makePlayer(node);
+        state.liveLoaded = false;
+        state.restoreLoaded = false;
+        state.restoreRequestRunning = false;
+        state.label.textContent = "PROJECT LOADED — preview will restore when cached render data is available";
+        try {
+            state.video.pause();
+            state.video.removeAttribute("src");
+            state.video.load();
+        } catch (_) {}
+        restorePreviewOnLoad(node, state);
+    }
+}
+
 app.registerExtension({
     name: "MiniMaxH3.MotionContext.LivePreview",
+
+    setup() {
+        window.addEventListener("h3-extender-project-loaded", (event) => {
+            const ownerId = event?.detail?.owner_id;
+            if (ownerId == null) return;
+            refreshImportedProjectPreview(ownerId);
+        });
+    },
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === DISK_JOIN_TARGET) {
