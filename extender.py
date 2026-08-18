@@ -13,9 +13,21 @@ normally before the Extender.
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import datetime as _datetime
+import hashlib
 import json
 import math
+import os
+import re
+from pathlib import Path
 import secrets
+import shutil
+import time
+import uuid
+import zipfile
+import numpy as np
 import torch
 import torchaudio
 import comfy.model_management
@@ -25,11 +37,21 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 import node_helpers
+from aiohttp import web
+from PIL import Image, ImageOps
 from server import PromptServer
 
 from .motion_context_ram import MiniMaxH3MotionContextRAM
 from .motion_context_disk import (
+    CACHE_VERSION,
     CACHE_TYPE,
+    _DATA_START,
+    _chain_paths,
+    _decoded_preview_cache_path,
+    _decoded_preview_video_cache_path,
+    _ensure_cache_root,
+    _safe_name,
+    _write_json_atomic,
     MiniMaxH3MotionContextDiskJoin,
     _cache_size_mb,
     _load_manifest_from_paths,
@@ -37,14 +59,28 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.23-strict-comfy-compat"
+BUILD = "minimax-h3-extender-v14.46-audio-entry-ramp"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
 REF_IMAGE_SHORT_EDGE = 2048
 MAX_CLIPS = 512
 DEFAULT_DURATION = 10.0
+DEFAULT_MEGAPIXELS = 0.40
+MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
+
+PROJECT_FORMAT = "MiniMax H3 Extender Project"
+PROJECT_FORMAT_VERSION = 2
+PROJECT_SUPPORTED_VERSIONS = {1, 2}
+PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
+PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
+PROJECT_COPY_CHUNK = 8 * 1024 * 1024
+MAX_IMAGE_REFS = 9
+REFS_JSON_VERSION = 1
+MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
+MAX_REF_PIXELS = 120_000_000
+_PROJECT_DOWNLOADS = {}
 
 
 def _align_frame_count(n: int) -> int:
@@ -80,6 +116,356 @@ def _empty_av_latent(width: int, height: int, frame_count: int):
     return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}
 
 
+def _manual_effective_resolution(width: int, height: int):
+    """Mirror the resolution the legacy latent allocation actually uses.
+
+    Older workflows could feed arbitrary integers into width/height through
+    connected inputs.  _empty_av_latent historically floors each axis to a
+    16-pixel latent grid via integer division, so preserve that exact behavior
+    for Manual/fallback mode instead of silently changing old caches.
+    """
+    w = max(16, min(MAX_RESOLUTION, (int(width) // 16) * 16))
+    h = max(16, min(MAX_RESOLUTION, (int(height) // 16) * 16))
+    return w, h
+
+
+def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
+    """Mirror ComfyUI Scale Image to Total Pixels -> Get Image Size -> Extender."""
+    src_w = int(src_w)
+    src_h = int(src_h)
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError("MiniMax H3 Extender: reference image has invalid dimensions.")
+
+    mp = max(0.01, min(16.0, float(megapixels)))
+    total = mp * 1024.0 * 1024.0
+    scale_by = math.sqrt(total / float(src_w * src_h))
+    scaled_w = max(1, round(src_w * scale_by))
+    scaled_h = max(1, round(src_h * scale_by))
+
+    if scaled_w > MAX_RESOLUTION or scaled_h > MAX_RESOLUTION:
+        shrink = min(MAX_RESOLUTION / float(scaled_w), MAX_RESOLUTION / float(scaled_h))
+        scaled_w = max(1, round(scaled_w * shrink))
+        scaled_h = max(1, round(scaled_h * shrink))
+
+    return _manual_effective_resolution(scaled_w, scaled_h)
+
+
+def _auto_resolution_from_image(image, megapixels: float):
+    if image is None or getattr(image, "ndim", 0) < 4:
+        raise ValueError("MiniMax H3 Extender: invalid reference image for auto resolution.")
+    return _auto_resolution_from_dimensions(
+        int(image.shape[2]),
+        int(image.shape[1]),
+        megapixels,
+    )
+
+
+def _refs_root():
+    root = _ensure_cache_root() / "_refs"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _ref_id_is_safe(value):
+    value = str(value or "").lower()
+    return len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _ref_path(ref_id):
+    ref_id = str(ref_id or "").lower()
+    if not _ref_id_is_safe(ref_id):
+        raise ValueError("MiniMax H3 Extender: invalid internal reference id.")
+    return _refs_root() / f"{ref_id}.png"
+
+
+def _empty_refs():
+    return [None for _ in range(MAX_IMAGE_REFS)]
+
+
+def _normalize_ref_descriptor(value):
+    if not isinstance(value, dict):
+        return None
+    ref_id = str(value.get("id") or value.get("ref_id") or "").lower().strip()
+    if not _ref_id_is_safe(ref_id):
+        return None
+    try:
+        width = int(value.get("width", 0) or 0)
+        height = int(value.get("height", 0) or 0)
+    except Exception:
+        width = height = 0
+    try:
+        size_bytes = int(value.get("size_bytes", 0) or 0)
+    except Exception:
+        size_bytes = 0
+    return {
+        "id": ref_id,
+        "original_name": str(value.get("original_name") or value.get("name") or "reference.png"),
+        "width": max(0, width),
+        "height": max(0, height),
+        "size_bytes": max(0, size_bytes),
+    }
+
+
+def _normalize_ref_descriptors(refs):
+    """Normalize nine stable logical ref slots without compacting holes."""
+    source = list(refs or [])[:MAX_IMAGE_REFS]
+    normalized = []
+    for value in source:
+        normalized.append(_normalize_ref_descriptor(value))
+    normalized += [None] * (MAX_IMAGE_REFS - len(normalized))
+    return normalized
+
+
+def _parse_refs_json(raw):
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        try:
+            payload = json.loads(str(raw or "{}"))
+        except Exception:
+            payload = {}
+    values = payload.get("refs") if isinstance(payload, dict) else None
+    if not isinstance(values, list):
+        values = []
+    refs = [_normalize_ref_descriptor(value) for value in values[:MAX_IMAGE_REFS]]
+    refs += [None] * (MAX_IMAGE_REFS - len(refs))
+    return _normalize_ref_descriptors(refs)
+
+
+def _refs_json(refs):
+    return json.dumps(
+        {"version": REFS_JSON_VERSION, "refs": _normalize_ref_descriptors(refs)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _refs_signature(refs):
+    ids = [ref.get("id") if isinstance(ref, dict) else None for ref in _normalize_ref_descriptors(refs)]
+    raw = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _reference_count(refs):
+    return sum(1 for ref in refs or [] if ref is not None)
+
+
+def _validate_reference_file(path):
+    path = Path(path)
+    with Image.open(path) as image:
+        width, height = map(int, image.size)
+        if width <= 0 or height <= 0:
+            raise ValueError("MiniMax H3 Extender: reference image has invalid dimensions.")
+        if width * height > MAX_REF_PIXELS:
+            raise ValueError(
+                f"MiniMax H3 Extender: reference image is too large ({width}x{height})."
+            )
+        image.verify()
+    return width, height
+
+
+def _hash_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(PROJECT_COPY_CHUNK)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _store_uploaded_reference(source_path, original_name):
+    """Normalize an uploaded reference to RGB PNG and store it content-addressed."""
+    source_path = Path(source_path)
+    temp_png = _refs_root() / f".upload_{uuid.uuid4().hex}.png"
+    try:
+        with Image.open(source_path) as source:
+            source = ImageOps.exif_transpose(source)
+            width, height = map(int, source.size)
+            if width <= 0 or height <= 0:
+                raise ValueError("MiniMax H3 Extender: reference image has invalid dimensions.")
+            if width * height > MAX_REF_PIXELS:
+                raise ValueError(
+                    f"MiniMax H3 Extender: reference image is too large ({width}x{height})."
+                )
+            rgb = source.convert("RGB")
+            rgb.save(temp_png, format="PNG", optimize=False, compress_level=4)
+
+        ref_id = _hash_file(temp_png)
+        target = _ref_path(ref_id)
+        if target.exists():
+            temp_png.unlink(missing_ok=True)
+        else:
+            os.replace(temp_png, target)
+        return {
+            "id": ref_id,
+            "original_name": str(original_name or source_path.name or "reference.png"),
+            "width": int(width),
+            "height": int(height),
+            "size_bytes": int(target.stat().st_size),
+        }
+    finally:
+        try:
+            temp_png.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _store_project_reference(source_path, original_name):
+    """Validate an archived PNG and preserve its exact bytes/hash on import."""
+    source_path = Path(source_path)
+    width, height = _validate_reference_file(source_path)
+    ref_id = _hash_file(source_path)
+    target = _ref_path(ref_id)
+    if not target.exists():
+        temp = _refs_root() / f".import_{uuid.uuid4().hex}.png"
+        shutil.copyfile(source_path, temp)
+        try:
+            os.replace(temp, target)
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return {
+        "id": ref_id,
+        "original_name": str(original_name or "reference.png"),
+        "width": int(width),
+        "height": int(height),
+        "size_bytes": int(target.stat().st_size),
+    }
+
+
+def _load_reference_tensor(ref):
+    if not isinstance(ref, dict):
+        raise ValueError("MiniMax H3 Extender: invalid internal reference metadata.")
+    path = _ref_path(ref.get("id"))
+    if not path.exists():
+        raise FileNotFoundError(
+            f"MiniMax H3 Extender: internal reference '{ref.get('original_name') or ref.get('id')}' is missing. "
+            "Reload the reference image or load the portable .ext project that contains it."
+        )
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        array = np.asarray(image, dtype=np.float32) / 255.0
+    return torch.from_numpy(np.ascontiguousarray(array)).unsqueeze(0)
+
+
+def _refs_from_project_payload(project_payload):
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("refs_json") if isinstance(extender, dict) else None
+    if not raw:
+        settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
+        raw = settings.get("refs_json") if isinstance(settings, dict) else None
+    if not raw and isinstance(extender, dict) and isinstance(extender.get("references"), list):
+        raw = {"version": REFS_JSON_VERSION, "refs": extender.get("references")}
+    return _parse_refs_json(raw)
+
+
+def _write_refs_to_project_payload(project_payload, refs):
+    refs = _normalize_ref_descriptors(refs)
+    extender = project_payload.setdefault("extender", {})
+    raw = _refs_json(refs)
+    extender["refs_json"] = raw
+    extender["references"] = copy.deepcopy(refs)
+    settings = extender.setdefault("settings", {})
+    if isinstance(settings, dict):
+        settings["refs_json"] = raw
+    return refs
+
+
+def _reference_dimensions(ref):
+    if ref is None:
+        return None
+    if isinstance(ref, dict):
+        try:
+            width = int(ref.get("width", 0) or 0)
+            height = int(ref.get("height", 0) or 0)
+        except Exception:
+            return None
+        if width > 0 and height > 0:
+            return width, height
+        path = _ref_path(ref.get("id"))
+        if path.exists():
+            width, height = _validate_reference_file(path)
+            ref["width"] = int(width)
+            ref["height"] = int(height)
+            return width, height
+        return None
+    if getattr(ref, "ndim", 0) >= 4:
+        return int(ref.shape[2]), int(ref.shape[1])
+    return None
+
+
+def _select_resolution_guide(refs):
+    """Ref 1 wins; otherwise the first available internal reference wins."""
+    if refs and refs[0] is not None:
+        return 1, refs[0]
+    for index, image in enumerate(refs or [], start=1):
+        if image is not None:
+            return index, image
+    return None, None
+
+
+def _resolve_generation_resolution(resolution_mode, megapixels, width, height, refs):
+    manual_w, manual_h = _manual_effective_resolution(width, height)
+    mode = str(resolution_mode or "auto_from_ref")
+    if mode == "manual":
+        return {
+            "width": manual_w,
+            "height": manual_h,
+            "mode": "manual",
+            "guide_ref": None,
+            "guide_src_width": 0,
+            "guide_src_height": 0,
+            "fallback": False,
+            "megapixels": float(megapixels),
+        }
+
+    guide_index, guide = _select_resolution_guide(refs)
+    dims = _reference_dimensions(guide) if guide is not None else None
+    if guide is None or dims is None:
+        return {
+            "width": manual_w,
+            "height": manual_h,
+            "mode": "manual_fallback",
+            "guide_ref": None,
+            "guide_src_width": 0,
+            "guide_src_height": 0,
+            "fallback": True,
+            "megapixels": float(megapixels),
+        }
+
+    src_w, src_h = dims
+    resolved_w, resolved_h = _auto_resolution_from_dimensions(src_w, src_h, megapixels)
+    return {
+        "width": resolved_w,
+        "height": resolved_h,
+        "mode": "auto_from_ref",
+        "guide_ref": int(guide_index),
+        "guide_src_width": int(src_w),
+        "guide_src_height": int(src_h),
+        "fallback": False,
+        "megapixels": float(megapixels),
+    }
+
+def _resolution_from_manifest(manifest):
+    if not isinstance(manifest, dict):
+        return None
+    geom = manifest.get("geometry")
+    if not isinstance(geom, dict):
+        return None
+    try:
+        w = int(geom.get("video_w", 0)) * 16
+        h = int(geom.get("video_h", 0)) * 16
+    except Exception:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return {"width": w, "height": h}
+
+
 def _resize(image, width: int, height: int):
     samples = image[..., :3].movedim(-1, 1)
     samples = comfy.utils.common_upscale(
@@ -108,23 +494,24 @@ def _prepare_shared_refs(
     refs,
     ref_audio=None,
 ):
-    """Encode shared Ref2VA image refs plus one optional standalone audio ref."""
-    active = []
-    seen_gap = False
-    for i, image in enumerate(refs, start=1):
-        if image is None:
-            seen_gap = True
-            continue
-        if seen_gap:
-            raise ValueError(
-                f"MiniMax H3 Extender: ref_{i} is connected after an empty "
-                "reference slot. Connect shared refs contiguously from ref_1."
-            )
-        active.append(image)
+    """Encode shared Ref2VA image refs plus one optional standalone audio ref.
+
+    Ref slots are stable logical identities. Native H3 numbers only the active
+    images contiguously, so we also return the logical slot order and remap
+    <Picture N> tags just before tokenization. This lets Ref 3 stay Ref 3 even
+    when Ref 2 is empty, without feeding a fake placeholder image to the model.
+    """
+    active = [
+        (slot, image)
+        for slot, image in enumerate(refs, start=1)
+        if image is not None
+    ]
 
     ref_items = []
     ref_blocks = []
-    for img in active:
+    active_picture_slots = []
+    for slot, ref in active:
+        img = _load_reference_tensor(ref) if isinstance(ref, dict) else ref
         h, w = int(img.shape[1]), int(img.shape[2])
         if ref_image_size == "match":
             scale = min(1.0, math.sqrt((int(width) * int(height)) / float(w * h)))
@@ -143,6 +530,7 @@ def _prepare_shared_refs(
         resized = _resize(img[:1], tw, th)
         z = vae.encode(resized)
         ref_items.append({"type": "image", "data": resized})
+        active_picture_slots.append(int(slot))
         ref_blocks.append(
             {
                 "kind": "image",
@@ -175,7 +563,32 @@ def _prepare_shared_refs(
             }
         )
 
-    return ref_items, ref_blocks
+    return ref_items, ref_blocks, active_picture_slots
+
+
+_PICTURE_TAG_RE = re.compile(r"<Picture\s+(\d+)>", re.IGNORECASE)
+
+
+def _remap_picture_tags(prompt: str, active_picture_slots):
+    """Map stable UI Ref slots to H3's contiguous active Picture ordinals."""
+    slot_to_ordinal = {
+        int(slot): ordinal
+        for ordinal, slot in enumerate(active_picture_slots or [], start=1)
+    }
+
+    def replace(match):
+        slot = int(match.group(1))
+        if slot < 1 or slot > MAX_IMAGE_REFS:
+            return match.group(0)
+        ordinal = slot_to_ordinal.get(slot)
+        # Do not police the user's prompt. An empty logical slot may be an
+        # accidental reference or an intentional use of native H3 numbering.
+        # In that case leave the tag exactly as written and let H3 interpret it.
+        if ordinal is None:
+            return match.group(0)
+        return f"<Picture {ordinal}>"
+
+    return _PICTURE_TAG_RE.sub(replace, str(prompt))
 
 
 def _make_ref2va_conditioning(
@@ -187,9 +600,11 @@ def _make_ref2va_conditioning(
     frame_count: int,
     ref_items,
     ref_blocks,
+    active_picture_slots,
 ):
     latent = _empty_av_latent(width, height, frame_count)
-    tokens = clip.tokenize(str(prompt), minimax_ref_items=ref_items)
+    resolved_prompt = _remap_picture_tags(prompt, active_picture_slots)
+    tokens = clip.tokenize(resolved_prompt, minimax_ref_items=ref_items)
     cond = clip.encode_from_tokens_scheduled(tokens)
     if ref_blocks:
         cond = node_helpers.conditioning_set_values(
@@ -269,6 +684,7 @@ def _sample_h3(model, conditioning, latent, seed: int, sampler_name: str, schedu
 def _default_clip(index: int = 0):
     return {
         "id": f"clip_{index + 1}",
+        "name": "",
         "prompt": "",
         "seed": int(secrets.randbelow(DEFAULT_SEED_MAX)),
         "seed_mode": "randomize",
@@ -319,6 +735,7 @@ def _parse_clips_json(value: str):
         out.append(
             {
                 "id": str(raw.get("id") or f"clip_{i + 1}"),
+                "name": str(raw.get("name", "")),
                 "prompt": str(raw.get("prompt", "")),
                 "seed": seed,
                 "seed_mode": seed_mode,
@@ -388,6 +805,458 @@ def _send_extender_progress(
         pass
 
 
+def _project_now_iso():
+    return _datetime.datetime.now(_datetime.timezone.utc).isoformat()
+
+
+def _project_filename(value):
+    stem = _safe_name(Path(str(value or "MiniMax_H3_Project")).stem)
+    return f"{stem}.ext"
+
+
+def _project_temp_root():
+    root = _ensure_cache_root() / "_projects"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _cleanup_project_downloads():
+    now = time.time()
+    stale = []
+    for token, info in list(_PROJECT_DOWNLOADS.items()):
+        if now - float(info.get("created_at", 0.0)) > PROJECT_DOWNLOAD_TTL_SECONDS:
+            stale.append((token, info))
+    for token, info in stale:
+        _PROJECT_DOWNLOADS.pop(token, None)
+        try:
+            Path(info.get("path", "")).unlink(missing_ok=True)
+        except Exception:
+            pass
+    # Also clean abandoned downloads left by a previous ComfyUI process where
+    # the in-memory token table no longer exists.
+    try:
+        for path in _project_temp_root().glob("download_*.ext"):
+            if now - float(path.stat().st_mtime) > PROJECT_DOWNLOAD_TTL_SECONDS:
+                path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _clips_from_project_payload(project_payload):
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("clips_json")
+    if not isinstance(raw, str) or not raw.strip():
+        settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
+        raw = settings.get("clips_json") if isinstance(settings, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        clips = extender.get("clips") if isinstance(extender, dict) else None
+        if isinstance(clips, list):
+            raw = json.dumps({"version": 1, "clips": clips}, ensure_ascii=False)
+    if not isinstance(raw, str) or not raw.strip():
+        raw = _state_json([_default_clip(0)])
+    return _parse_clips_json(raw)
+
+
+def _project_cache_snapshot(owner_id, project_payload):
+    """Return a coherent, immutable manifest snapshot and byte limit.
+
+    The .h3cache is append-only for a live tail. We snapshot the atomically-written
+    manifest first, then copy only through the last referenced segment_end. If a
+    generation starts concurrently, extra bytes appended after that boundary are
+    intentionally excluded from the project.
+    """
+    data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+    if not data_path.exists() or not manifest_path.exists():
+        return None
+
+    manifest = _load_manifest_from_paths(data_path, manifest_path)
+    if manifest is None:
+        return None
+    manifest = copy.deepcopy(manifest)
+    segments = [dict(x) for x in manifest.get("segments", [])]
+
+    # The UI state is the authority for explicit validation. Persist it into the
+    # project snapshot without mutating the user's live cache manifest.
+    try:
+        clips = _clips_from_project_payload(project_payload)
+    except Exception:
+        clips = []
+    for i, desc in enumerate(segments):
+        desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
+    manifest["segments"] = segments
+
+    if segments:
+        data_limit = int(segments[-1].get("segment_end", 0))
+    else:
+        data_limit = int(_DATA_START)
+    if data_limit < int(_DATA_START):
+        raise ValueError("MiniMax H3 Extender Project: invalid cache byte boundary.")
+    if int(data_path.stat().st_size) < data_limit:
+        raise IOError("MiniMax H3 Extender Project: cache changed while snapshotting; retry Save Project.")
+
+    return {
+        "data_path": data_path,
+        "manifest_path": manifest_path,
+        "preview_path": _decoded_preview_cache_path(data_path),
+        "manifest": manifest,
+        "data_limit": data_limit,
+    }
+
+
+def _zip_write_prefix(zf, arcname, source_path, byte_limit):
+    source_path = Path(source_path)
+    remaining = int(byte_limit)
+    info = zipfile.ZipInfo(str(arcname))
+    info.compress_type = zipfile.ZIP_STORED
+    info.date_time = time.localtime(source_path.stat().st_mtime)[:6]
+    with open(source_path, "rb") as src, zf.open(info, "w", force_zip64=True) as dst:
+        while remaining > 0:
+            chunk = src.read(min(PROJECT_COPY_CHUNK, remaining))
+            if not chunk:
+                raise IOError(
+                    f"MiniMax H3 Extender Project: source cache ended {remaining} byte(s) early."
+                )
+            dst.write(chunk)
+            remaining -= len(chunk)
+
+
+def _build_project_archive(owner_id, requested_name, project_payload, output_path):
+    project_payload = copy.deepcopy(project_payload)
+    refs = _refs_from_project_payload(project_payload)
+    refs = _write_refs_to_project_payload(project_payload, refs)
+
+    # A portable project is only useful when every referenced image is actually
+    # embedded. Fail loudly instead of silently writing a project that depends on
+    # a local cache entry which may not exist on the destination machine.
+    ref_files = []
+    for index, ref in enumerate(refs, start=1):
+        if ref is None:
+            continue
+        path = _ref_path(ref.get("id"))
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MiniMax H3 Extender Project: reference {index} is missing from the internal store. "
+                "Reload that reference image before saving the project."
+            )
+        width, height = _validate_reference_file(path)
+        ref["width"] = int(width)
+        ref["height"] = int(height)
+        ref["size_bytes"] = int(path.stat().st_size)
+        ref_files.append((index, ref, path))
+    _write_refs_to_project_payload(project_payload, refs)
+
+    snapshot = _project_cache_snapshot(owner_id, project_payload)
+
+    if snapshot is not None:
+        cache_resolution = _resolution_from_manifest(snapshot.get("manifest"))
+        if cache_resolution is not None:
+            extender_payload = project_payload.setdefault("extender", {})
+            resolution = extender_payload.setdefault("resolution", {})
+            if isinstance(resolution, dict):
+                resolution["resolved_width"] = int(cache_resolution["width"])
+                resolution["resolved_height"] = int(cache_resolution["height"])
+                resolution["source"] = "disk_cache"
+
+    archive_meta = {
+        "format": PROJECT_FORMAT,
+        "format_version": PROJECT_FORMAT_VERSION,
+        "created_at": _project_now_iso(),
+        "extender_build": BUILD,
+        "cache_version": CACHE_VERSION,
+        "source_owner_id": str(owner_id),
+        "project_name": Path(_project_filename(requested_name)).stem,
+        "project": project_payload,
+        "references": {
+            "count": int(len(ref_files)),
+            "embedded": True,
+        },
+        "cache": {
+            "present": snapshot is not None,
+            "clip_count": int(len(snapshot["manifest"].get("segments", []))) if snapshot else 0,
+            "frame_count": int(snapshot["manifest"].get("final_frame_count", 0)) if snapshot else 0,
+            "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
+        },
+    }
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+        project_bytes = json.dumps(
+            archive_meta,
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+        zf.writestr("project.json", project_bytes, compress_type=zipfile.ZIP_DEFLATED)
+
+        for index, ref, path in ref_files:
+            zf.write(
+                path,
+                arcname=f"refs/ref_{index}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+
+        if snapshot is not None:
+            manifest_bytes = json.dumps(
+                snapshot["manifest"],
+                ensure_ascii=False,
+                indent=2,
+            ).encode("utf-8")
+            zf.writestr("cache/chain.json", manifest_bytes, compress_type=zipfile.ZIP_DEFLATED)
+            _zip_write_prefix(
+                zf,
+                "cache/chain.h3cache",
+                snapshot["data_path"],
+                snapshot["data_limit"],
+            )
+            if snapshot["preview_path"].exists():
+                zf.write(
+                    snapshot["preview_path"],
+                    arcname="cache/chain.preview.mp4",
+                    compress_type=zipfile.ZIP_STORED,
+                )
+    return archive_meta
+
+def _safe_zip_member(name):
+    value = str(name or "").replace("\\", "/")
+    if not value or value.startswith("/"):
+        return False
+    parts = [p for p in value.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return False
+    return True
+
+
+def _zip_copy_member(zf, member_name, destination):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zf.open(member_name, "r") as src, open(destination, "wb") as dst:
+        while True:
+            chunk = src.read(PROJECT_COPY_CHUNK)
+            if not chunk:
+                break
+            dst.write(chunk)
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
+def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None):
+    target_data, target_manifest = _chain_paths(f"extender_{_safe_name(owner_id)}")
+    target_preview = _decoded_preview_cache_path(target_data)
+    target_preview_video = _decoded_preview_video_cache_path(target_data)
+    # The video-only preview prefix is a derived v14.42 sidecar. It is not
+    # required in .ext archives, but it MUST be cleared on project replacement
+    # so a previous project's prefix can never be reused accidentally.
+    targets = [target_data, target_manifest, target_preview, target_preview_video]
+    backups = []
+    token = uuid.uuid4().hex[:10]
+
+    try:
+        for target in targets:
+            if target.exists():
+                backup = target.with_name(target.name + f".project_backup_{token}")
+                os.replace(target, backup)
+                backups.append((target, backup))
+
+        if new_data is not None and new_manifest is not None:
+            os.replace(str(new_data), target_data)
+            os.replace(str(new_manifest), target_manifest)
+            if new_preview is not None and Path(new_preview).exists():
+                os.replace(str(new_preview), target_preview)
+        # No imported cache means an intentionally empty project. The old cache
+        # remains only in backups until this transaction succeeds.
+    except Exception:
+        for target in targets:
+            try:
+                target.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for target, backup in reversed(backups):
+            if backup.exists():
+                os.replace(backup, target)
+        raise
+    else:
+        for _, backup in backups:
+            try:
+                backup.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _import_project_archive(owner_id, archive_path):
+    archive_path = Path(archive_path)
+    work_root = _project_temp_root() / f"import_{uuid.uuid4().hex}"
+    work_root.mkdir(parents=True, exist_ok=True)
+    new_data = work_root / "chain.h3cache"
+    new_manifest = work_root / "chain.json"
+    new_preview = work_root / "chain.preview.mp4"
+
+    try:
+        with zipfile.ZipFile(archive_path, "r", allowZip64=True) as zf:
+            for info in zf.infolist():
+                if not _safe_zip_member(info.filename):
+                    raise ValueError(
+                        f"MiniMax H3 Extender Project: unsafe ZIP entry '{info.filename}'."
+                    )
+
+            names = set(zf.namelist())
+            if "project.json" not in names:
+                raise ValueError("MiniMax H3 Extender Project: project.json is missing.")
+            pinfo = zf.getinfo("project.json")
+            if int(pinfo.file_size) > PROJECT_JSON_MAX_BYTES:
+                raise ValueError("MiniMax H3 Extender Project: project.json is unexpectedly large.")
+
+            with zf.open("project.json", "r") as f:
+                archive_meta = json.loads(f.read().decode("utf-8"))
+            if archive_meta.get("format") != PROJECT_FORMAT:
+                raise ValueError("MiniMax H3 Extender Project: unsupported project file.")
+            format_version = int(archive_meta.get("format_version", -1))
+            if format_version not in PROJECT_SUPPORTED_VERSIONS:
+                supported = ", ".join(str(v) for v in sorted(PROJECT_SUPPORTED_VERSIONS))
+                raise ValueError(
+                    "MiniMax H3 Extender Project: incompatible project format "
+                    f"{format_version} (supported: {supported})."
+                )
+
+            project_payload = archive_meta.get("project", {})
+            if not isinstance(project_payload, dict):
+                raise ValueError("MiniMax H3 Extender Project: invalid project metadata.")
+            clips = _clips_from_project_payload(project_payload)
+
+            # v2 embeds the real reference pixels. Import each image into the
+            # Extender's content-addressed store and rewrite the returned project
+            # metadata to the local ids. v1 projects remain fully loadable; they
+            # simply have no embedded internal references.
+            saved_refs = _refs_from_project_payload(project_payload)
+            imported_refs = _empty_refs()
+            if format_version >= 2:
+                for index in range(1, MAX_IMAGE_REFS + 1):
+                    member = f"refs/ref_{index}.png"
+                    saved = saved_refs[index - 1]
+                    if member not in names:
+                        if saved is not None:
+                            raise ValueError(
+                                f"MiniMax H3 Extender Project: embedded reference {index} is missing."
+                            )
+                        continue
+                    ref_info = zf.getinfo(member)
+                    if int(ref_info.file_size) > MAX_REF_UPLOAD_BYTES:
+                        raise ValueError(
+                            f"MiniMax H3 Extender Project: reference {index} exceeds the allowed image size."
+                        )
+                    extracted = work_root / f"ref_{index}.png"
+                    _zip_copy_member(zf, member, extracted)
+                    desc = _store_project_reference(
+                        extracted,
+                        (saved or {}).get("original_name") if isinstance(saved, dict) else f"ref_{index}.png",
+                    )
+                    if isinstance(saved, dict) and saved.get("id") and desc["id"] != saved.get("id"):
+                        raise ValueError(
+                            f"MiniMax H3 Extender Project: reference {index} failed its integrity check."
+                        )
+                    imported_refs[index - 1] = desc
+                imported_refs = _normalize_ref_descriptors(imported_refs)
+            _write_refs_to_project_payload(project_payload, imported_refs)
+
+            has_data = "cache/chain.h3cache" in names
+            has_manifest = "cache/chain.json" in names
+            if has_data != has_manifest:
+                raise ValueError("MiniMax H3 Extender Project: incomplete cache payload.")
+
+            imported_manifest = None
+            if has_data:
+                _zip_copy_member(zf, "cache/chain.h3cache", new_data)
+                _zip_copy_member(zf, "cache/chain.json", new_manifest)
+                if "cache/chain.preview.mp4" in names:
+                    _zip_copy_member(zf, "cache/chain.preview.mp4", new_preview)
+
+                imported_manifest = _load_manifest_from_paths(new_data, new_manifest)
+                if imported_manifest is None:
+                    raise ValueError("MiniMax H3 Extender Project: cache manifest is empty.")
+
+                # A hand-edited project may contain fewer cards than cached clips.
+                # Keep only the portable prefix represented by the saved UI state.
+                if len(imported_manifest.get("segments", [])) > len(clips):
+                    imported_manifest = _truncate_chain(
+                        new_data,
+                        new_manifest,
+                        imported_manifest,
+                        len(clips),
+                    )
+
+                segments = [dict(x) for x in imported_manifest.get("segments", [])]
+                for i, desc in enumerate(segments):
+                    desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
+                imported_manifest = dict(imported_manifest)
+                imported_manifest["segments"] = segments
+                imported_manifest["owner_id"] = f"extender_{_safe_name(owner_id)}"
+                imported_manifest["imported_at"] = time.time()
+                imported_manifest["updated_at"] = time.time()
+                _write_json_atomic(new_manifest, imported_manifest)
+
+                imported_resolution = _resolution_from_manifest(imported_manifest)
+                if imported_resolution is not None:
+                    extender_payload = project_payload.setdefault("extender", {})
+                    resolution = extender_payload.setdefault("resolution", {})
+                    if isinstance(resolution, dict):
+                        resolution["resolved_width"] = int(imported_resolution["width"])
+                        resolution["resolved_height"] = int(imported_resolution["height"])
+                        resolution["source"] = "disk_cache"
+
+            cached_count = int(len(imported_manifest.get("segments", []))) if imported_manifest else 0
+            # A clip can only remain validated when its physical cached segment is
+            # present. Normalize the returned UI state accordingly.
+            for i in range(cached_count, len(clips)):
+                clips[i]["validated"] = False
+            found_open = False
+            for clip_cfg in clips:
+                if found_open:
+                    clip_cfg["validated"] = False
+                elif not clip_cfg["validated"]:
+                    found_open = True
+
+            normalized_clips_json = _state_json(clips)
+            extender_payload = project_payload.setdefault("extender", {})
+            extender_payload["clips_json"] = normalized_clips_json
+            extender_payload["clips"] = clips
+            settings = extender_payload.setdefault("settings", {})
+            if isinstance(settings, dict):
+                settings["clips_json"] = normalized_clips_json
+
+            _replace_cache_transaction(
+                owner_id,
+                new_data if imported_manifest is not None else None,
+                new_manifest if imported_manifest is not None else None,
+                new_preview if imported_manifest is not None and new_preview.exists() else None,
+            )
+
+            validated_count = 0
+            if imported_manifest is not None:
+                for desc in imported_manifest.get("segments", []):
+                    if not bool(desc.get("validated", False)):
+                        break
+                    validated_count += 1
+
+            loaded_resolution = _resolution_from_manifest(imported_manifest)
+            return {
+                "project_name": str(archive_meta.get("project_name") or archive_path.stem),
+                "project": project_payload,
+                "references": {
+                    "count": int(_reference_count(imported_refs)),
+                    "refs_json": _refs_json(imported_refs),
+                },
+                "cache": {
+                    "present": imported_manifest is not None,
+                    "cached_count": cached_count,
+                    "validated_count": int(validated_count),
+                    "frame_count": int(imported_manifest.get("final_frame_count", 0)) if imported_manifest else 0,
+                    "resolved_width": int(loaded_resolution["width"]) if loaded_resolution else 0,
+                    "resolved_height": int(loaded_resolution["height"]) if loaded_resolution else 0,
+                },
+            }
+    finally:
+        shutil.rmtree(work_root, ignore_errors=True)
+
+
 
 class MiniMaxH3Extender:
     @classmethod
@@ -402,8 +1271,20 @@ class MiniMaxH3Extender:
             "clip": ("CLIP",),
             "vae": ("VAE",),
             "run_mode": (["clip_by_clip", "full_batch"], {"default": "clip_by_clip"}),
-            "width": ("INT", {"default": 896, "min": 32, "max": 4096, "step": 32}),
-            "height": ("INT", {"default": 576, "min": 32, "max": 4096, "step": 32}),
+            "width": (
+                "INT",
+                {
+                    "default": 896, "min": 32, "max": 4096, "step": 32,
+                    "tooltip": "Manual resolution width, also used as Auto fallback when no internal image reference is loaded.",
+                },
+            ),
+            "height": (
+                "INT",
+                {
+                    "default": 576, "min": 32, "max": 4096, "step": 32,
+                    "tooltip": "Manual resolution height, also used as Auto fallback when no internal image reference is loaded.",
+                },
+            ),
             "ref_image_size": (["match", "max"], {"default": "match"}),
             "steps": ("INT", {"default": 4, "min": 1, "max": 10000, "step": 1}),
             "sampler_name": (sampler_names, {"default": default_sampler}),
@@ -418,19 +1299,41 @@ class MiniMaxH3Extender:
                     "multiline": True,
                 },
             ),
+            # Keep these AFTER clips_json so pre-v14.25 workflow widget arrays
+            # keep their original positional mapping. The frontend migrates old
+            # workflows/projects to Manual mode on load.
+            "resolution_mode": (
+                ["auto_from_ref", "manual"],
+                {
+                    "default": "auto_from_ref",
+                    "tooltip": "Auto uses internal Ref 1 as the aspect-ratio guide; with no internal image references it falls back to width/height.",
+                },
+            ),
+            "megapixels": (
+                "FLOAT",
+                {
+                    "default": DEFAULT_MEGAPIXELS, "min": 0.01, "max": 16.0, "step": 0.01,
+                    "tooltip": "Target total pixels for Auto resolution. Mirrors ComfyUI Scale Image to Total Pixels + Get Image Size; the final AV latent keeps the Extender's existing 16-pixel grid.",
+                },
+            ),
+            # Internal image-reference manager state. Appended after the v14.25
+            # widgets so older positional workflow widget arrays keep mapping.
+            "refs_json": (
+                "STRING",
+                {
+                    "default": _refs_json(_empty_refs()),
+                    "multiline": True,
+                },
+            ),
         }
 
-        # audio_vae/ref_audio stay optional so existing image-only Extender
-        # workflows continue to load and execute unchanged.  When ref_audio is
-        # connected, audio_vae becomes functionally required.
+        # Standalone audio remains an external socket for now. Image refs are
+        # deliberately no longer graph inputs: they are loaded/previewed/stored
+        # by the Extender itself and embedded in portable .ext projects.
         optional = {
             "audio_vae": ("VAE", {"forceInput": True}),
             "ref_audio": ("AUDIO", {"forceInput": True}),
         }
-        optional.update({
-            f"ref_{i}": ("IMAGE", {"forceInput": True})
-            for i in range(1, 10)
-        })
 
         return {
             "required": required,
@@ -467,6 +1370,9 @@ class MiniMaxH3Extender:
         context_length,
         audio_context_length,
         clips_json,
+        resolution_mode="auto_from_ref",
+        megapixels=DEFAULT_MEGAPIXELS,
+        refs_json=None,
         unique_id=None,
         **kwargs,
     ):
@@ -491,18 +1397,83 @@ class MiniMaxH3Extender:
                         clips[j]["validated"] = False
                     break
 
-        refs = [kwargs.get(f"ref_{i}") for i in range(1, 10)]
+        refs = _parse_refs_json(refs_json)
+        refs_signature = _refs_signature(refs)
+        requested_resolution = _resolve_generation_resolution(
+            resolution_mode,
+            megapixels,
+            width,
+            height,
+            refs,
+        )
+
+        cache_resolution = _resolution_from_manifest(manifest)
+        cache_has_segments = bool(segments) and cache_resolution is not None
+
+        # Resolution is a live generation setting again. Auto/MP or Manual
+        # width/height may be changed at any time, exactly like the old external
+        # Scale Image -> Get Image Size workflow. A latent chain cannot mix two
+        # geometries, so when the requested size changes we restart only the
+        # generated cache while preserving every card/prompt/seed/config.
+        #
+        # A .ext Load is handled in the frontend by putting the exact archived
+        # cache width/height into Manual mode. Therefore the imported project
+        # continues at its stored geometry until the user explicitly changes the
+        # resolution controls afterwards.
+        resolution = dict(requested_resolution)
+        resolution["requested_width"] = int(requested_resolution["width"])
+        resolution["requested_height"] = int(requested_resolution["height"])
+        resolution["cache_reset"] = False
+
+        resolved_width = int(resolution["width"])
+        resolved_height = int(resolution["height"])
+
+        requested_mismatch = bool(
+            cache_has_segments
+            and (
+                int(cache_resolution["width"]) != resolved_width
+                or int(cache_resolution["height"]) != resolved_height
+            )
+        )
+        previous_cache_resolution = dict(cache_resolution) if requested_mismatch else None
+
+        if requested_mismatch:
+            # Resolution is the one unavoidable global invalidation: latent
+            # geometry cannot be mixed inside one sequential disk chain.
+            manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
+            segments = []
+            cache_resolution = None
+            cache_has_segments = False
+            resolution["cache_reset"] = True
+            for cfg in clips:
+                cfg["validated"] = False
+            try:
+                preview_path = _decoded_preview_cache_path(data_path)
+                if preview_path.exists():
+                    preview_path.unlink()
+            except Exception:
+                pass
+
+        # References are intentionally user-controlled. The Extender never
+        # associates a Ref number with a clip number and never decides which clip
+        # becomes obsolete after a reference edit. Keep this fingerprint as
+        # informational project/cache metadata, never as an invalidation key.
+        manifest = _load_manifest_from_paths(data_path, manifest_path) or manifest
+        manifest = dict(manifest)
+        manifest["extender_refs_signature"] = refs_signature
+        manifest["extender_ref_ids"] = [
+            ref.get("id") if isinstance(ref, dict) else None for ref in refs
+        ]
+        manifest["updated_at"] = time.time()
+        _write_json_atomic(manifest_path, manifest)
+
+        resolution_mismatch = False
+
         audio_vae = kwargs.get("audio_vae")
         ref_audio = kwargs.get("ref_audio")
-        ref_items, ref_blocks = _prepare_shared_refs(
-            vae,
-            audio_vae,
-            int(width),
-            int(height),
-            str(ref_image_size),
-            refs,
-            ref_audio=ref_audio,
-        )
+        ref_items = None
+        ref_blocks = None
+        active_picture_slots = None
 
         disk_join = MiniMaxH3MotionContextDiskJoin()
         motion = MiniMaxH3MotionContextRAM()
@@ -549,16 +1520,28 @@ class MiniMaxH3Extender:
             for j in range(i + 1, len(clips)):
                 clips[j]["validated"] = False
 
+            if ref_items is None or ref_blocks is None or active_picture_slots is None:
+                ref_items, ref_blocks, active_picture_slots = _prepare_shared_refs(
+                    vae,
+                    audio_vae,
+                    resolved_width,
+                    resolved_height,
+                    str(ref_image_size),
+                    refs,
+                    ref_audio=ref_audio,
+                )
+
             frame_count = _duration_to_frames(cfg["duration"])
             positive, latent = _make_ref2va_conditioning(
                 clip,
                 vae,
                 cfg["prompt"],
-                int(width),
-                int(height),
+                resolved_width,
+                resolved_height,
                 frame_count,
                 ref_items,
                 ref_blocks,
+                active_picture_slots,
             )
 
             trim_frames = None
@@ -630,6 +1613,7 @@ class MiniMaxH3Extender:
             raise RuntimeError("MiniMax H3 Extender: sequence produced no cache handle.")
 
         final_manifest = _load_manifest_from_paths(data_path, manifest_path)
+        final_cache_resolution = _resolution_from_manifest(final_manifest)
         cached_count = len(final_manifest.get("segments", []))
         validated_count = 0
         for desc in final_manifest.get("segments", []):
@@ -639,8 +1623,23 @@ class MiniMaxH3Extender:
                 break
 
         normalized_json = _state_json(clips)
+        if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
+            resolution_text = (
+                f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
+                f"@ {float(resolution['megapixels']):.2f}MP"
+            )
+        elif resolution.get("fallback"):
+            resolution_text = f"{resolved_width}x{resolved_height} manual fallback (no image ref)"
+        else:
+            resolution_text = f"{resolved_width}x{resolved_height} manual"
+
+        if resolution.get("cache_reset") and previous_cache_resolution:
+            resolution_text += (
+                f" | resolution changed from "
+                f"{int(previous_cache_resolution['width'])}x{int(previous_cache_resolution['height'])}: cache restarted"
+            )
         status = (
-            f"{str(run_mode)} | cached {cached_count}/{len(clips)} | "
+            f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | cached {cached_count}/{len(clips)} | "
             f"validated {validated_count} | "
             + (
                 "generated " + ",".join(str(i + 1) for i in generated)
@@ -665,6 +1664,28 @@ class MiniMaxH3Extender:
             "validated_count": validated_count,
             "generated": [i + 1 for i in generated],
             "status": status,
+            "resolved_width": resolved_width,
+            "resolved_height": resolved_height,
+            "resolution_mode": str(resolution.get("mode") or "manual"),
+            "resolution_guide": (
+                f"ref_{int(resolution['guide_ref'])}"
+                if resolution.get("guide_ref") is not None
+                else ""
+            ),
+            "resolution_guide_width": int(resolution.get("guide_src_width", 0) or 0),
+            "resolution_guide_height": int(resolution.get("guide_src_height", 0) or 0),
+            "resolution_fallback": bool(resolution.get("fallback", False)),
+            "megapixels": float(resolution.get("megapixels", megapixels)),
+            "cache_width": int(final_cache_resolution["width"]) if final_cache_resolution else 0,
+            "cache_height": int(final_cache_resolution["height"]) if final_cache_resolution else 0,
+            "resolution_mismatch": False,
+            "resolution_cache_locked": False,
+            "resolution_cache_reset": bool(resolution.get("cache_reset", False)),
+            "reference_cache_reset": False,
+            "reference_count": int(_reference_count(refs)),
+            "refs_json": _refs_json(refs),
+            "requested_width": int(resolution.get("requested_width", resolved_width)),
+            "requested_height": int(resolution.get("requested_height", resolved_height)),
             "build": BUILD,
         }
 
@@ -688,3 +1709,229 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3Extender": "MiniMax H3 Extender",
 }
+
+
+if getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.post("/h3_extender/ref/upload")
+    async def h3_extender_ref_upload(request):
+        """Upload one image reference and store the actual pixels internally."""
+        temp_path = _project_temp_root() / f"ref_upload_{uuid.uuid4().hex}.bin"
+        original_name = "reference.png"
+        got_file = False
+        size = 0
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name != "ref_file":
+                    continue
+                original_name = str(part.filename or "reference.png")
+                with open(temp_path, "wb") as f:
+                    while True:
+                        chunk = await part.read_chunk(size=PROJECT_COPY_CHUNK)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_REF_UPLOAD_BYTES:
+                            raise ValueError(
+                                f"MiniMax H3 Extender: reference upload exceeds {MAX_REF_UPLOAD_BYTES // (1024 * 1024)} MB."
+                            )
+                        f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+                got_file = True
+                break
+
+            if not got_file or not temp_path.exists() or temp_path.stat().st_size <= 0:
+                return web.json_response(
+                    {"ok": False, "error": "No reference image was uploaded."}, status=400
+                )
+            try:
+                ref = await asyncio.to_thread(
+                    _store_uploaded_reference,
+                    temp_path,
+                    original_name,
+                )
+            except Exception as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response({"ok": True, "ref": ref})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @PromptServer.instance.routes.get("/h3_extender/ref/image")
+    async def h3_extender_ref_image(request):
+        """Serve an internally managed reference thumbnail/full preview."""
+        ref_id = str(request.query.get("id", "")).lower().strip()
+        if not _ref_id_is_safe(ref_id):
+            return web.Response(status=400, text="Invalid reference id.")
+        path = _ref_path(ref_id)
+        if not path.exists():
+            return web.Response(status=404, text="Reference image not found.")
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Type": "image/png",
+                "Cache-Control": "public, max-age=31536000, immutable",
+            },
+        )
+
+    @PromptServer.instance.routes.post("/h3_extender/project/prepare_save")
+    async def h3_extender_project_prepare_save(request):
+        """Build a portable .ext archive without buffering the cache in RAM."""
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id", "")).strip()
+            if not owner_id:
+                return web.json_response(
+                    {"ok": False, "error": "Missing Extender node id."}, status=400
+                )
+            project_payload = body.get("project", {})
+            if not isinstance(project_payload, dict):
+                return web.json_response(
+                    {"ok": False, "error": "Invalid project metadata."}, status=400
+                )
+
+            _cleanup_project_downloads()
+            filename = _project_filename(body.get("project_name", "MiniMax_H3_Project"))
+            token = uuid.uuid4().hex
+            temp_path = _project_temp_root() / f"download_{token}.ext"
+
+            try:
+                archive_meta = await asyncio.to_thread(
+                    _build_project_archive,
+                    owner_id,
+                    filename,
+                    project_payload,
+                    temp_path,
+                )
+            except Exception as exc:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return web.json_response(
+                    {"ok": False, "error": str(exc)}, status=500
+                )
+
+            _PROJECT_DOWNLOADS[token] = {
+                "path": str(temp_path),
+                "filename": filename,
+                "created_at": time.time(),
+            }
+            return web.json_response({
+                "ok": True,
+                "token": token,
+                "filename": filename,
+                "size_bytes": int(temp_path.stat().st_size),
+                "cache": archive_meta.get("cache", {}),
+                "references": archive_meta.get("references", {}),
+            })
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @PromptServer.instance.routes.get("/h3_extender/project/download")
+    async def h3_extender_project_download(request):
+        """Stream a prepared .ext directly to the browser, then remove the temp file."""
+        _cleanup_project_downloads()
+        token = str(request.query.get("token", "")).strip()
+        info = _PROJECT_DOWNLOADS.pop(token, None)
+        if not info:
+            return web.Response(status=404, text="Project download expired or was not found.")
+
+        path = Path(info["path"])
+        if not path.exists():
+            return web.Response(status=404, text="Project file no longer exists.")
+
+        filename = _project_filename(info.get("filename", "MiniMax_H3_Project.ext"))
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(path.stat().st_size),
+                "Cache-Control": "no-store",
+            },
+        )
+        try:
+            await response.prepare(request)
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(PROJECT_COPY_CHUNK)
+                    if not chunk:
+                        break
+                    await response.write(chunk)
+            await response.write_eof()
+            return response
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @PromptServer.instance.routes.post("/h3_extender/project/load")
+    async def h3_extender_project_load(request):
+        """Import a .ext into the cache owned by the Extender node making the request."""
+        upload_path = _project_temp_root() / f"upload_{uuid.uuid4().hex}.ext"
+        owner_id = ""
+        original_name = ""
+        got_file = False
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "owner_id":
+                    owner_id = (await part.text()).strip()
+                elif part.name == "project_file":
+                    original_name = str(part.filename or "project.ext")
+                    with open(upload_path, "wb") as f:
+                        while True:
+                            chunk = await part.read_chunk(size=PROJECT_COPY_CHUNK)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    got_file = True
+
+            if not owner_id:
+                return web.json_response(
+                    {"ok": False, "error": "Missing Extender node id."}, status=400
+                )
+            if not got_file or not upload_path.exists():
+                return web.json_response(
+                    {"ok": False, "error": "No .ext project file was uploaded."}, status=400
+                )
+
+            try:
+                imported = await asyncio.to_thread(
+                    _import_project_archive,
+                    owner_id,
+                    upload_path,
+                )
+            except zipfile.BadZipFile:
+                return web.json_response(
+                    {"ok": False, "error": "The selected .ext file is not a valid project archive."},
+                    status=400,
+                )
+            except Exception as exc:
+                return web.json_response(
+                    {"ok": False, "error": str(exc)}, status=400
+                )
+
+            imported["ok"] = True
+            imported["source_filename"] = original_name
+            return web.json_response(imported)
+        finally:
+            try:
+                upload_path.unlink(missing_ok=True)
+            except Exception:
+                pass
