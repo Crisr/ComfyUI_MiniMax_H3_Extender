@@ -5,6 +5,34 @@ A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous v
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
 
 ---
+## 🆕 Latest updates
+
+Recent H3 Extender updates bring a much more self-contained workflow and better long-sequence handling:
+
+- **Internal reference manager**
+  - Up to 9 image references can now be loaded directly inside the Extender.
+  - No external `Load Image` nodes are required anymore.
+  - References are shown as thumbnails directly in the node.
+  - Reference slots stay fixed, so prompt numbering remains stable.
+  - Double-click a thumbnail to view it larger.
+
+- **Portable `.ext` projects**
+  - `Save Project` now embeds the actual reference images inside the project archive.
+  - `Load Project` restores prompts, refs, validation state, cache, preview and resolution settings.
+  - A saved project can therefore be reopened on another machine without needing the original image files.
+
+- **Named clip cards**
+  - Each clip card can now have its own optional name, making long sequences much easier to organize.
+
+- **Improved audio joins** (work in progress)
+  - Audio is now rebuilt from PCM and encoded only once at the end instead of concatenating separate AAC streams.
+  - Additional gain matching, declicking and smooth entry ramps reduce audible bumps between clips.
+
+---
+
+<img width="2091" height="948" alt="image" src="https://github.com/user-attachments/assets/905dcd01-09f8-4dfe-9d20-2f949637f938" />
+
+
 <img width="2557" height="1212" alt="Capture d&#39;écran 2026-08-15 083401" src="https://github.com/user-attachments/assets/99ca1fc4-d8b9-4662-a869-1fa06e5e58e1" />
 
 ## Keeping References Consistent Across Clips
