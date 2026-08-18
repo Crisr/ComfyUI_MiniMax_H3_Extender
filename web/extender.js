@@ -64,19 +64,29 @@ const FINAL_PROJECT_WIDGETS = [
 
 
 function emptyRefsState() {
-    return { version: 1, refs: Array(MAX_IMAGE_REFS).fill(null) };
+    return { version: 2, refs: Array(MAX_IMAGE_REFS).fill(null) };
 }
 
 function normalizeRefDescriptor(value) {
     if (!value || typeof value !== "object") return null;
     const id = String(value.id || value.ref_id || "").toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(id)) return null;
+    const sourceCandidate = String(value.source_id || value.original_id || id).toLowerCase();
+    const source_id = /^[0-9a-f]{64}$/.test(sourceCandidate) ? sourceCandidate : id;
+    const adjustment = (name) => {
+        const n = Number(value[name] ?? 100);
+        return Number.isFinite(n) ? Math.min(200, Math.max(0, n)) : 100;
+    };
     return {
         id,
+        source_id,
         original_name: String(value.original_name || value.name || "reference.png"),
         width: Math.max(0, Number(value.width || 0)),
         height: Math.max(0, Number(value.height || 0)),
         size_bytes: Math.max(0, Number(value.size_bytes || 0)),
+        saturation: adjustment("saturation"),
+        contrast: adjustment("contrast"),
+        brightness: adjustment("brightness"),
     };
 }
 
@@ -95,14 +105,14 @@ function parseRefsState(raw) {
     try {
         const parsed = typeof raw === "string" ? JSON.parse(raw || "{}") : raw;
         const refs = Array.isArray(parsed) ? parsed : parsed?.refs;
-        return { version: 1, refs: normalizeRefsArray(Array.isArray(refs) ? refs : []) };
+        return { version: 2, refs: normalizeRefsArray(Array.isArray(refs) ? refs : []) };
     } catch (_) {
         return emptyRefsState();
     }
 }
 
 function serializeRefsState(state) {
-    return JSON.stringify({ version: 1, refs: normalizeRefsArray(state?.refs || []) });
+    return JSON.stringify({ version: 2, refs: normalizeRefsArray(state?.refs || []) });
 }
 
 function refCount(runtime) {
@@ -660,8 +670,13 @@ function handleReferenceChange(node, runtime, message = "Image references change
     }
 }
 
-function openReferencePreview(ref) {
-    if (!ref?.id) return;
+function openReferenceEditor(node, runtime, slotIndex, ref) {
+    if (!ref?.id || !node || !runtime) return;
+    if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
+        alert("Wait for the current clip generation to finish before editing a reference image.");
+        return;
+    }
+
     const overlay = document.createElement("div");
     overlay.style.position = "fixed";
     overlay.style.inset = "0";
@@ -670,28 +685,301 @@ function openReferencePreview(ref) {
     overlay.style.display = "flex";
     overlay.style.alignItems = "center";
     overlay.style.justifyContent = "center";
-    overlay.style.padding = "28px";
+    overlay.style.padding = "24px";
+    overlay.style.boxSizing = "border-box";
+
+    const panel = document.createElement("div");
+    panel.style.width = "min(1180px, 94vw)";
+    panel.style.height = "min(820px, 92vh)";
+    panel.style.minWidth = "0";
+    panel.style.minHeight = "0";
+    panel.style.display = "flex";
+    panel.style.flexDirection = "column";
+    panel.style.background = "#191919";
+    panel.style.border = "1px solid rgba(255,255,255,.18)";
+    panel.style.borderRadius = "10px";
+    panel.style.boxShadow = "0 18px 60px rgba(0,0,0,.65)";
+    panel.style.overflow = "hidden";
+    overlay.appendChild(panel);
+
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.justifyContent = "space-between";
+    header.style.gap = "12px";
+    header.style.padding = "10px 12px";
+    header.style.borderBottom = "1px solid rgba(255,255,255,.12)";
+
+    const title = document.createElement("div");
+    title.textContent = `Reference Editor — Ref ${slotIndex + 1}`;
+    title.style.fontWeight = "650";
+    title.style.fontSize = "13px";
+    title.style.overflow = "hidden";
+    title.style.textOverflow = "ellipsis";
+    title.style.whiteSpace = "nowrap";
+    title.title = ref.original_name || `Ref ${slotIndex + 1}`;
+
+    const closeButton = document.createElement("button");
+    closeButton.textContent = "×";
+    closeButton.title = "Close";
+    closeButton.style.width = "28px";
+    closeButton.style.minWidth = "28px";
+    closeButton.style.height = "26px";
+    closeButton.style.padding = "0";
+    closeButton.style.fontSize = "18px";
+    header.append(title, closeButton);
+    panel.appendChild(header);
+
+    const body = document.createElement("div");
+    body.style.flex = "1 1 auto";
+    body.style.minHeight = "0";
+    body.style.minWidth = "0";
+    body.style.display = "flex";
+    body.style.gap = "0";
+    panel.appendChild(body);
+
+    const previewWrap = document.createElement("div");
+    previewWrap.style.flex = "1 1 auto";
+    previewWrap.style.minWidth = "0";
+    previewWrap.style.minHeight = "0";
+    previewWrap.style.display = "flex";
+    previewWrap.style.alignItems = "center";
+    previewWrap.style.justifyContent = "center";
+    previewWrap.style.padding = "14px";
+    previewWrap.style.boxSizing = "border-box";
+    previewWrap.style.background = "#0f0f0f";
 
     const image = document.createElement("img");
-    image.src = refImageUrl(ref);
+    const sourceRef = { ...ref, id: ref.source_id || ref.id };
+    image.src = refImageUrl(sourceRef);
     image.alt = ref.original_name || "Reference image";
-    image.style.maxWidth = "94vw";
-    image.style.maxHeight = "92vh";
+    image.style.maxWidth = "100%";
+    image.style.maxHeight = "100%";
     image.style.objectFit = "contain";
-    image.style.borderRadius = "8px";
-    image.style.boxShadow = "0 12px 40px rgba(0,0,0,.55)";
-    overlay.appendChild(image);
+    image.style.borderRadius = "6px";
+    image.style.boxShadow = "0 8px 30px rgba(0,0,0,.45)";
+    image.draggable = false;
+    previewWrap.appendChild(image);
+    body.appendChild(previewWrap);
 
+    const controls = document.createElement("div");
+    controls.style.flex = "0 0 235px";
+    controls.style.width = "235px";
+    controls.style.boxSizing = "border-box";
+    controls.style.padding = "14px";
+    controls.style.borderLeft = "1px solid rgba(255,255,255,.12)";
+    controls.style.display = "flex";
+    controls.style.flexDirection = "column";
+    controls.style.gap = "12px";
+    controls.style.overflowY = "auto";
+    body.appendChild(controls);
+
+    const makeControl = (labelText) => {
+        const wrap = document.createElement("div");
+        wrap.style.display = "block";
+        wrap.style.fontSize = "11px";
+        wrap.style.fontWeight = "600";
+
+        const headerRow = document.createElement("div");
+        headerRow.style.display = "flex";
+        headerRow.style.alignItems = "center";
+        headerRow.style.justifyContent = "space-between";
+        headerRow.style.gap = "8px";
+        headerRow.style.marginBottom = "4px";
+
+        const label = document.createElement("div");
+        label.textContent = labelText;
+
+        const number = document.createElement("input");
+        number.type = "number";
+        number.min = "0";
+        number.max = "200";
+        number.step = "1";
+        number.value = "100";
+        number.style.width = "58px";
+        number.style.boxSizing = "border-box";
+        number.style.padding = "3px 5px";
+        number.style.borderRadius = "5px";
+        number.style.border = "1px solid rgba(255,255,255,.18)";
+        number.style.background = "rgba(0,0,0,.28)";
+        number.style.color = "inherit";
+        number.style.textAlign = "right";
+
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = "0";
+        slider.max = "200";
+        slider.step = "1";
+        slider.value = "100";
+        slider.style.width = "100%";
+        slider.style.margin = "0";
+        slider.style.padding = "0";
+        slider.style.boxSizing = "border-box";
+        slider.title = `${labelText}: 100`;
+
+        headerRow.append(label, number);
+        wrap.append(headerRow, slider);
+        controls.appendChild(wrap);
+        return { slider, number, labelText };
+    };
+
+    const saturation = makeControl("Saturation (%)");
+    const contrast = makeControl("Contrast (%)");
+    const brightness = makeControl("Brightness (%)");
+
+    const help = document.createElement("div");
+    help.textContent = "100 = original image. Edits are always calculated from the initially loaded reference, so Reset truly restores the original pixels.";
+    help.style.fontSize = "10px";
+    help.style.lineHeight = "1.35";
+    help.style.opacity = ".66";
+    controls.appendChild(help);
+
+    const spacer = document.createElement("div");
+    spacer.style.flex = "1 1 auto";
+    controls.appendChild(spacer);
+
+    const buttons = document.createElement("div");
+    buttons.style.display = "grid";
+    buttons.style.gridTemplateColumns = "1fr 1fr";
+    buttons.style.gap = "7px";
+
+    const reset = document.createElement("button");
+    reset.textContent = "Reset";
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    const apply = document.createElement("button");
+    apply.textContent = "Apply";
+    apply.style.gridColumn = "1 / -1";
+    apply.style.fontWeight = "650";
+    buttons.append(reset, cancel, apply);
+    controls.appendChild(buttons);
+
+    const numericValue = (control) => {
+        const value = Number(control.slider.value);
+        if (!Number.isFinite(value)) return 100;
+        return Math.min(200, Math.max(0, value));
+    };
+
+    const setControlValue = (control, value) => {
+        const parsed = Number(value);
+        const clamped = Number.isFinite(parsed) ? Math.min(200, Math.max(0, parsed)) : 100;
+        const text = String(Math.round(clamped));
+        control.slider.value = text;
+        control.number.value = text;
+        control.slider.title = `${control.labelText}: ${text}`;
+    };
+
+    setControlValue(saturation, ref.saturation ?? 100);
+    setControlValue(contrast, ref.contrast ?? 100);
+    setControlValue(brightness, ref.brightness ?? 100);
+
+    const updatePreview = () => {
+        const b = numericValue(brightness);
+        const c = numericValue(contrast);
+        const sat = numericValue(saturation);
+        image.style.filter = `brightness(${b}%) contrast(${c}%) saturate(${sat}%)`;
+    };
+    for (const control of [saturation, contrast, brightness]) {
+        control.slider.addEventListener("input", () => {
+            control.number.value = control.slider.value;
+            control.slider.title = `${control.labelText}: ${control.slider.value}`;
+            updatePreview();
+        });
+        control.number.addEventListener("input", () => {
+            const value = Number(control.number.value);
+            if (Number.isFinite(value)) {
+                setControlValue(control, value);
+                updatePreview();
+            }
+        });
+        control.number.addEventListener("change", () => {
+            setControlValue(control, control.number.value);
+            updatePreview();
+        });
+    }
+    updatePreview();
+
+    let closed = false;
     const close = () => {
+        if (closed) return;
+        closed = true;
         window.removeEventListener("keydown", onKey);
         overlay.remove();
     };
     const onKey = (event) => {
         if (event.key === "Escape") close();
     };
+    closeButton.addEventListener("click", close);
+    cancel.addEventListener("click", close);
     overlay.addEventListener("click", close);
-    image.addEventListener("click", (event) => event.stopPropagation());
+    panel.addEventListener("click", (event) => event.stopPropagation());
     window.addEventListener("keydown", onKey);
+
+    reset.addEventListener("click", () => {
+        setControlValue(saturation, 100);
+        setControlValue(contrast, 100);
+        setControlValue(brightness, 100);
+        updatePreview();
+    });
+
+    apply.addEventListener("click", async () => {
+        if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
+            alert("Wait for the current clip generation to finish before editing a reference image.");
+            return;
+        }
+        apply.disabled = true;
+        reset.disabled = true;
+        cancel.disabled = true;
+        runtime.refBusy = true;
+        runtime.statusText = `Applying Ref ${slotIndex + 1} adjustments…`;
+        render(node, runtime);
+        try {
+            const response = await fetch(api.apiURL("/h3_extender/ref/edit"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    ref_id: ref.id,
+                    source_id: ref.source_id || ref.id,
+                    original_name: ref.original_name || `ref_${slotIndex + 1}.png`,
+                    saturation: numericValue(saturation),
+                    contrast: numericValue(contrast),
+                    brightness: numericValue(brightness),
+                }),
+            });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || !payload?.ok || !payload?.ref) {
+                throw new Error(payload?.error || `Reference edit failed (${response.status}).`);
+            }
+            const newRef = normalizeRefDescriptor(payload.ref);
+            if (!newRef) throw new Error("The backend returned invalid reference metadata.");
+
+            const current = runtime.refsState.refs[slotIndex];
+            if (!current || String(current.id) !== String(ref.id)) {
+                throw new Error(`Ref ${slotIndex + 1} changed while the editor was open.`);
+            }
+
+            runtime.refsState.refs[slotIndex] = newRef;
+            if (sameRefContent(ref, newRef)) {
+                updateRefsHidden(node, runtime);
+                runtime.statusText = `Ref ${slotIndex + 1} unchanged`;
+                render(node, runtime);
+            } else {
+                handleReferenceChange(node, runtime, `Ref ${slotIndex + 1} adjusted`);
+            }
+            close();
+        } catch (error) {
+            runtime.statusText = "Reference edit failed";
+            render(node, runtime);
+            alert(String(error?.message || error));
+            apply.disabled = false;
+            reset.disabled = false;
+            cancel.disabled = false;
+        } finally {
+            runtime.refBusy = false;
+            render(node, runtime);
+        }
+    });
+
     document.body.appendChild(overlay);
 }
 
@@ -874,7 +1162,7 @@ function applyProjectPayload(node, runtime, projectPayload) {
     const rawRefs =
         extender?.refs_json
         || settings?.refs_json
-        || JSON.stringify({ version: 1, refs: extender?.references || [] });
+        || JSON.stringify({ version: 2, refs: extender?.references || [] });
     runtime.refsState = parseRefsState(rawRefs);
     updateRefsHidden(node, runtime);
 
@@ -1129,16 +1417,16 @@ function renderReferences(node, runtime) {
             const img = document.createElement("img");
             img.src = refImageUrl(ref);
             img.alt = ref.original_name || `Ref ${index + 1}`;
-            img.title = `${ref.original_name || `Ref ${index + 1}`} — double-click to preview`;
+            img.title = `${ref.original_name || `Ref ${index + 1}`} — double-click to edit`;
             img.style.width = "100%";
             img.style.height = "100%";
             img.style.objectFit = "contain";
-            img.style.cursor = "zoom-in";
+            img.style.cursor = "pointer";
             img.draggable = false;
             img.addEventListener("dblclick", (event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                openReferencePreview(ref);
+                openReferenceEditor(node, runtime, index, ref);
             });
             thumb.appendChild(img);
 
@@ -1689,7 +1977,7 @@ function buildUi(node) {
     refsSection.style.marginBottom = "7px";
 
     const refsHeader = document.createElement("div");
-    refsHeader.textContent = "REFERENCE IMAGES — double-click a thumbnail to preview";
+    refsHeader.textContent = "REFERENCE IMAGES — double-click a thumbnail to edit";
     refsHeader.style.fontSize = "10px";
     refsHeader.style.fontWeight = "600";
     refsHeader.style.opacity = ".75";
