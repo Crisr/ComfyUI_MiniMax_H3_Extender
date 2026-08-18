@@ -10,7 +10,8 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 Recent H3 Extender updates bring a much more self-contained workflow and better long-sequence handling:
 
 - **Internal reference manager**
-  -Add thumb editor. 
+
+  - Add thumb editor.
   - Up to 9 image references can now be loaded directly inside the Extender.
   - No external `Load Image` nodes are required anymore.
   - References are shown as thumbnails directly in the node.
