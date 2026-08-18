@@ -233,22 +233,10 @@ async function restoreCacheState(node, runtime) {
         const restoredW = Number(payload.resolved_width || 0);
         const restoredH = Number(payload.resolved_height || 0);
         if (restoredW > 0 && restoredH > 0) {
+            // Cache restore is informational only. Do not overwrite live
+            // resolution controls: outside an explicit .ext Load the user is
+            // free to change Auto/MP or Manual width/height at any time.
             runtime.expectedResolution = { width: restoredW, height: restoredH };
-
-            // v14.50 and older could create perfectly usable caches on the
-            // historical 16-pixel grid. Never invalidate such a long chain just
-            // because v14.51 adopts H3's official 32-pixel canvas for NEW
-            // resolutions. Pin that exact legacy cache in Manual mode until the
-            // user explicitly edits a resolution control.
-            const legacyGrid = (restoredW % 32) !== 0 || (restoredH % 32) !== 0;
-            if (legacyGrid && Number(payload.cached_count || 0) > 0) {
-                setWidgetValue(node, "width", restoredW);
-                setWidgetValue(node, "height", restoredH);
-                setWidgetValue(node, "resolution_mode", "manual");
-                rememberManualResolution(node, runtime, restoredW, restoredH);
-                runtime.projectResolutionLoaded = true;
-                runtime.resolutionMirrorActive = false;
-            }
         }
         runtime.cacheStateRestored = true;
         const resolutionText = restoredW > 0 && restoredH > 0
@@ -272,9 +260,8 @@ function getWidget(node, name) {
 }
 
 function effectiveManualResolution(width, height) {
-    const step = 32;
-    const w = Math.max(step, Math.min(MAX_RESOLUTION, pythonRound(Number(width || 0) / step) * step));
-    const h = Math.max(step, Math.min(MAX_RESOLUTION, pythonRound(Number(height || 0) / step) * step));
+    const w = Math.max(16, Math.min(MAX_RESOLUTION, Math.floor(Number(width || 0) / 16) * 16));
+    const h = Math.max(16, Math.min(MAX_RESOLUTION, Math.floor(Number(height || 0) / 16) * 16));
     return { width: w, height: h };
 }
 
@@ -306,7 +293,14 @@ function autoResolutionFromDimensions(srcWidth, srcHeight, megapixels) {
         scaledH *= shrink;
     }
 
-    return effectiveManualResolution(scaledW, scaledH);
+    // Auto only: H3 32-pixel canvas, snapped downward so the resolved canvas
+    // never exceeds the requested megapixel budget. Manual mode keeps the
+    // proven historical 16-pixel behavior and remains fully user-controlled.
+    const step = 32;
+    return {
+        width: Math.max(step, Math.min(MAX_RESOLUTION, Math.floor(scaledW / step) * step)),
+        height: Math.max(step, Math.min(MAX_RESOLUTION, Math.floor(scaledH / step) * step)),
+    };
 }
 
 function currentGuideRefNumber(runtime) {
@@ -574,21 +568,17 @@ function invalidateFrom(state, index) {
     }
 }
 
-function currentResolutionFromWidgets(node, runtime = null) {
+function currentResolutionFromWidgets(node) {
     const width = Number(getWidget(node, "width")?.value || 0);
     const height = Number(getWidget(node, "height")?.value || 0);
     if (!(width > 0) || !(height > 0)) return null;
-    // A loaded pre-v14.51 project may carry an exact legacy 16-grid cache.
-    // Preserve that archived geometry until the user explicitly edits the
-    // resolution; after that every new request uses the native H3 32-grid.
-    if (runtime?.projectResolutionLoaded) return { width, height };
     return effectiveManualResolution(width, height);
 }
 
 function invalidateForResolutionChange(node, runtime) {
     if (!node || !runtime?.state) return false;
     const expected = runtime.expectedResolution;
-    const current = currentResolutionFromWidgets(node, runtime);
+    const current = currentResolutionFromWidgets(node);
     if (!expected || !current) return false;
 
     const expectedW = Number(expected.width || 0);
