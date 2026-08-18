@@ -38,7 +38,7 @@ import comfy.utils
 import latent_preview
 import node_helpers
 from aiohttp import web
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 from server import PromptServer
 
 from .motion_context_ram import MiniMaxH3MotionContextRAM
@@ -59,7 +59,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.46-audio-entry-ramp"
+BUILD = "minimax-h3-extender-v14.50-preview-rotation"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -77,7 +77,7 @@ PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
 PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
 PROJECT_COPY_CHUNK = 8 * 1024 * 1024
 MAX_IMAGE_REFS = 9
-REFS_JSON_VERSION = 1
+REFS_JSON_VERSION = 2
 MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
 MAX_REF_PIXELS = 120_000_000
 _PROJECT_DOWNLOADS = {}
@@ -197,12 +197,29 @@ def _normalize_ref_descriptor(value):
         size_bytes = int(value.get("size_bytes", 0) or 0)
     except Exception:
         size_bytes = 0
+    source_id = str(value.get("source_id") or value.get("original_id") or ref_id).lower().strip()
+    if not _ref_id_is_safe(source_id):
+        source_id = ref_id
+
+    def _adjustment(name):
+        try:
+            number = float(value.get(name, 100) or 100)
+        except Exception:
+            number = 100.0
+        if not math.isfinite(number):
+            number = 100.0
+        return max(0.0, min(200.0, number))
+
     return {
         "id": ref_id,
+        "source_id": source_id,
         "original_name": str(value.get("original_name") or value.get("name") or "reference.png"),
         "width": max(0, width),
         "height": max(0, height),
         "size_bytes": max(0, size_bytes),
+        "saturation": _adjustment("saturation"),
+        "contrast": _adjustment("contrast"),
+        "brightness": _adjustment("brightness"),
     }
 
 
@@ -300,10 +317,14 @@ def _store_uploaded_reference(source_path, original_name):
             os.replace(temp_png, target)
         return {
             "id": ref_id,
+            "source_id": ref_id,
             "original_name": str(original_name or source_path.name or "reference.png"),
             "width": int(width),
             "height": int(height),
             "size_bytes": int(target.stat().st_size),
+            "saturation": 100.0,
+            "contrast": 100.0,
+            "brightness": 100.0,
         }
     finally:
         try:
@@ -311,6 +332,81 @@ def _store_uploaded_reference(source_path, original_name):
         except Exception:
             pass
 
+
+def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation):
+    """Render absolute photographic adjustments from the immutable source ref.
+
+    Every edited descriptor keeps ``source_id`` pointing at the pixels that were
+    originally loaded. Re-opening the editor therefore has an actual baseline:
+    Reset = 100/100/100 against those original pixels, rather than 100% against
+    the already edited derivative.
+    """
+    source_id = str(source_id or "").lower().strip()
+    if not _ref_id_is_safe(source_id):
+        raise ValueError("MiniMax H3 Extender: invalid source reference id.")
+
+    source_path = _ref_path(source_id)
+    if not source_path.exists():
+        raise ValueError("MiniMax H3 Extender: original reference image not found.")
+
+    def _factor(value, label):
+        try:
+            number = float(value)
+        except Exception as exc:
+            raise ValueError(f"MiniMax H3 Extender: invalid {label} value.") from exc
+        if not math.isfinite(number) or number < 0.0 or number > 200.0:
+            raise ValueError(f"MiniMax H3 Extender: {label} must be between 0 and 200 percent.")
+        return number, number / 100.0
+
+    brightness_value, brightness_factor = _factor(brightness, "brightness")
+    contrast_value, contrast_factor = _factor(contrast, "contrast")
+    saturation_value, saturation_factor = _factor(saturation, "saturation")
+
+    temp_png = _refs_root() / f".edit_{uuid.uuid4().hex}.png"
+    try:
+        with Image.open(source_path) as source:
+            image = source.convert("RGB")
+            width, height = map(int, image.size)
+            if width <= 0 or height <= 0:
+                raise ValueError("MiniMax H3 Extender: reference image has invalid dimensions.")
+            if width * height > MAX_REF_PIXELS:
+                raise ValueError(
+                    f"MiniMax H3 Extender: reference image is too large ({width}x{height})."
+                )
+
+            # Keep the order identical to the browser preview filter chain.
+            if abs(brightness_factor - 1.0) > 1e-9:
+                image = ImageEnhance.Brightness(image).enhance(brightness_factor)
+            if abs(contrast_factor - 1.0) > 1e-9:
+                image = ImageEnhance.Contrast(image).enhance(contrast_factor)
+            if abs(saturation_factor - 1.0) > 1e-9:
+                image = ImageEnhance.Color(image).enhance(saturation_factor)
+
+            image.save(temp_png, format="PNG", optimize=False, compress_level=4)
+
+        new_id = _hash_file(temp_png)
+        target = _ref_path(new_id)
+        if target.exists():
+            temp_png.unlink(missing_ok=True)
+        else:
+            os.replace(temp_png, target)
+
+        return {
+            "id": new_id,
+            "source_id": source_id,
+            "original_name": str(original_name or "reference.png"),
+            "width": int(width),
+            "height": int(height),
+            "size_bytes": int(target.stat().st_size),
+            "saturation": float(saturation_value),
+            "contrast": float(contrast_value),
+            "brightness": float(brightness_value),
+        }
+    finally:
+        try:
+            temp_png.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 def _store_project_reference(source_path, original_name):
     """Validate an archived PNG and preserve its exact bytes/hash on import."""
@@ -330,10 +426,14 @@ def _store_project_reference(source_path, original_name):
                 pass
     return {
         "id": ref_id,
+        "source_id": ref_id,
         "original_name": str(original_name or "reference.png"),
         "width": int(width),
         "height": int(height),
         "size_bytes": int(target.stat().st_size),
+        "saturation": 100.0,
+        "contrast": 100.0,
+        "brightness": 100.0,
     }
 
 
@@ -929,6 +1029,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
     # embedded. Fail loudly instead of silently writing a project that depends on
     # a local cache entry which may not exist on the destination machine.
     ref_files = []
+    source_ref_files = []
     for index, ref in enumerate(refs, start=1):
         if ref is None:
             continue
@@ -943,6 +1044,20 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
         ref["height"] = int(height)
         ref["size_bytes"] = int(path.stat().st_size)
         ref_files.append((index, ref, path))
+
+        # If the visible ref is an edited derivative, also embed the immutable
+        # source pixels. This keeps Reset meaningful after Save/Load and on
+        # another machine.
+        source_id = str(ref.get("source_id") or ref.get("id") or "").lower().strip()
+        if source_id != str(ref.get("id") or "").lower().strip():
+            source_path = _ref_path(source_id)
+            if not source_path.exists():
+                raise FileNotFoundError(
+                    f"MiniMax H3 Extender Project: original source for reference {index} is missing. "
+                    "Reload that reference image before saving the project."
+                )
+            _validate_reference_file(source_path)
+            source_ref_files.append((index, source_id, source_path))
     _write_refs_to_project_payload(project_payload, refs)
 
     snapshot = _project_cache_snapshot(owner_id, project_payload)
@@ -969,6 +1084,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
         "references": {
             "count": int(len(ref_files)),
             "embedded": True,
+            "original_sources": int(len(source_ref_files)),
         },
         "cache": {
             "present": snapshot is not None,
@@ -992,6 +1108,12 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             zf.write(
                 path,
                 arcname=f"refs/ref_{index}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+        for index, source_id, source_path in source_ref_files:
+            zf.write(
+                source_path,
+                arcname=f"refs/original_ref_{index}.png",
                 compress_type=zipfile.ZIP_STORED,
             )
 
@@ -1153,6 +1275,43 @@ def _import_project_archive(owner_id, archive_path):
                         raise ValueError(
                             f"MiniMax H3 Extender Project: reference {index} failed its integrity check."
                         )
+
+                    saved_source_id = (
+                        str(saved.get("source_id") or saved.get("id") or desc["id"]).lower().strip()
+                        if isinstance(saved, dict)
+                        else desc["id"]
+                    )
+                    source_member = f"refs/original_ref_{index}.png"
+                    if source_member in names:
+                        source_info = zf.getinfo(source_member)
+                        if int(source_info.file_size) > MAX_REF_UPLOAD_BYTES:
+                            raise ValueError(
+                                f"MiniMax H3 Extender Project: original reference {index} exceeds the allowed image size."
+                            )
+                        source_extracted = work_root / f"original_ref_{index}.png"
+                        _zip_copy_member(zf, source_member, source_extracted)
+                        source_desc = _store_project_reference(
+                            source_extracted,
+                            (saved or {}).get("original_name") if isinstance(saved, dict) else f"ref_{index}.png",
+                        )
+                        if _ref_id_is_safe(saved_source_id) and source_desc["id"] != saved_source_id:
+                            raise ValueError(
+                                f"MiniMax H3 Extender Project: original reference {index} failed its integrity check."
+                            )
+                        desc["source_id"] = source_desc["id"]
+                    else:
+                        # v2 projects created before v14.49 only embedded the
+                        # currently used pixels. They remain loadable; that image
+                        # becomes their reset baseline because the older archive
+                        # contains no recoverable original.
+                        desc["source_id"] = desc["id"]
+
+                    if isinstance(saved, dict) and desc["source_id"] != desc["id"]:
+                        for key in ("saturation", "contrast", "brightness"):
+                            try:
+                                desc[key] = max(0.0, min(200.0, float(saved.get(key, 100) or 100)))
+                            except Exception:
+                                desc[key] = 100.0
                     imported_refs[index - 1] = desc
                 imported_refs = _normalize_ref_descriptors(imported_refs)
             _write_refs_to_project_payload(project_payload, imported_refs)
@@ -1764,6 +1923,29 @@ if getattr(PromptServer, "instance", None) is not None:
                 temp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    @PromptServer.instance.routes.post("/h3_extender/ref/edit")
+    async def h3_extender_ref_edit(request):
+        """Apply simple photographic adjustments to an internal reference."""
+        try:
+            body = await request.json()
+            source_id = str(body.get("source_id") or body.get("ref_id") or "").lower().strip()
+            if not _ref_id_is_safe(source_id):
+                return web.json_response(
+                    {"ok": False, "error": "Invalid source reference id."}, status=400
+                )
+
+            ref = await asyncio.to_thread(
+                _edit_internal_reference,
+                source_id,
+                str(body.get("original_name") or "reference.png"),
+                body.get("brightness", 100),
+                body.get("contrast", 100),
+                body.get("saturation", 100),
+            )
+            return web.json_response({"ok": True, "ref": ref})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
 
     @PromptServer.instance.routes.get("/h3_extender/ref/image")
     async def h3_extender_ref_image(request):

@@ -58,9 +58,10 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.46-audio-entry-ramp"
+BUILD = "motion-context-disk-v14.50-preview-rotation"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
+PREVIEW_ROTATION_SLOTS = 3
 
 class _FinalDecodeNativeProgress:
     """Native ComfyUI progress bound to the *currently executing* Final Decode node.
@@ -1251,28 +1252,80 @@ def _comfy_media_item(path, fps, media_type):
     }
 
 
-def _preview_temp_path(unique_id):
+def _preview_temp_root():
     if folder_paths is not None:
         root = Path(folder_paths.get_temp_directory()).resolve()
     else:
         root = _ensure_cache_root() / "_preview"
     root.mkdir(parents=True, exist_ok=True)
-    return root / f"h3_motion_preview_{_safe_name(unique_id)}.mp4"
+    return root
+
+
+def _preview_temp_path(unique_id, slot=0):
+    root = _preview_temp_root()
+    return root / f"h3_motion_preview_{_safe_name(unique_id)}_{int(slot)}.mp4"
+
+
+def _preview_temp_legacy_path(unique_id):
+    return _preview_temp_root() / f"h3_motion_preview_{_safe_name(unique_id)}.mp4"
+
+
+def _preview_rotation_order(unique_id):
+    slots = [
+        _preview_temp_path(unique_id, i) for i in range(int(PREVIEW_ROTATION_SLOTS))
+    ]
+    existing = [(i, p.stat().st_mtime) for i, p in enumerate(slots) if p.exists()]
+    if not existing:
+        return list(range(int(PREVIEW_ROTATION_SLOTS)))
+    latest_idx = max(existing, key=lambda x: x[1])[0]
+    return [
+        (latest_idx + step) % int(PREVIEW_ROTATION_SLOTS)
+        for step in range(1, int(PREVIEW_ROTATION_SLOTS) + 1)
+    ]
+
+
+def _reserve_preview_temp_path(unique_id):
+    """Pick the next preview slot in a 3-file rotation.
+
+    We never touch the slot that was most recently published first, because on
+    Windows the browser/video player may keep it locked for a long time. We try
+    the other two slots first and only reuse a slot when it can actually be
+    deleted/replaced.
+    """
+    # Best-effort cleanup of the pre-v14.50 single preview file.
+    legacy = _preview_temp_legacy_path(unique_id)
+    if legacy.exists():
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+
+    last_error = None
+    for idx in _preview_rotation_order(unique_id):
+        candidate = _preview_temp_path(unique_id, idx)
+        if candidate.exists():
+            try:
+                candidate.unlink()
+            except OSError as e:
+                last_error = e
+                continue
+        return candidate
+
+    raise PermissionError(
+        "H3 preview rotation: all preview slots are currently locked by another "
+        f"process for node {unique_id!r}."
+    ) from last_error
 
 
 def _publish_full_preview(output_path, unique_id):
     """
     Put the final file under ComfyUI temp so the in-node browser player always
     has a /view-compatible URL, including when output_directory is custom.
-    Only one preview file per Final Decode node is kept.
+    Uses a 3-file rotation so the UI never tries to replace the MP4 that is
+    currently opened by the browser player on Windows.
     """
     src = Path(output_path).resolve()
-    dst = _preview_temp_path(unique_id)
-    if dst.exists():
-        try:
-            dst.unlink()
-        except OSError:
-            pass
+    dst = _reserve_preview_temp_path(unique_id)
 
     try:
         os.link(src, dst)
@@ -2035,7 +2088,7 @@ def _export_live_candidate_preview(
 
     validated_count = _validated_prefix_count(segments)
     token = f"v125_{_safe_name(unique_id)}_{uuid.uuid4().hex[:8]}"
-    preview_path = _preview_temp_path(unique_id)
+    preview_path = None
     root = _ensure_cache_root()
 
     # Upgrade v14.42 lossless cached PCM once. This changes only small gain
@@ -2065,11 +2118,7 @@ def _export_live_candidate_preview(
             raise RuntimeError(
                 "H3 progressive preview: validated preview cache is missing."
             )
-        if preview_path.exists():
-            try:
-                preview_path.unlink()
-            except OSError:
-                pass
+        preview_path = _reserve_preview_temp_path(unique_id)
         try:
             os.link(committed_path, preview_path)
         except Exception:
@@ -2138,11 +2187,7 @@ def _export_live_candidate_preview(
             current_audio,
         )
 
-        if preview_path.exists():
-            try:
-                preview_path.unlink()
-            except OSError:
-                pass
+        preview_path = _reserve_preview_temp_path(unique_id)
 
         # FULL VIDEO preview: stream-copy only the H.264 video.  Audio is
         # rebuilt from lossless per-clip PCM and encoded ONCE for the complete
@@ -2222,7 +2267,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
     if not segments:
         return None
 
-    preview_path = _preview_temp_path(final)
+    preview_path = None
     committed_path = _decoded_preview_cache_path(data_path)
     committed_video_path = _decoded_preview_video_cache_path(data_path)
     committed_count = int(manifest.get("preview_committed_count", 0))
@@ -2234,11 +2279,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
         and committed_path.exists()
         and str(manifest.get("preview_audio_mode", "")) == PREVIEW_AUDIO_MODE
     ):
-        if preview_path.exists():
-            try:
-                preview_path.unlink()
-            except OSError:
-                pass
+        preview_path = _reserve_preview_temp_path(final_id)
         try:
             os.link(committed_path, preview_path)
         except Exception:
@@ -2299,11 +2340,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
             token,
         )
 
-        if preview_path.exists():
-            try:
-                preview_path.unlink()
-            except OSError:
-                pass
+        preview_path = _reserve_preview_temp_path(final_id)
         os.replace(temp_preview, preview_path)
 
         return {
