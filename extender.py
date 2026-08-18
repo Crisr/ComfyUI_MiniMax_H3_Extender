@@ -59,7 +59,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.51-h3-resolution-grid-32"
+BUILD = "minimax-h3-extender-v14.52-safe-auto-grid-32"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -116,25 +116,30 @@ def _empty_av_latent(width: int, height: int, frame_count: int):
     return {"samples": comfy.nested_tensor.NestedTensor((video, audio))}
 
 
-def _snap_h3_resolution_axis(value):
-    """Round one canvas axis to H3's native 32-pixel spatial grid."""
-    snapped = round(float(value) / float(CANVAS_MULTIPLE)) * CANVAS_MULTIPLE
-    return max(CANVAS_MULTIPLE, min(MAX_RESOLUTION, int(snapped)))
-
-
 def _manual_effective_resolution(width: int, height: int):
-    """Return the effective H3 canvas for Manual/fallback resolution.
+    """Mirror the resolution the legacy latent allocation actually uses.
 
-    MiniMax H3's official ComfyUI workflows use a 32-pixel resolution step.
-    Keep Manual and Auto on that same spatial grid. Existing disk caches made
-    on the older 16-pixel grid are preserved separately when their archived
-    width/height exactly match the current Manual widgets.
+    Older workflows could feed arbitrary integers into width/height through
+    connected inputs.  _empty_av_latent historically floors each axis to a
+    16-pixel latent grid via integer division, so preserve that exact behavior
+    for Manual/fallback mode instead of silently changing old caches.
     """
-    return _snap_h3_resolution_axis(width), _snap_h3_resolution_axis(height)
+    w = max(16, min(MAX_RESOLUTION, (int(width) // 16) * 16))
+    h = max(16, min(MAX_RESOLUTION, (int(height) // 16) * 16))
+    return w, h
 
 
 def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
-    """Mirror Scale Image to Total Pixels with H3 resolution_steps=32."""
+    """Auto resolution on H3's 32-pixel grid without exceeding the MP budget.
+
+    H3's standard workflows use resolution_steps=32. For the Extender we snap
+    DOWN to that grid rather than to the nearest value: this keeps every Auto
+    canvas divisible by 32 while avoiding an upward size jump on borderline
+    Dynamic-VRAM/AIMDO setups.
+
+    Manual mode deliberately keeps the historical 16-pixel behavior so existing
+    workflows remain fully user-controlled and backward-compatible.
+    """
     src_w = int(src_w)
     src_h = int(src_h)
     if src_w <= 0 or src_h <= 0:
@@ -151,7 +156,10 @@ def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
         scaled_w *= shrink
         scaled_h *= shrink
 
-    return _snap_h3_resolution_axis(scaled_w), _snap_h3_resolution_axis(scaled_h)
+    step = int(CANVAS_MULTIPLE)
+    w = max(step, min(MAX_RESOLUTION, int(math.floor(scaled_w / step)) * step))
+    h = max(step, min(MAX_RESOLUTION, int(math.floor(scaled_h / step)) * step))
+    return w, h
 
 
 def _auto_resolution_from_image(image, megapixels: float):
@@ -1476,7 +1484,7 @@ class MiniMaxH3Extender:
                 "FLOAT",
                 {
                     "default": DEFAULT_MEGAPIXELS, "min": 0.01, "max": 16.0, "step": 0.01,
-                    "tooltip": "Target total pixels for Auto resolution. Mirrors ComfyUI Scale Image to Total Pixels with the official MiniMax H3 32-pixel resolution step.",
+                    "tooltip": "Target total pixels for Auto resolution. Auto canvases use the MiniMax H3 32-pixel grid without exceeding the requested pixel budget; Manual mode keeps the historical user-controlled behavior.",
                 },
             ),
             # Internal image-reference manager state. Appended after the v14.25
@@ -1572,22 +1580,6 @@ class MiniMaxH3Extender:
 
         cache_resolution = _resolution_from_manifest(manifest)
         cache_has_segments = bool(segments) and cache_resolution is not None
-
-        # Compatibility for projects/caches created before v14.51. Those could
-        # legitimately use a 16-pixel-aligned H3 canvas (for example 784x1184).
-        # If Manual mode still shows that exact archived geometry, continue the
-        # existing chain unchanged. The first explicit resolution edit switches
-        # to the official 32-pixel grid and starts a new compatible cache.
-        if (
-            cache_has_segments
-            and str(resolution_mode or "manual") == "manual"
-            and int(width) == int(cache_resolution["width"])
-            and int(height) == int(cache_resolution["height"])
-        ):
-            requested_resolution = dict(requested_resolution)
-            requested_resolution["width"] = int(cache_resolution["width"])
-            requested_resolution["height"] = int(cache_resolution["height"])
-            requested_resolution["legacy_cache_geometry"] = True
 
         # Resolution is a live generation setting again. Auto/MP or Manual
         # width/height may be changed at any time, exactly like the old external
