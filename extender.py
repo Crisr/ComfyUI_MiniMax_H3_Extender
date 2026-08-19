@@ -59,7 +59,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.52-safe-auto-grid-32"
+BUILD = "minimax-h3-extender-v14.53-unified-grid-32"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -117,15 +117,10 @@ def _empty_av_latent(width: int, height: int, frame_count: int):
 
 
 def _manual_effective_resolution(width: int, height: int):
-    """Mirror the resolution the legacy latent allocation actually uses.
-
-    Older workflows could feed arbitrary integers into width/height through
-    connected inputs.  _empty_av_latent historically floors each axis to a
-    16-pixel latent grid via integer division, so preserve that exact behavior
-    for Manual/fallback mode instead of silently changing old caches.
-    """
-    w = max(16, min(MAX_RESOLUTION, (int(width) // 16) * 16))
-    h = max(16, min(MAX_RESOLUTION, (int(height) // 16) * 16))
+    """Snap Manual/fallback resolution to MiniMax H3's 32-pixel canvas grid."""
+    step = CANVAS_MULTIPLE
+    w = max(step, min(MAX_RESOLUTION, (int(width) // step) * step))
+    h = max(step, min(MAX_RESOLUTION, (int(height) // step) * step))
     return w, h
 
 
@@ -137,8 +132,8 @@ def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
     canvas divisible by 32 while avoiding an upward size jump on borderline
     Dynamic-VRAM/AIMDO setups.
 
-    Manual mode deliberately keeps the historical 16-pixel behavior so existing
-    workflows remain fully user-controlled and backward-compatible.
+    Manual/fallback mode uses the same 32-pixel canvas grid, so every newly
+    requested H3 resolution follows the same alignment rule.
     """
     src_w = int(src_w)
     src_h = int(src_h)
@@ -1484,7 +1479,7 @@ class MiniMaxH3Extender:
                 "FLOAT",
                 {
                     "default": DEFAULT_MEGAPIXELS, "min": 0.01, "max": 16.0, "step": 0.01,
-                    "tooltip": "Target total pixels for Auto resolution. Auto canvases use the MiniMax H3 32-pixel grid without exceeding the requested pixel budget; Manual mode keeps the historical user-controlled behavior.",
+                    "tooltip": "Target total pixels for Auto resolution. Auto and Manual canvases use the MiniMax H3 32-pixel grid; Auto snaps downward without exceeding the requested pixel budget.",
                 },
             ),
             # Internal image-reference manager state. Appended after the v14.25
