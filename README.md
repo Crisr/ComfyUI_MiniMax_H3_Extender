@@ -9,6 +9,62 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 Recent H3 Extender updates bring a much more self-contained workflow and better long-sequence handling:
 
+### 🎬 Save Preview
+
+The **Final Decode / Preview** node now includes a dedicated **Save Preview** button.
+
+It saves the currently assembled Extender preview exactly as shown, including:
+
+- seam handling
+- assembled audio
+- per-clip color corrections
+- ComfyUI workflow metadata
+- ComfyUI prompt metadata
+
+The saved MP4 can be dragged back into ComfyUI to restore the workflow.
+
+### 🎨 Real-Time Per-Clip Color Editor
+
+Each generated clip now has its own **color editor**, accessible directly from the clip card with the `🎨` button.
+
+You can adjust:
+
+- Saturation
+- Contrast
+- Brightness
+
+The editor provides a **live looping preview around the selected clip**, including a short part of the previous and next clips, making it much easier to visually match colors between continuations.
+
+Corrections are:
+
+- stored independently for every clip
+- editable again at any time
+- non-destructive
+- preserved in `.ext` Save/Load projects
+- automatically included in Preview, Full Batch and Save Preview
+
+Color correction is applied only to the decoded video and **does not modify Motion Context, latent data or clip validation**.
+
+A small `✓` next to the palette indicates that a clip has an active color correction.
+
+### ⚡ Full Batch Integration
+
+Full Batch correctly preserves and applies all previously configured clip corrections during final assembly.
+
+You can therefore:
+
+1. Generate several clips
+2. Color-correct individual clips
+3. Continue generating additional clips
+4. Run Full Batch
+5. Obtain the complete sequence with all previous adjustments preserved
+
+### 💾 Save / Load Project
+
+Per-clip color adjustments are stored inside `.ext` projects.
+
+Loading a project restores the clip settings and color correction state, allowing you to continue exactly where you stopped.
+
 - **Internal reference manager**
 
   - Add thumb editor.
