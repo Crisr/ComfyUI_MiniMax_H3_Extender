@@ -42,6 +42,7 @@ from PIL import Image, ImageEnhance, ImageOps
 from server import PromptServer
 
 from .motion_context_ram import MiniMaxH3MotionContextRAM
+from .prompt_bridge import PROMPT_PACK_TYPE, _prompt_pack_signature
 from .motion_context_disk import (
     CACHE_VERSION,
     CACHE_TYPE,
@@ -59,7 +60,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.58-color-check-clarity"
+BUILD = "minimax-h3-extender-v14.59-external-prompt-pack"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -882,12 +883,101 @@ def _parse_clips_json(value: str):
     return out
 
 
-def _state_json(clips):
+def _prompt_pack_signature_from_state(value):
+    if isinstance(value, dict):
+        payload = value
+    else:
+        try:
+            payload = json.loads(str(value or "{}"))
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        return ""
+    signature = str(payload.get("prompt_pack_signature") or "").lower().strip()
+    if len(signature) != 64 or any(ch not in "0123456789abcdef" for ch in signature):
+        return ""
+    return signature
+
+
+def _state_json(clips, prompt_pack_signature=""):
+    payload = {"version": 1, "clips": clips}
+    signature = str(prompt_pack_signature or "").lower().strip()
+    if len(signature) == 64 and all(ch in "0123456789abcdef" for ch in signature):
+        payload["prompt_pack_signature"] = signature
     return json.dumps(
-        {"version": 1, "clips": clips},
+        payload,
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _normalize_external_prompt_pack(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("MiniMax H3 Extender: external prompt pack is invalid.")
+
+    prompts_raw = value.get("prompts")
+    if not isinstance(prompts_raw, (list, tuple)):
+        raise ValueError("MiniMax H3 Extender: external prompt pack has no prompt list.")
+
+    prompts = []
+    found_empty = False
+    for index, raw in enumerate(list(prompts_raw)[:10], start=1):
+        text = "" if raw is None else str(raw)
+        if not text.strip():
+            found_empty = True
+            continue
+        if found_empty:
+            raise ValueError(
+                "MiniMax H3 Extender: external prompt pack contains a gap before "
+                f"prompt {index}."
+            )
+        prompts.append(text)
+
+    if not prompts:
+        raise ValueError("MiniMax H3 Extender: external prompt pack contains no prompts.")
+
+    signature = _prompt_pack_signature(prompts)
+    return {
+        "type": PROMPT_PACK_TYPE,
+        "version": int(value.get("version", 1) or 1),
+        "source": str(value.get("source") or "External prompt pack"),
+        "count": len(prompts),
+        "prompts": prompts,
+        "signature": signature,
+    }
+
+
+def _sync_clips_from_prompt_pack(clips, pack, stored_signature=""):
+    """Import a changed pack into normal clip prompts and sync card count.
+
+    A pack is an import source, not a second runtime prompt path. Once imported,
+    the textarea prompt remains authoritative and can be edited normally. The
+    same connected pack is therefore not copied again unless its content changes
+    or the user changes the number of Extender cards while it is connected.
+    """
+    if pack is None:
+        return clips, str(stored_signature or ""), False, False
+
+    prompts = list(pack.get("prompts") or [])
+    desired_count = len(prompts)
+    signature = str(pack.get("signature") or "")
+    count_changed = len(clips) != desired_count
+    content_changed = signature != str(stored_signature or "")
+    should_import = bool(count_changed or content_changed)
+
+    if not should_import:
+        return clips, signature, False, False
+
+    synced = [dict(c) for c in list(clips)[:desired_count]]
+    while len(synced) < desired_count:
+        synced.append(_default_clip(len(synced)))
+
+    for index, prompt in enumerate(prompts):
+        synced[index]["prompt"] = str(prompt)
+
+    return synced, signature, True, count_changed
 
 
 def _manifest_for_extender(owner_id, fps=24.0):
@@ -895,6 +985,27 @@ def _manifest_for_extender(owner_id, fps=24.0):
 
 
 EXTENDER_PROGRESS_EVENT = "h3_extender_progress"
+EXTENDER_PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import"
+
+
+def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=""):
+    try:
+        server = PromptServer.instance
+        if server is None:
+            return
+        server.send_sync(
+            EXTENDER_PROMPT_PACK_EVENT,
+            {
+                "node": str(node_id),
+                "clips_json": str(clips_json),
+                "prompt_count": int(prompt_count),
+                "source": str(source or "External prompt pack"),
+            },
+            getattr(server, "client_id", None),
+        )
+    except Exception:
+        # Prompt import UI feedback must never be able to break generation.
+        pass
 
 
 def _send_extender_progress(
@@ -966,6 +1077,15 @@ def _cleanup_project_downloads():
                 path.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _prompt_pack_signature_from_project_payload(project_payload):
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("clips_json")
+    if not isinstance(raw, str) or not raw.strip():
+        settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
+        raw = settings.get("clips_json") if isinstance(settings, dict) else None
+    return _prompt_pack_signature_from_state(raw)
 
 
 def _clips_from_project_payload(project_payload):
@@ -1269,6 +1389,7 @@ def _import_project_archive(owner_id, archive_path):
             if not isinstance(project_payload, dict):
                 raise ValueError("MiniMax H3 Extender Project: invalid project metadata.")
             clips = _clips_from_project_payload(project_payload)
+            project_prompt_pack_signature = _prompt_pack_signature_from_project_payload(project_payload)
 
             # v2 embeds the real reference pixels. Import each image into the
             # Extender's content-addressed store and rewrite the returned project
@@ -1399,7 +1520,7 @@ def _import_project_archive(owner_id, archive_path):
                 elif not clip_cfg["validated"]:
                     found_open = True
 
-            normalized_clips_json = _state_json(clips)
+            normalized_clips_json = _state_json(clips, project_prompt_pack_signature)
             extender_payload = project_payload.setdefault("extender", {})
             extender_payload["clips_json"] = normalized_clips_json
             extender_payload["clips"] = clips
@@ -1518,6 +1639,12 @@ class MiniMaxH3Extender:
         optional = {
             "audio_vae": ("VAE", {"forceInput": True}),
             "ref_audio": ("AUDIO", {"forceInput": True}),
+            "prompt_pack": (
+                PROMPT_PACK_TYPE,
+                {
+                    "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
+                },
+            ),
         }
 
         return {
@@ -1558,11 +1685,23 @@ class MiniMaxH3Extender:
         resolution_mode="auto_from_ref",
         megapixels=DEFAULT_MEGAPIXELS,
         refs_json=None,
+        prompt_pack=None,
         unique_id=None,
         **kwargs,
     ):
+        stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json)
+        external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
+        clips, active_prompt_pack_signature, prompt_pack_imported, _prompt_pack_count_changed = (
+            _sync_clips_from_prompt_pack(
+                clips,
+                external_prompt_pack,
+                stored_prompt_pack_signature,
+            )
+        )
         owner = str(unique_id if unique_id is not None else "h3_extender")
+        if external_prompt_pack is None:
+            active_prompt_pack_signature = ""
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
 
         # If cards were removed, trim the physical cache immediately.
@@ -1638,6 +1777,15 @@ class MiniMaxH3Extender:
                     preview_path.unlink()
             except Exception:
                 pass
+
+        if prompt_pack_imported and external_prompt_pack is not None:
+            imported_json = _state_json(clips, active_prompt_pack_signature)
+            _send_extender_prompt_pack_import(
+                owner,
+                imported_json,
+                len(external_prompt_pack.get("prompts") or []),
+                external_prompt_pack.get("source") or "External prompt pack",
+            )
 
         # References are intentionally user-controlled. The Extender never
         # associates a Ref number with a clip number and never decides which clip
@@ -1826,7 +1974,7 @@ class MiniMaxH3Extender:
             else:
                 break
 
-        normalized_json = _state_json(clips)
+        normalized_json = _state_json(clips, active_prompt_pack_signature)
         if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
             resolution_text = (
                 f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
@@ -1842,9 +1990,15 @@ class MiniMaxH3Extender:
                 f" | resolution changed from "
                 f"{int(previous_cache_resolution['width'])}x{int(previous_cache_resolution['height'])}: cache restarted"
             )
+        prompt_pack_text = ""
+        if external_prompt_pack is not None:
+            prompt_pack_text = (
+                f" | prompt pack {len(external_prompt_pack.get('prompts') or [])}"
+                + (" imported" if prompt_pack_imported else " linked")
+            )
         status = (
             f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | cached {cached_count}/{len(clips)} | "
-            f"validated {validated_count} | "
+            f"validated {validated_count}{prompt_pack_text} | "
             + (
                 "generated " + ",".join(str(i + 1) for i in generated)
                 if generated
@@ -1890,6 +2044,10 @@ class MiniMaxH3Extender:
             "refs_json": _refs_json(refs),
             "requested_width": int(resolution.get("requested_width", resolved_width)),
             "requested_height": int(resolution.get("requested_height", resolved_height)),
+            "prompt_pack_connected": external_prompt_pack is not None,
+            "prompt_pack_imported": bool(prompt_pack_imported),
+            "prompt_pack_count": int(len(external_prompt_pack.get("prompts") or [])) if external_prompt_pack is not None else 0,
+            "prompt_pack_signature": str(active_prompt_pack_signature or ""),
             "build": BUILD,
         }
 
