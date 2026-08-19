@@ -3,6 +3,10 @@
 Packs numbered STRING prompt outputs from story/prompt generator nodes into one
 H3_PROMPT_PACK socket that the MiniMax H3 Extender can import into its normal
 per-clip prompt cards.
+
+The frontend presents these sockets as an autogrowing list.  The backend keeps
+a generous fixed declaration so the legacy V1 node API can still validate and
+execute dynamically-created prompt_N sockets on both classic nodes and Nodes 2.0.
 """
 
 from __future__ import annotations
@@ -10,30 +14,28 @@ from __future__ import annotations
 import hashlib
 import json
 
-MAX_PROMPTS = 10
+# V1 custom nodes do not have native backend autogrow inputs.  The frontend
+# therefore shows only the sockets that are useful while this declaration keeps
+# enough valid prompt_N names available for execution/validation.
+MAX_PROMPTS = 128
 PROMPT_PACK_TYPE = "H3_PROMPT_PACK"
 PROMPT_PACK_VERSION = 1
 
 
 def _pack_prompts(values):
-    """Return one contiguous prompt list and reject accidental holes.
+    """Return prompts as one compact ordered list.
 
-    H3 Story -> Sequences exposes ten fixed STRING outputs and returns empty
-    strings after n_sequences. Keeping the list contiguous prevents a missing
-    middle cable/output from silently shifting prompt numbering.
+    Empty/unconnected inputs are ignored.  This makes the bridge behave like a
+    normal ordered list: if a middle source is disconnected, every later prompt
+    moves up one position in the pack instead of leaving a hole or raising an
+    error.  The frontend mirrors the same behavior by compacting/renaming its
+    visible prompt_N sockets while preserving the connected cables.
     """
     prompts = []
-    found_empty = False
-    for index, value in enumerate(list(values)[:MAX_PROMPTS], start=1):
+    for value in list(values)[:MAX_PROMPTS]:
         text = "" if value is None else str(value)
         if not text.strip():
-            found_empty = True
             continue
-        if found_empty:
-            raise ValueError(
-                "MiniMax H3 Prompt Pack Bridge: prompt outputs must be contiguous "
-                f"from prompt_1. Found non-empty prompt_{index} after an empty slot."
-            )
         prompts.append(text)
 
     if not prompts:
@@ -53,7 +55,7 @@ def _prompt_pack_signature(prompts):
 
 
 class MiniMaxH3PromptPackBridge:
-    """Pack prompt_1..prompt_10 STRING outputs into a single Extender input."""
+    """Pack a dynamic ordered series of STRING inputs into one Extender input."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -63,7 +65,7 @@ class MiniMaxH3PromptPackBridge:
                     "STRING",
                     {
                         "forceInput": True,
-                        "tooltip": "Connect prompt_1 from an external H3 story/prompt node.",
+                        "tooltip": "Connect the first STRING prompt. More prompt inputs appear automatically.",
                     },
                 ),
             },
@@ -73,7 +75,7 @@ class MiniMaxH3PromptPackBridge:
                         "STRING",
                         {
                             "forceInput": True,
-                            "tooltip": f"Connect external prompt_{i}. Trailing empty prompts are ignored.",
+                            "tooltip": f"Dynamic STRING prompt {i}.",
                         },
                     )
                     for i in range(2, MAX_PROMPTS + 1)

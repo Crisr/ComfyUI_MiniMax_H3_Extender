@@ -60,7 +60,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.59-external-prompt-pack"
+BUILD = "minimax-h3-extender-v14.61-compact-prompt-bridge"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
