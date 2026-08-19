@@ -17,6 +17,7 @@ The v10 RAM Motion Context conditioning and its validated seam corrections remai
 unchanged. This module only changes persistence/execution and final streaming.
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -58,7 +59,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.50-preview-rotation"
+BUILD = "motion-context-disk-v14.54-save-preview"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -1335,6 +1336,96 @@ def _publish_full_preview(output_path, unique_id):
 
 
 
+def _saved_preview_output_path():
+    """Return a unique human-readable MP4 path in the normal ComfyUI output dir."""
+    if folder_paths is not None:
+        root = Path(folder_paths.get_output_directory()).resolve()
+    else:
+        root = _ensure_cache_root() / "_saved_previews"
+    root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return root / f"MiniMax_H3_preview_{stamp}_{uuid.uuid4().hex[:4]}.mp4"
+
+
+def _ffmetadata_escape(value):
+    """Escape one single-line ffmetadata value without putting JSON on argv."""
+    text = str(value)
+    text = text.replace("\\", "\\\\")
+    text = text.replace("=", "\\=")
+    text = text.replace(";", "\\;")
+    text = text.replace("#", "\\#")
+    text = text.replace("\r", "")
+    text = text.replace("\n", "\\\n")
+    return text
+
+
+def _save_preview_with_metadata(source_path, workflow=None, prompt=None):
+    """Save the assembled preview to output with ComfyUI-compatible MP4 metadata.
+
+    Audio/video streams are copied, not re-encoded. The only container rewrite is
+    needed to add the same `workflow` / `prompt` tags used by ComfyUI SaveVideo.
+    """
+    source = Path(source_path).resolve()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError("H3 Save Preview: current preview file was not found.")
+
+    ffmpeg = _find_ffmpeg()
+    output = _saved_preview_output_path()
+    root = _ensure_cache_root()
+    token = f"save_preview_{uuid.uuid4().hex[:10]}"
+    metadata_path = root / f"_{token}.ffmeta"
+    log_path = root / f"_{token}.log"
+
+    metadata = {}
+    if workflow is not None:
+        metadata["workflow"] = workflow
+    if prompt is not None:
+        metadata["prompt"] = prompt
+
+    try:
+        lines = [";FFMETADATA1"]
+        for key, value in metadata.items():
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            lines.append(f"{key}={_ffmetadata_escape(encoded)}")
+        metadata_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i", str(source),
+            "-f", "ffmetadata",
+            "-i", str(metadata_path),
+            "-map", "0",
+            "-map_metadata", "1",
+            "-c", "copy",
+            "-movflags", "use_metadata_tags+faststart",
+            str(output),
+        ]
+        with open(log_path, "wb") as log_f:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
+        if proc.returncode != 0:
+            tail = ""
+            try:
+                tail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"H3 Save Preview failed with ffmpeg code {proc.returncode}.\n{tail}"
+            )
+        return output
+    finally:
+        for path in (metadata_path, log_path):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+
 # -----------------------------------------------------------------------------
 # v12.5 - progressive FULL decoded preview cache
 # -----------------------------------------------------------------------------
@@ -2366,6 +2457,55 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
 
 
 if web is not None and PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.post("/h3_extender/save_preview")
+    async def h3_extender_save_preview(request):
+        """Save only the currently assembled Final Decode preview to output."""
+        try:
+            body = await request.json()
+            filename = str(body.get("filename") or "").strip()
+            media_type = str(body.get("type") or "temp").strip()
+            subfolder = str(body.get("subfolder") or "").strip()
+
+            if media_type != "temp" or subfolder not in ("", "."):
+                return web.json_response(
+                    {"ok": False, "error": "Save Preview only accepts the Extender temp preview."},
+                    status=400,
+                )
+            if Path(filename).name != filename or not re.fullmatch(
+                r"h3_motion_preview_[A-Za-z0-9._-]+_[0-2]\.mp4", filename
+            ):
+                return web.json_response(
+                    {"ok": False, "error": "Invalid H3 preview filename."}, status=400
+                )
+
+            source = (_preview_temp_root() / filename).resolve()
+            if source.parent != _preview_temp_root().resolve():
+                return web.json_response(
+                    {"ok": False, "error": "Invalid H3 preview path."}, status=400
+                )
+            if not source.exists():
+                return web.json_response(
+                    {"ok": False, "error": "The currently displayed preview no longer exists."},
+                    status=404,
+                )
+
+            workflow = body.get("workflow")
+            prompt = body.get("prompt")
+            output = await asyncio.to_thread(
+                _save_preview_with_metadata,
+                source,
+                workflow,
+                prompt,
+            )
+            return web.json_response({
+                "ok": True,
+                "video": _comfy_media_item(output, float(body.get("fps") or FPS), "output"),
+                "filename": output.name,
+            })
+        except Exception as exc:
+            _LOG.exception("H3 Save Preview failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @PromptServer.instance.routes.get("/h3_extender/cache_state")
     async def h3_extender_cache_state(request):
         """Restore Extender card cache/validation UI state without execution."""

@@ -59,7 +59,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.53-unified-grid-32"
+BUILD = "minimax-h3-extender-v14.54-save-preview"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
