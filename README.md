@@ -88,6 +88,9 @@ Loading a project restores the clip settings and color correction state, allowin
 
 ---
 
+<img width="1860" height="691" alt="image" src="https://github.com/user-attachments/assets/9f2354a4-d8b7-485d-904f-76481e8fba15" />
+
+
 <img width="2048" height="1103" alt="image" src="https://github.com/user-attachments/assets/f67ba34a-5b8a-4d3b-9c18-d6314db2c873" />
 
 
