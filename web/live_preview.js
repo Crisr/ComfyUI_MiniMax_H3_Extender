@@ -195,6 +195,40 @@ function mediaUrl(info) {
     return api.apiURL("/view?" + params.toString());
 }
 
+function normalizeColorAdjustment(value) {
+    const c = value && typeof value === "object" ? value : {};
+    const clamp = (v, lo, hi, fallback) => {
+        const n = Number(v);
+        return Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : fallback));
+    };
+    return {
+        saturation: clamp(c.saturation, 0, 200, 100),
+        contrast: clamp(c.contrast, 50, 150, 100),
+        brightness: clamp(c.brightness, 50, 150, 100),
+    };
+}
+
+function cssColorFilter(value) {
+    const c = normalizeColorAdjustment(value);
+    return `saturate(${c.saturation}%) contrast(${c.contrast}%) brightness(${c.brightness}%)`;
+}
+
+function colorAdjustmentAtTime(timeline, time) {
+    const t = Number(time || 0);
+    for (const item of timeline || []) {
+        const start = Number(item?.start || 0);
+        const end = Number(item?.end || start);
+        if (t >= start && t < end) return item?.adjustment || null;
+    }
+    return null;
+}
+
+function syncPreviewColorFilter(state) {
+    if (!state?.video) return;
+    const adjustment = colorAdjustmentAtTime(state.colorTimeline, state.video.currentTime);
+    state.video.style.filter = adjustment ? cssColorFilter(adjustment) : "none";
+}
+
 
 function findUpstreamExtenderId(node) {
     const graph = node?.graph || app.graph;
@@ -257,6 +291,7 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 
         state.currentVideoInfo = { ...payload.video };
         state.currentFps = Number(payload.video?.frame_rate || state.currentFps || 24);
+        state.colorTimeline = Array.isArray(payload.color_timeline) ? payload.color_timeline : [];
         state.saveButton.disabled = false;
         state.video.src = mediaUrl(payload.video) + "&t=" + Date.now();
         state.video.load();
@@ -444,6 +479,7 @@ async function saveCurrentPreview(node, state) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+                owner_id: findUpstreamExtenderId(node),
                 filename: info.filename,
                 subfolder: info.subfolder || "",
                 type: info.type || "temp",
@@ -553,6 +589,7 @@ function makePlayer(node) {
         widget: null,
         currentVideoInfo: null,
         currentFps: 24,
+        colorTimeline: [],
         saveInProgress: false,
         currentHeight: PLAYER_MIN_HEIGHT,
         syncingPlayer: false,
@@ -562,6 +599,18 @@ function makePlayer(node) {
         restoreLoaded: false,
         restoreRequestRunning: false,
     };
+
+    video.addEventListener("timeupdate", () => syncPreviewColorFilter(state));
+    video.addEventListener("seeked", () => syncPreviewColorFilter(state));
+    video.addEventListener("loadedmetadata", () => syncPreviewColorFilter(state));
+    if (typeof video.requestVideoFrameCallback === "function") {
+        const colorFrameTick = () => {
+            if (!box.isConnected) return;
+            syncPreviewColorFilter(state);
+            video.requestVideoFrameCallback(colorFrameTick);
+        };
+        video.requestVideoFrameCallback(colorFrameTick);
+    }
 
     const widget = node.addDOMWidget("h3_live_preview", "preview", box, {
         serialize: false,
@@ -628,6 +677,8 @@ function refreshImportedProjectPreview(ownerId) {
         state.restoreLoaded = false;
         state.restoreRequestRunning = false;
         state.currentVideoInfo = null;
+        state.colorTimeline = [];
+        state.video.style.filter = "none";
         state.saveButton.disabled = true;
         state.label.textContent = "PROJECT LOADED — preview will restore when cached render data is available";
         try {
@@ -647,6 +698,19 @@ app.registerExtension({
             const ownerId = event?.detail?.owner_id;
             if (ownerId == null) return;
             refreshImportedProjectPreview(ownerId);
+        });
+        window.addEventListener("h3-extender-color-updated", (event) => {
+            const ownerId = event?.detail?.owner_id;
+            const timeline = event?.detail?.color_timeline;
+            if (ownerId == null || !Array.isArray(timeline)) return;
+            const graph = app.graph;
+            for (const node of graph?._nodes || []) {
+                if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+                if (String(findUpstreamExtenderId(node)) !== String(ownerId)) continue;
+                const state = makePlayer(node);
+                state.colorTimeline = timeline;
+                syncPreviewColorFilter(state);
+            }
         });
     },
 
@@ -736,6 +800,7 @@ app.registerExtension({
 
             state.currentVideoInfo = { ...info };
             state.currentFps = Number(info.frame_rate || state.currentFps || 24);
+            state.colorTimeline = Array.isArray(meta?.color_timeline) ? meta.color_timeline : [];
             state.saveButton.disabled = false;
             state.video.src = mediaUrl(info) + "&t=" + Date.now();
             state.video.load();

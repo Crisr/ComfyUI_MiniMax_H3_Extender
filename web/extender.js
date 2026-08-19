@@ -155,6 +155,29 @@ function randomSeed() {
     }
 }
 
+function normalizeColorAdjustment(value) {
+    const c = value && typeof value === "object" ? value : {};
+    const clamp = (v, lo, hi, fallback) => {
+        const n = Number(v);
+        return Math.max(lo, Math.min(hi, Number.isFinite(n) ? n : fallback));
+    };
+    return {
+        saturation: clamp(c.saturation, 0, 200, 100),
+        contrast: clamp(c.contrast, 50, 150, 100),
+        brightness: clamp(c.brightness, 50, 150, 100),
+    };
+}
+
+function colorAdjustmentIsNeutral(value) {
+    const c = normalizeColorAdjustment(value);
+    return [c.saturation, c.contrast, c.brightness].every((v) => Math.abs(v - 100) < 1e-6);
+}
+
+function cssColorFilter(value) {
+    const c = normalizeColorAdjustment(value);
+    return `saturate(${c.saturation}%) contrast(${c.contrast}%) brightness(${c.brightness}%)`;
+}
+
 function newClip(index) {
     return {
         id: `clip_${index + 1}_${Date.now().toString(36)}`,
@@ -164,6 +187,7 @@ function newClip(index) {
         seed_mode: "randomize",
         duration: 10.0,
         validated: false,
+        color_adjustment: normalizeColorAdjustment(),
     };
 }
 
@@ -185,6 +209,7 @@ function parseState(raw) {
                         : "randomize",
                     duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
                     validated: Boolean(c?.validated),
+                    color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
                 })),
             };
         }
@@ -1064,6 +1089,313 @@ function connectedFinalDecode(node) {
     return null;
 }
 
+function colorMediaUrl(info) {
+    const params = new URLSearchParams();
+    params.set("filename", info?.filename || "");
+    params.set("type", info?.type || "temp");
+    params.set("subfolder", info?.subfolder || "");
+    return api.apiURL("/view?" + params.toString());
+}
+
+function colorAtTimelineTime(timeline, time, targetIndex, liveAdjustment) {
+    const t = Number(time || 0);
+    for (const item of timeline || []) {
+        const start = Number(item?.start || 0);
+        const end = Number(item?.end || start);
+        if (t >= start && t < end) {
+            if (Number(item?.index) === Number(targetIndex)) return liveAdjustment;
+            return normalizeColorAdjustment(item?.adjustment);
+        }
+    }
+    return normalizeColorAdjustment();
+}
+
+function closeColorEditor(overlay) {
+    try {
+        const video = overlay?.querySelector?.("video");
+        if (video) {
+            video.pause();
+            video.removeAttribute("src");
+            video.load();
+        }
+    } catch (_) {}
+    overlay?.remove?.();
+}
+
+async function openClipColorEditor(node, runtime, clipIndex) {
+    const finalNode = connectedFinalDecode(node);
+    if (!finalNode) {
+        alert("Connect the Extender cache output to Final Decode / Preview first.");
+        return;
+    }
+
+    const params = new URLSearchParams();
+    params.set("owner_id", String(node.id));
+    params.set("final_id", String(finalNode.id));
+    params.set("clip_index", String(clipIndex));
+
+    let payload;
+    try {
+        const response = await fetch(
+            api.apiURL("/h3_extender/color_editor_info?" + params.toString())
+        );
+        payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Color editor failed (${response.status}).`);
+        }
+    } catch (error) {
+        alert(`Color editor unavailable:\n${error?.message || error}`);
+        return;
+    }
+
+    const timeline = Array.isArray(payload.timeline) ? payload.timeline : [];
+    const target = timeline.find((item) => Number(item?.index) === Number(clipIndex));
+    if (!target || !payload?.video?.filename) {
+        alert("The decoded clip preview is not available yet.");
+        return;
+    }
+
+    const clip = runtime.state.clips[clipIndex];
+    let adjustment = normalizeColorAdjustment(
+        clip?.color_adjustment || target?.adjustment
+    );
+
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.zIndex = "100000";
+    overlay.style.background = "rgba(0,0,0,.78)";
+    overlay.style.display = "flex";
+    overlay.style.alignItems = "center";
+    overlay.style.justifyContent = "center";
+    overlay.style.padding = "24px";
+    overlay.style.boxSizing = "border-box";
+
+    const dialog = document.createElement("div");
+    dialog.style.width = "min(1040px, 94vw)";
+    dialog.style.maxHeight = "92vh";
+    dialog.style.overflow = "auto";
+    dialog.style.background = "#171717";
+    dialog.style.color = "#f0f0f0";
+    dialog.style.border = "1px solid rgba(255,255,255,.18)";
+    dialog.style.borderRadius = "10px";
+    dialog.style.boxShadow = "0 18px 60px rgba(0,0,0,.65)";
+    dialog.style.padding = "14px";
+    dialog.style.boxSizing = "border-box";
+
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.justifyContent = "space-between";
+    header.style.gap = "12px";
+    header.style.marginBottom = "10px";
+
+    const title = document.createElement("strong");
+    const clipName = String(clip?.name || "").trim();
+    title.textContent = `Color Edit — Clip ${clipIndex + 1}${clipName ? ` — ${clipName}` : ""}`;
+    title.style.fontSize = "15px";
+
+    const close = document.createElement("button");
+    close.textContent = "✕";
+    close.title = "Close";
+    close.style.width = "30px";
+    close.style.height = "26px";
+    close.style.cursor = "pointer";
+    close.addEventListener("click", () => closeColorEditor(overlay));
+    header.append(title, close);
+
+    const video = document.createElement("video");
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.style.display = "block";
+    video.style.width = "100%";
+    video.style.maxHeight = "58vh";
+    video.style.objectFit = "contain";
+    video.style.background = "#000";
+    video.style.borderRadius = "6px";
+
+    const totalEnd = timeline.length ? Number(timeline[timeline.length - 1]?.end || 0) : Number(target.end || 0);
+    const loopStart = Math.max(0, Number(target.start || 0) - 2.0);
+    const loopEnd = Math.min(totalEnd, Number(target.end || 0) + 2.0);
+
+    const loopInfo = document.createElement("div");
+    loopInfo.textContent = `Loop: ${loopStart.toFixed(2)}s → ${loopEnd.toFixed(2)}s  •  target ${Number(target.start).toFixed(2)}s → ${Number(target.end).toFixed(2)}s`;
+    loopInfo.style.fontSize = "11px";
+    loopInfo.style.opacity = ".72";
+    loopInfo.style.margin = "7px 0 10px";
+
+    const controls = document.createElement("div");
+    controls.style.display = "grid";
+    controls.style.gridTemplateColumns = "1fr";
+    controls.style.gap = "8px";
+
+    const valueInputs = {};
+    const sliderRows = [];
+    const makeSlider = (key, label, min, max) => {
+        const row = document.createElement("div");
+        row.style.display = "grid";
+        row.style.gridTemplateColumns = "100px 1fr 64px";
+        row.style.gap = "10px";
+        row.style.alignItems = "center";
+
+        const text = document.createElement("span");
+        text.textContent = label;
+        text.style.fontSize = "12px";
+
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = String(min);
+        slider.max = String(max);
+        slider.step = "1";
+        slider.value = String(Math.round(adjustment[key]));
+        slider.style.width = "100%";
+
+        const number = document.createElement("input");
+        number.type = "number";
+        number.min = String(min);
+        number.max = String(max);
+        number.step = "1";
+        number.value = String(Math.round(adjustment[key]));
+        number.style.width = "64px";
+        number.style.boxSizing = "border-box";
+        number.style.background = "rgba(0,0,0,.35)";
+        number.style.color = "inherit";
+        number.style.border = "1px solid rgba(255,255,255,.18)";
+        number.style.borderRadius = "4px";
+        number.style.padding = "3px 5px";
+
+        const update = (raw) => {
+            const n = Math.max(min, Math.min(max, Number(raw)));
+            adjustment = { ...adjustment, [key]: Number.isFinite(n) ? n : 100 };
+            slider.value = String(Math.round(adjustment[key]));
+            number.value = String(Math.round(adjustment[key]));
+            updateLiveFilter();
+        };
+        slider.addEventListener("input", () => update(slider.value));
+        number.addEventListener("input", () => update(number.value));
+        valueInputs[key] = { slider, number, update };
+        row.append(text, slider, number);
+        sliderRows.push(row);
+        controls.appendChild(row);
+    };
+
+    const updateLiveFilter = () => {
+        const c = colorAtTimelineTime(timeline, video.currentTime, clipIndex, adjustment);
+        video.style.filter = cssColorFilter(c);
+    };
+
+    makeSlider("saturation", "Saturation", 0, 200);
+    makeSlider("contrast", "Contrast", 50, 150);
+    makeSlider("brightness", "Brightness", 50, 150);
+
+    const buttons = document.createElement("div");
+    buttons.style.display = "flex";
+    buttons.style.justifyContent = "flex-end";
+    buttons.style.gap = "8px";
+    buttons.style.marginTop = "12px";
+
+    const reset = document.createElement("button");
+    reset.textContent = "Reset";
+    reset.title = "Return this clip to neutral 100 / 100 / 100";
+    reset.addEventListener("click", () => {
+        adjustment = normalizeColorAdjustment();
+        for (const [key, pair] of Object.entries(valueInputs)) {
+            pair.slider.value = String(Math.round(adjustment[key]));
+            pair.number.value = String(Math.round(adjustment[key]));
+        }
+        updateLiveFilter();
+    });
+
+    const cancel = document.createElement("button");
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => closeColorEditor(overlay));
+
+    const apply = document.createElement("button");
+    apply.textContent = "Apply";
+    apply.style.fontWeight = "700";
+    apply.style.minWidth = "84px";
+    apply.addEventListener("click", async () => {
+        apply.disabled = true;
+        apply.textContent = "Applying...";
+        try {
+            const response = await fetch(api.apiURL("/h3_extender/color_adjust"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    owner_id: String(node.id),
+                    clip_index: Number(clipIndex),
+                    adjustment: normalizeColorAdjustment(adjustment),
+                }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok || !result?.ok) {
+                throw new Error(result?.error || `Color adjustment failed (${response.status}).`);
+            }
+            clip.color_adjustment = normalizeColorAdjustment(result.adjustment);
+            updateHidden(node, runtime);
+            runtime.statusText = result.modified
+                ? `Clip ${clipIndex + 1} color correction saved`
+                : `Clip ${clipIndex + 1} color correction reset`;
+            render(node, runtime);
+            window.dispatchEvent(new CustomEvent("h3-extender-color-updated", {
+                detail: {
+                    owner_id: String(node.id),
+                    color_timeline: Array.isArray(result.timeline) ? result.timeline : [],
+                },
+            }));
+            node.graph?.setDirtyCanvas(true, true);
+            closeColorEditor(overlay);
+        } catch (error) {
+            alert(`Color adjustment failed:\n${error?.message || error}`);
+            apply.disabled = false;
+            apply.textContent = "Apply";
+        }
+    });
+
+    buttons.append(reset, cancel, apply);
+    dialog.append(header, video, loopInfo, controls, buttons);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    overlay.addEventListener("mousedown", (event) => {
+        if (event.target === overlay) closeColorEditor(overlay);
+    });
+    const keyHandler = (event) => {
+        if (event.key === "Escape" && overlay.isConnected) {
+            closeColorEditor(overlay);
+            document.removeEventListener("keydown", keyHandler);
+        }
+    };
+    document.addEventListener("keydown", keyHandler);
+
+    video.addEventListener("loadedmetadata", () => {
+        video.currentTime = loopStart;
+        updateLiveFilter();
+        video.play().catch(() => {});
+    });
+    video.addEventListener("timeupdate", () => {
+        if (video.currentTime >= loopEnd - 0.015 || video.currentTime < loopStart - 0.05) {
+            video.currentTime = loopStart;
+        }
+        updateLiveFilter();
+    });
+    video.addEventListener("seeked", updateLiveFilter);
+    if (typeof video.requestVideoFrameCallback === "function") {
+        const colorFrameTick = () => {
+            if (!overlay.isConnected) return;
+            if (video.currentTime >= loopEnd - 0.015 || video.currentTime < loopStart - 0.05) {
+                video.currentTime = loopStart;
+            }
+            updateLiveFilter();
+            video.requestVideoFrameCallback(colorFrameTick);
+        };
+        video.requestVideoFrameCallback(colorFrameTick);
+    }
+    video.src = colorMediaUrl(payload.video) + "&t=" + Date.now();
+    video.load();
+}
+
 function collectWidgetValues(node, names) {
     const out = {};
     for (const name of names) {
@@ -1554,6 +1886,46 @@ function render(node, runtime) {
             // Keep focus while typing; no DOM rebuild here.
         });
 
+        const colorWrap = document.createElement("div");
+        colorWrap.style.display = "flex";
+        colorWrap.style.alignItems = "center";
+        colorWrap.style.gap = "2px";
+        colorWrap.style.flex = "0 0 auto";
+
+        const colorButton = document.createElement("button");
+        colorButton.type = "button";
+        colorButton.textContent = "🎨";
+        const colorBusy = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
+        const colorCached = index < Number(runtime.cachedCount || 0);
+        colorButton.title = colorBusy
+            ? "Color editing is disabled while the Extender is rendering"
+            : colorCached
+                ? "Edit color for this decoded clip"
+                : "Color editor becomes available after this clip has been decoded";
+        colorButton.disabled = colorBusy || !colorCached;
+        colorButton.style.width = "27px";
+        colorButton.style.height = "22px";
+        colorButton.style.padding = "0";
+        colorButton.style.borderRadius = "4px";
+        colorButton.style.cursor = colorButton.disabled ? "default" : "pointer";
+        colorButton.style.opacity = colorButton.disabled ? ".35" : ".9";
+        colorButton.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (!colorButton.disabled) openClipColorEditor(node, runtime, index);
+        });
+
+        const colorCheck = document.createElement("span");
+        colorCheck.textContent = colorAdjustmentIsNeutral(clip.color_adjustment) ? "" : "✓";
+        colorCheck.title = colorCheck.textContent ? "Color correction applied" : "";
+        colorCheck.style.width = "10px";
+        colorCheck.style.fontSize = "11px";
+        colorCheck.style.fontWeight = "700";
+        colorCheck.style.color = "rgba(115,225,145,.95)";
+        colorCheck.style.textAlign = "center";
+
+        colorWrap.append(colorButton, colorCheck);
+
         const badge = document.createElement("span");
         badge.style.fontSize = "10px";
         badge.style.opacity = ".8";
@@ -1566,12 +1938,12 @@ function render(node, runtime) {
                             ? "✓ COMPLETE"
                             : "▶ RENDERING"
                 ) :
-            st === "validated" ? "✓ VALIDATED" :
+            st === "validated" ? "VALIDATED" :
             st === "candidate" ? "● CANDIDATE" :
             st === "current" ? "● NEXT" :
             st === "cached" ? "CACHE" : "○";
 
-        head.append(title, name, badge);
+        head.append(title, name, colorWrap, badge);
         card.appendChild(head);
 
         card.appendChild(makeFieldLabel("Prompt"));
