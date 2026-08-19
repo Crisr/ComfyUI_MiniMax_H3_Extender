@@ -5,6 +5,45 @@ const TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const DISK_JOIN_TARGET = "MiniMaxH3MotionContextDiskJoin";
 const EXTENDER_TARGET = "MiniMaxH3Extender";
 
+function ensureSavePreviewButtonStyle() {
+    if (document.getElementById("h3-save-preview-button-style")) return;
+    const style = document.createElement("style");
+    style.id = "h3-save-preview-button-style";
+    style.textContent = `
+        .h3-save-preview-button {
+            height: 22px;
+            min-width: 118px;
+            padding: 0 14px;
+            border: 1px solid rgba(120, 220, 160, 0.72);
+            border-radius: 5px;
+            background: linear-gradient(180deg, rgba(51, 145, 92, 0.96), rgba(35, 108, 70, 0.96));
+            color: #ffffff;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.35px;
+            line-height: 20px;
+            cursor: pointer;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+            transition: filter 100ms ease, transform 100ms ease, opacity 100ms ease;
+        }
+        .h3-save-preview-button:hover:not(:disabled) {
+            filter: brightness(1.18);
+        }
+        .h3-save-preview-button:active:not(:disabled) {
+            transform: translateY(1px);
+        }
+        .h3-save-preview-button:disabled {
+            border-color: rgba(255, 255, 255, 0.20);
+            background: rgba(70, 70, 70, 0.88);
+            color: rgba(255, 255, 255, 0.55);
+            cursor: default;
+            box-shadow: none;
+            opacity: 0.78;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
 function stripFinalDecodeOutputs(node) {
     if (!node?.outputs?.length) return;
 
@@ -123,8 +162,9 @@ function installValidationCascade(node) {
 
 
 const PLAYER_MIN_WIDTH = 380;
-const PLAYER_MIN_HEIGHT = 220;
+const PLAYER_MIN_HEIGHT = 227;
 const LABEL_HEIGHT = 22;
+const PREVIEW_HEADER_GAP = 7;
 const BOTTOM_PAD = 14;
 
 function previewDomRenderMode(element) {
@@ -215,6 +255,9 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         state.label.textContent =
             `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
 
+        state.currentVideoInfo = { ...payload.video };
+        state.currentFps = Number(payload.video?.frame_rate || state.currentFps || 24);
+        state.saveButton.disabled = false;
         state.video.src = mediaUrl(payload.video) + "&t=" + Date.now();
         state.video.load();
 
@@ -292,7 +335,7 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         state.box.style.flex = "1 1 auto";
         state.box.style.overflow = "visible";
         state.video.style.height = "auto";
-        state.video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - 4)}px`;
+        state.video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4)}px`;
         state.video.style.flex = "1 1 auto";
         return;
     }
@@ -364,10 +407,74 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         state.lastRenderMode = "legacy";
         state.box.style.height = `${availableH}px`;
         state.video.style.height =
-            `${Math.max(80, availableH - LABEL_HEIGHT - 4)}px`;
+            `${Math.max(80, availableH - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4)}px`;
         node.graph?.setDirtyCanvas(true, true);
     } finally {
         state.syncingPlayer = false;
+    }
+}
+
+async function saveCurrentPreview(node, state) {
+    const info = state?.currentVideoInfo;
+    if (!info?.filename || state.saveInProgress) return;
+
+    state.saveInProgress = true;
+    const button = state.saveButton;
+    const oldText = button?.textContent || "SAVE PREVIEW";
+    if (button) {
+        button.disabled = true;
+        button.textContent = "Saving...";
+    }
+
+    try {
+        let promptData = null;
+        try {
+            promptData = await app.graphToPrompt();
+        } catch (_) {
+            // Workflow metadata is still useful even if API-prompt serialization
+            // fails for an unrelated custom widget.
+        }
+
+        const workflow = promptData?.workflow
+            ?? app.graph?.serialize?.()
+            ?? null;
+        const prompt = promptData?.output ?? null;
+
+        const response = await fetch(api.apiURL("/h3_extender/save_preview"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                filename: info.filename,
+                subfolder: info.subfolder || "",
+                type: info.type || "temp",
+                fps: Number(info.frame_rate || state.currentFps || 24),
+                workflow,
+                prompt,
+            }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Save Preview failed (${response.status}).`);
+        }
+
+        if (button) {
+            button.textContent = "Saved ✓";
+            setTimeout(() => {
+                if (!state.saveInProgress && button.textContent === "Saved ✓") {
+                    button.textContent = oldText;
+                }
+            }, 1800);
+        }
+    } catch (error) {
+        console.error("MiniMax H3 Save Preview failed", error);
+        if (button) button.textContent = "Save failed";
+        alert(`Save Preview failed:\n${error?.message || error}`);
+        setTimeout(() => {
+            if (!state.saveInProgress && button) button.textContent = oldText;
+        }, 1800);
+    } finally {
+        state.saveInProgress = false;
+        if (button) button.disabled = !state.currentVideoInfo?.filename;
     }
 }
 
@@ -386,6 +493,15 @@ function makePlayer(node) {
     box.style.background = "transparent";
     box.style.overflow = "hidden";
 
+    const header = document.createElement("div");
+    header.style.height = `${LABEL_HEIGHT}px`;
+    header.style.minHeight = `${LABEL_HEIGHT}px`;
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.gap = "8px";
+    header.style.marginBottom = `${PREVIEW_HEADER_GAP}px`;
+    header.style.overflow = "hidden";
+
     const label = document.createElement("div");
     label.textContent = "FULL LIVE PREVIEW";
     label.style.fontSize = "11px";
@@ -396,6 +512,20 @@ function makePlayer(node) {
     label.style.whiteSpace = "nowrap";
     label.style.overflow = "hidden";
     label.style.textOverflow = "ellipsis";
+    label.style.flex = "1 1 auto";
+    label.style.minWidth = "0";
+
+    ensureSavePreviewButtonStyle();
+    const saveButton = document.createElement("button");
+    saveButton.type = "button";
+    saveButton.textContent = "SAVE PREVIEW";
+    saveButton.title = "Save the currently assembled preview to ComfyUI output with workflow metadata";
+    saveButton.className = "h3-save-preview-button";
+    saveButton.disabled = true;
+    saveButton.style.flex = "0 0 auto";
+
+    header.appendChild(label);
+    header.appendChild(saveButton);
 
     const video = document.createElement("video");
     video.controls = true;
@@ -404,21 +534,26 @@ function makePlayer(node) {
     video.preload = "metadata";
     video.style.display = "block";
     video.style.width = "100%";
-    video.style.height = `${PLAYER_MIN_HEIGHT - LABEL_HEIGHT - 4}px`;
+    video.style.height = `${PLAYER_MIN_HEIGHT - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4}px`;
     video.style.flex = "1 1 auto";
     video.style.minHeight = "0";
     video.style.objectFit = "contain";
     video.style.background = "#000";
     video.style.borderRadius = "4px";
 
-    box.appendChild(label);
+    box.appendChild(header);
     box.appendChild(video);
 
     const state = {
         box,
+        header,
         label,
+        saveButton,
         video,
         widget: null,
+        currentVideoInfo: null,
+        currentFps: 24,
+        saveInProgress: false,
         currentHeight: PLAYER_MIN_HEIGHT,
         syncingPlayer: false,
         lastRenderMode: null,
@@ -444,7 +579,7 @@ function makePlayer(node) {
                 box.style.flex = "1 1 auto";
                 box.style.overflow = "visible";
                 video.style.height = "auto";
-                video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - 4)}px`;
+                video.style.minHeight = `${Math.max(80, PLAYER_MIN_HEIGHT - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4)}px`;
                 video.style.flex = "1 1 auto";
                 state.lastRenderMode = "nodes2";
             } else {
@@ -455,6 +590,7 @@ function makePlayer(node) {
         },
     });
     state.widget = widget;
+    saveButton.addEventListener("click", () => saveCurrentPreview(node, state));
 
     node.__h3LivePreview = state;
 
@@ -491,6 +627,8 @@ function refreshImportedProjectPreview(ownerId) {
         state.liveLoaded = false;
         state.restoreLoaded = false;
         state.restoreRequestRunning = false;
+        state.currentVideoInfo = null;
+        state.saveButton.disabled = true;
         state.label.textContent = "PROJECT LOADED — preview will restore when cached render data is available";
         try {
             state.video.pause();
@@ -596,6 +734,9 @@ app.registerExtension({
                 state.label.textContent = "FULL LIVE PREVIEW";
             }
 
+            state.currentVideoInfo = { ...info };
+            state.currentFps = Number(info.frame_rate || state.currentFps || 24);
+            state.saveButton.disabled = false;
             state.video.src = mediaUrl(info) + "&t=" + Date.now();
             state.video.load();
             state.video.play().catch(() => {});
