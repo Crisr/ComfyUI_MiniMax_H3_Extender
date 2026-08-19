@@ -260,8 +260,9 @@ function getWidget(node, name) {
 }
 
 function effectiveManualResolution(width, height) {
-    const w = Math.max(16, Math.min(MAX_RESOLUTION, Math.floor(Number(width || 0) / 16) * 16));
-    const h = Math.max(16, Math.min(MAX_RESOLUTION, Math.floor(Number(height || 0) / 16) * 16));
+    const step = 32;
+    const w = Math.max(step, Math.min(MAX_RESOLUTION, Math.floor(Number(width || 0) / step) * step));
+    const h = Math.max(step, Math.min(MAX_RESOLUTION, Math.floor(Number(height || 0) / step) * step));
     return { width: w, height: h };
 }
 
@@ -293,9 +294,8 @@ function autoResolutionFromDimensions(srcWidth, srcHeight, megapixels) {
         scaledH *= shrink;
     }
 
-    // Auto only: H3 32-pixel canvas, snapped downward so the resolved canvas
-    // never exceeds the requested megapixel budget. Manual mode keeps the
-    // proven historical 16-pixel behavior and remains fully user-controlled.
+    // H3 32-pixel canvas. Auto snaps downward so the resolved canvas never
+    // exceeds the requested megapixel budget; Manual uses the same 32px grid.
     const step = 32;
     return {
         width: Math.max(step, Math.min(MAX_RESOLUTION, Math.floor(scaledW / step) * step)),
