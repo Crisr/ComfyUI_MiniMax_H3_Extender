@@ -243,3 +243,15 @@ Then run:
     git clone https://github.com/tritant/ComfyUI_MiniMax_H3_Extender.git
 
 Restart ComfyUI after installation.
+
+### ℹ️ About the old Disk Join nodes
+
+The old low-level **Motion Context Disk Join** workflow is now considered **deprecated** and is no longer actively maintained.
+
+New workflows should use the main **MiniMax H3 Extender** node, which now handles cache management, references, trimming, validation, preview, seam correction, project Save/Load, color correction and final assembly internally.
+
+---
+
+Thanks again to everyone testing the node and reporting edge cases.
+
+The Extender is becoming much more comfortable to use for long H3 sequences.
