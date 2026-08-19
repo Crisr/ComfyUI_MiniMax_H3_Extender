@@ -4,6 +4,7 @@ import { api } from "../../scripts/api.js";
 const TARGET = "MiniMaxH3Extender";
 const FINAL_TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const PROGRESS_EVENT = "h3_extender_progress";
+const PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import";
 const CARD_WIDTH = 318;
 const UI_MIN_HEIGHT = 600;
 const NODES2_MIN_HEIGHT = 650;
@@ -199,6 +200,7 @@ function parseState(raw) {
             return {
                 version: 1,
                 load_token: String(p?.project_load_token || ""),
+                prompt_pack_signature: String(p?.prompt_pack_signature || ""),
                 clips: clips.map((c, i) => ({
                     id: String(c?.id || `clip_${i + 1}`),
                     name: String(c?.name || ""),
@@ -214,12 +216,15 @@ function parseState(raw) {
             };
         }
     } catch (_) {}
-    return { version: 1, load_token: "", clips: [newClip(0)] };
+    return { version: 1, load_token: "", prompt_pack_signature: "", clips: [newClip(0)] };
 }
 
 function serializeState(state) {
     const payload = { version: 1, clips: state.clips };
     if (state?.load_token) payload.project_load_token = String(state.load_token);
+    if (state?.prompt_pack_signature) {
+        payload.prompt_pack_signature = String(state.prompt_pack_signature);
+    }
     return JSON.stringify(payload);
 }
 
@@ -2643,6 +2648,24 @@ app.registerExtension({
         // the expected node UI callback from arriving.
         api.addEventListener("execution_success", () => {
             clearTransientRenderingState();
+        });
+
+        api.addEventListener(PROMPT_PACK_EVENT, ({ detail }) => {
+            const node = findExtenderNodeByExecutionId(detail?.node);
+            if (!node) return;
+
+            const runtime = buildUi(node);
+            if (!runtime || !detail?.clips_json) return;
+
+            runtime.jsonWidget.value = String(detail.clips_json);
+            runtime.state = parseState(detail.clips_json);
+            const count = Number(detail?.prompt_count || runtime.state.clips.length || 0);
+            const source = String(detail?.source || "External prompt pack");
+            runtime.statusText = `${source}: imported ${count} prompt${count === 1 ? "" : "s"} → ${count} clip${count === 1 ? "" : "s"}`;
+            updateHidden(node, runtime);
+            render(node, runtime);
+            syncDomHeight(node, runtime, false);
+            node.graph?.setDirtyCanvas(true, true);
         });
 
         api.addEventListener(PROGRESS_EVENT, ({ detail }) => {
