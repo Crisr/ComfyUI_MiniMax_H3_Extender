@@ -32,6 +32,9 @@ Recent H3 Extender updates bring a much more self-contained workflow and better 
 
 ---
 
+<img width="2048" height="1103" alt="image" src="https://github.com/user-attachments/assets/f67ba34a-5b8a-4d3b-9c18-d6314db2c873" />
+
+
 <img width="2091" height="948" alt="image" src="https://github.com/user-attachments/assets/905dcd01-09f8-4dfe-9d20-2f949637f938" />
 
 
