@@ -59,7 +59,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.54-save-preview"
+BUILD = "motion-context-disk-v14.58-color-check-clarity"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -909,19 +909,26 @@ def _next_output_path(output_dir, prefix, extension):
     raise RuntimeError("Disk Final Decode: could not allocate output filename.")
 
 
-def _replace_output_from_preview(preview_path, output_dir, filename_prefix):
+def _replace_output_from_preview(
+    preview_path, output_dir, filename_prefix, ffmpeg=None, color_timeline=None
+):
     """Atomically update the clip-by-clip autosave from the current full preview.
 
-    The progressive preview is already a complete H.264/AAC MP4 containing the
-    validated prefix plus the current candidate. Reusing it avoids any second
-    VAE decode or sampling pass just to persist the current sequence.
+    The rolling browser preview stays neutral/non-destructive. User color
+    adjustments are baked only into the persistent autosave copy.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{_safe_name(filename_prefix)}.mp4"
-    tmp = output_dir / f".{destination.name}.{uuid.uuid4().hex[:10]}.tmp"
+    tmp = output_dir / f".{destination.stem}.{uuid.uuid4().hex[:10]}.tmp.mp4"
     try:
-        shutil.copy2(Path(preview_path), tmp)
+        if ffmpeg is not None and _timeline_has_color(color_timeline):
+            _apply_color_timeline_to_file(
+                ffmpeg, preview_path, tmp, color_timeline,
+                codec="H.264", crf=17, preset="fast",
+            )
+        else:
+            shutil.copy2(Path(preview_path), tmp)
         os.replace(tmp, destination)
     finally:
         try:
@@ -1318,6 +1325,171 @@ def _reserve_preview_temp_path(unique_id):
     ) from last_error
 
 
+def _latest_preview_temp_path(unique_id):
+    candidates = [
+        _preview_temp_path(unique_id, i) for i in range(int(PREVIEW_ROTATION_SLOTS))
+    ]
+    existing = [p for p in candidates if p.exists()]
+    if not existing:
+        legacy = _preview_temp_legacy_path(unique_id)
+        if legacy.exists():
+            return legacy
+        return None
+    return max(existing, key=lambda p: p.stat().st_mtime)
+
+
+def _normalize_color_adjustment(value=None):
+    raw = value if isinstance(value, dict) else {}
+
+    def _v(name, default, low, high):
+        try:
+            x = float(raw.get(name, default))
+        except Exception:
+            x = float(default)
+        return max(float(low), min(float(high), x))
+
+    return {
+        "saturation": _v("saturation", 100.0, 0.0, 200.0),
+        "contrast": _v("contrast", 100.0, 50.0, 150.0),
+        "brightness": _v("brightness", 100.0, 50.0, 150.0),
+    }
+
+
+def _color_is_neutral(value):
+    c = _normalize_color_adjustment(value)
+    return all(abs(float(c[k]) - 100.0) < 1e-6 for k in ("saturation", "contrast", "brightness"))
+
+
+def _color_timeline(segments, fps):
+    fps = float(fps or FPS)
+    cursor = 0
+    out = []
+    for i, desc in enumerate(segments or []):
+        contribution = int(desc.get("frames", 0))
+        if i > 0:
+            contribution -= int(desc.get("trim_frames", 0))
+        contribution = max(0, contribution)
+        start = float(cursor / fps)
+        cursor += contribution
+        end = float(cursor / fps)
+        adjustment = _normalize_color_adjustment(desc.get("color_adjustment"))
+        out.append({
+            "index": int(i),
+            "start": start,
+            "end": end,
+            "adjustment": adjustment,
+            "modified": not _color_is_neutral(adjustment),
+        })
+    return out
+
+
+def _timeline_has_color(timeline):
+    return any(bool(item.get("modified")) for item in (timeline or []))
+
+
+def _ffmpeg_color_filter(timeline):
+    """Build filters that closely mirror browser CSS saturate/contrast/brightness.
+
+    Keeping the live editor and the baked FFmpeg result on the same transform
+    model makes the adjustment effectively WYSIWYG while preserving a neutral
+    decoded source in cache.
+    """
+    filters = []
+    for item in timeline or []:
+        if not bool(item.get("modified")):
+            continue
+        c = _normalize_color_adjustment(item.get("adjustment"))
+        sat = float(c["saturation"]) / 100.0
+        contrast = float(c["contrast"]) / 100.0
+        brightness = float(c["brightness"]) / 100.0
+        start = float(item.get("start", 0.0))
+        end = float(item.get("end", start))
+        enable = f"gte(t\\,{start:.6f})*lt(t\\,{end:.6f})"
+
+        # CSS saturate() matrix (Filter Effects spec luminance coefficients).
+        rr = 0.213 + 0.787 * sat
+        rg = 0.715 - 0.715 * sat
+        rb = 0.072 - 0.072 * sat
+        gr = 0.213 - 0.213 * sat
+        gg = 0.715 + 0.285 * sat
+        gb = 0.072 - 0.072 * sat
+        br = 0.213 - 0.213 * sat
+        bg = 0.715 - 0.715 * sat
+        bb = 0.072 + 0.928 * sat
+        filters.append(
+            "colorchannelmixer="
+            f"rr={rr:.8f}:rg={rg:.8f}:rb={rb:.8f}:"
+            f"gr={gr:.8f}:gg={gg:.8f}:gb={gb:.8f}:"
+            f"br={br:.8f}:bg={bg:.8f}:bb={bb:.8f}:"
+            f"enable='{enable}'"
+        )
+
+        # CSS contrast() followed by brightness(), combined as one affine RGB LUT.
+        gain = contrast * brightness
+        offset = 255.0 * (0.5 * (1.0 - contrast) * brightness)
+        expr = f"clip(val*{gain:.8f}{offset:+.8f},0,255)"
+        filters.append(
+            "lutrgb="
+            f"r='{expr}':g='{expr}':b='{expr}':enable='{enable}'"
+        )
+    return ",".join(filters)
+
+
+def _video_reencode_args(codec, crf, preset):
+    if str(codec) == "H.265 / HEVC":
+        return ["-c:v", "libx265", "-preset", str(preset), "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
+    if str(codec) == "FFV1 lossless":
+        return ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
+    return ["-c:v", "libx264", "-preset", str(preset), "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
+
+
+def _apply_color_timeline_to_file(
+    ffmpeg,
+    source_path,
+    destination_path,
+    timeline,
+    codec="H.264",
+    crf=17,
+    preset="fast",
+):
+    source = Path(source_path)
+    destination = Path(destination_path)
+    vf = _ffmpeg_color_filter(timeline)
+    if not vf:
+        shutil.copy2(source, destination)
+        return destination
+
+    log_path = _ensure_cache_root() / f"_color_{uuid.uuid4().hex[:10]}.log"
+    cmd = [
+        ffmpeg, "-y",
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-vf", vf,
+        *_video_reencode_args(codec, crf, preset),
+        "-c:a", "copy",
+    ]
+    if str(destination).lower().endswith(".mp4"):
+        cmd += ["-movflags", "+faststart"]
+    cmd.append(str(destination))
+    try:
+        with open(log_path, "wb") as log_f:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
+        if proc.returncode != 0:
+            tail = ""
+            try:
+                tail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(f"H3 color correction failed with ffmpeg code {proc.returncode}.\n{tail}")
+        return destination
+    finally:
+        try:
+            log_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _publish_full_preview(output_path, unique_id):
     """
     Put the final file under ComfyUI temp so the in-node browser player always
@@ -1359,11 +1531,12 @@ def _ffmetadata_escape(value):
     return text
 
 
-def _save_preview_with_metadata(source_path, workflow=None, prompt=None):
+def _save_preview_with_metadata(source_path, workflow=None, prompt=None, color_timeline=None):
     """Save the assembled preview to output with ComfyUI-compatible MP4 metadata.
 
-    Audio/video streams are copied, not re-encoded. The only container rewrite is
-    needed to add the same `workflow` / `prompt` tags used by ComfyUI SaveVideo.
+    The rolling preview itself stays non-destructive/neutral. If per-clip color
+    adjustments exist, bake them only into the saved copy, then attach the same
+    `workflow` / `prompt` tags used by ComfyUI SaveVideo.
     """
     source = Path(source_path).resolve()
     if not source.exists() or not source.is_file():
@@ -1375,6 +1548,7 @@ def _save_preview_with_metadata(source_path, workflow=None, prompt=None):
     token = f"save_preview_{uuid.uuid4().hex[:10]}"
     metadata_path = root / f"_{token}.ffmeta"
     log_path = root / f"_{token}.log"
+    corrected_path = root / f"_{token}_color.mp4"
 
     metadata = {}
     if workflow is not None:
@@ -1383,6 +1557,14 @@ def _save_preview_with_metadata(source_path, workflow=None, prompt=None):
         metadata["prompt"] = prompt
 
     try:
+        source_for_metadata = source
+        if _timeline_has_color(color_timeline):
+            _apply_color_timeline_to_file(
+                ffmpeg, source, corrected_path, color_timeline,
+                codec="H.264", crf=17, preset="fast",
+            )
+            source_for_metadata = corrected_path
+
         lines = [";FFMETADATA1"]
         for key, value in metadata.items():
             encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1392,7 +1574,7 @@ def _save_preview_with_metadata(source_path, workflow=None, prompt=None):
         cmd = [
             ffmpeg,
             "-y",
-            "-i", str(source),
+            "-i", str(source_for_metadata),
             "-f", "ffmetadata",
             "-i", str(metadata_path),
             "-map", "0",
@@ -1418,7 +1600,7 @@ def _save_preview_with_metadata(source_path, workflow=None, prompt=None):
             )
         return output
     finally:
-        for path in (metadata_path, log_path):
+        for path in (metadata_path, log_path, corrected_path):
             try:
                 path.unlink(missing_ok=True)
             except Exception:
@@ -2457,11 +2639,80 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
 
 
 if web is not None and PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.get("/h3_extender/color_editor_info")
+    async def h3_extender_color_editor_info(request):
+        owner_id = request.query.get("owner_id", "")
+        final_id = request.query.get("final_id", "")
+        clip_index = request.query.get("clip_index", "")
+        if not owner_id or not final_id or clip_index == "":
+            return web.json_response({"ok": False, "error": "Missing owner/final/clip id."}, status=400)
+        try:
+            idx = int(clip_index)
+            data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if manifest is None:
+                return web.json_response({"ok": False, "error": "No cached H3 sequence found."}, status=404)
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            if idx < 0 or idx >= len(segments):
+                return web.json_response({"ok": False, "error": "This clip has not been rendered yet."}, status=400)
+            preview_path = _latest_preview_temp_path(final_id)
+            if preview_path is None or not preview_path.exists():
+                return web.json_response({
+                    "ok": False,
+                    "error": "No decoded preview is available yet. Run Final Decode/Preview once first.",
+                }, status=404)
+            timeline = _color_timeline(segments, float(manifest.get("fps", FPS)))
+            return web.json_response({
+                "ok": True,
+                "video": _comfy_media_item(preview_path, float(manifest.get("fps", FPS)), "temp"),
+                "timeline": timeline,
+                "clip_index": idx,
+                "total_clips": len(segments),
+            })
+        except Exception as exc:
+            _LOG.exception("H3 color editor info failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @PromptServer.instance.routes.post("/h3_extender/color_adjust")
+    async def h3_extender_color_adjust(request):
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "")
+            idx = int(body.get("clip_index"))
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+            data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if manifest is None:
+                return web.json_response({"ok": False, "error": "No cached H3 sequence found."}, status=404)
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            if idx < 0 or idx >= len(segments):
+                return web.json_response({"ok": False, "error": "This clip has not been rendered yet."}, status=400)
+            adjustment = _normalize_color_adjustment(body.get("adjustment"))
+            desc = dict(segments[idx])
+            desc["color_adjustment"] = adjustment
+            segments[idx] = desc
+            manifest = dict(manifest)
+            manifest["segments"] = segments
+            manifest["updated_at"] = time.time()
+            _write_json_atomic(manifest_path, manifest)
+            timeline = _color_timeline(segments, float(manifest.get("fps", FPS)))
+            return web.json_response({
+                "ok": True,
+                "adjustment": adjustment,
+                "modified": not _color_is_neutral(adjustment),
+                "timeline": timeline,
+            })
+        except Exception as exc:
+            _LOG.exception("H3 color adjustment failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @PromptServer.instance.routes.post("/h3_extender/save_preview")
     async def h3_extender_save_preview(request):
         """Save only the currently assembled Final Decode preview to output."""
         try:
             body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
             filename = str(body.get("filename") or "").strip()
             media_type = str(body.get("type") or "temp").strip()
             subfolder = str(body.get("subfolder") or "").strip()
@@ -2491,11 +2742,23 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
 
             workflow = body.get("workflow")
             prompt = body.get("prompt")
+            color_timeline = None
+            if owner_id:
+                try:
+                    data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+                    manifest = _load_manifest_from_paths(data_path, manifest_path)
+                    if manifest is not None:
+                        color_timeline = _color_timeline(
+                            manifest.get("segments", []), float(manifest.get("fps", FPS))
+                        )
+                except Exception:
+                    color_timeline = None
             output = await asyncio.to_thread(
                 _save_preview_with_metadata,
                 source,
                 workflow,
                 prompt,
+                color_timeline,
             )
             return web.json_response({
                 "ok": True,
@@ -2565,12 +2828,21 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 restored["fps"],
                 "temp",
             )
+            data_path, manifest_path = _chain_paths(
+                f"extender_{_safe_name(owner_id)}"
+            )
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            color_timeline = _color_timeline(
+                manifest.get("segments", []) if manifest else [],
+                float(manifest.get("fps", FPS)) if manifest else FPS,
+            )
             return web.json_response({
                 "found": True,
                 "video": item,
                 "clip_count": restored["clip_count"],
                 "frame_count": restored["frame_count"],
                 "cache_mode": restored["cache_mode"],
+                "color_timeline": color_timeline,
             })
         except Exception as exc:
             _LOG.warning("H3 restore preview on load failed: %s", exc)
@@ -2628,6 +2900,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
+        color_timeline = _color_timeline(segments, float(fps))
 
         ffmpeg = _find_ffmpeg()
 
@@ -2671,7 +2944,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             # directory.  Re-rendering the same candidate replaces it atomically,
             # so clip-by-clip testing never creates a pile of numbered files.
             autosave_path = _replace_output_from_preview(
-                preview_path, out_dir, filename_prefix
+                preview_path, out_dir, filename_prefix,
+                ffmpeg=ffmpeg, color_timeline=color_timeline,
             )
             progress.advance()
 
@@ -2698,6 +2972,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         "preview_frames": int(preview_frames),
                         "total_clips": int(len(segments)),
                         "autosave_path": str(autosave_path),
+                        "color_timeline": color_timeline,
+                        "color_preview_baked": False,
                     }],
                 },
                 "result": (),
@@ -2708,7 +2984,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         expected_frames = int(manifest["final_frame_count"])
         decode_units = max(1, len(segments) - 1)
         progress = _FinalDecodeNativeProgress(
-            unique_id, total=4 + (2 * decode_units)
+            unique_id, total=4 + (2 * decode_units) + (1 if _timeline_has_color(color_timeline) else 0)
         )
         seam_shifts = {}
         written_frames = 0
@@ -2723,6 +2999,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         raw_audio = temp_root / f"_export_{token}_audio.f32le"
         video_log = temp_root / f"_export_{token}_video.log"
         mux_log = temp_root / f"_export_{token}_mux.log"
+        color_temp = temp_root / f"_export_{token}_color.{extension}"
 
         try:
             # VIDEO - strict constant-memory path: one clip for N=1, otherwise
@@ -2875,6 +3152,18 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             )
             progress.advance()
 
+            # Publish the neutral seam-corrected decode to the browser first.
+            # The UI applies per-clip grading live, while the persistent output
+            # below receives the same settings baked in non-destructively.
+            preview_path = _publish_full_preview(output_path, unique_id)
+            if _timeline_has_color(color_timeline):
+                _apply_color_timeline_to_file(
+                    ffmpeg, output_path, color_temp, color_timeline,
+                    codec=codec, crf=crf, preset=preset,
+                )
+                os.replace(color_temp, output_path)
+                progress.advance()
+
             shifts_text = ",".join(
                 f"{i}:{int(seam_shifts.get(i, 0))}" for i in range(1, len(segments))
             )
@@ -2885,7 +3174,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 len(segments), expected_frames, duration, output_path,
             )
 
-            preview_path = _publish_full_preview(output_path, unique_id)
             item = _comfy_media_item(preview_path, fps, "temp")
             progress.finish()
 
@@ -2897,6 +3185,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         "clip": int(len(segments)),
                         "preview_frames": int(expected_frames),
                         "total_clips": int(len(segments)),
+                        "color_timeline": color_timeline,
+                        "color_preview_baked": False,
                     }],
                 },
                 "result": (),
@@ -2918,7 +3208,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     video_log_f.close()
                 except Exception:
                     pass
-            for p in (temp_video, raw_audio, video_log, mux_log):
+            for p in (temp_video, raw_audio, video_log, mux_log, color_temp):
                 try:
                     if Path(p).exists():
                         Path(p).unlink()

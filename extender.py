@@ -59,7 +59,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.54-save-preview"
+BUILD = "minimax-h3-extender-v14.58-color-check-clarity"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -788,6 +788,23 @@ def _sample_h3(model, conditioning, latent, seed: int, sampler_name: str, schedu
     return out
 
 
+def _normalize_color_adjustment(value=None):
+    raw = value if isinstance(value, dict) else {}
+
+    def _v(name, default=100.0, low=0.0, high=200.0):
+        try:
+            x = float(raw.get(name, default))
+        except Exception:
+            x = float(default)
+        return max(float(low), min(float(high), x))
+
+    return {
+        "saturation": _v("saturation", 100.0, 0.0, 200.0),
+        "contrast": _v("contrast", 100.0, 50.0, 150.0),
+        "brightness": _v("brightness", 100.0, 50.0, 150.0),
+    }
+
+
 def _default_clip(index: int = 0):
     return {
         "id": f"clip_{index + 1}",
@@ -797,6 +814,7 @@ def _default_clip(index: int = 0):
         "seed_mode": "randomize",
         "duration": DEFAULT_DURATION,
         "validated": False,
+        "color_adjustment": _normalize_color_adjustment(),
     }
 
 
@@ -848,6 +866,7 @@ def _parse_clips_json(value: str):
                 "seed_mode": seed_mode,
                 "duration": duration,
                 "validated": bool(raw.get("validated", False)),
+                "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
             }
         )
 
@@ -1779,6 +1798,25 @@ class MiniMaxH3Extender:
             raise RuntimeError("MiniMax H3 Extender: sequence produced no cache handle.")
 
         final_manifest = _load_manifest_from_paths(data_path, manifest_path)
+        # Color grading is montage metadata only. Keep it attached to each cached
+        # decoded segment without invalidating latents or validation state.
+        if final_manifest is not None:
+            color_segments = [dict(x) for x in final_manifest.get("segments", [])]
+            color_changed = False
+            for color_i, desc in enumerate(color_segments):
+                if color_i >= len(clips):
+                    break
+                wanted = _normalize_color_adjustment(clips[color_i].get("color_adjustment"))
+                if desc.get("color_adjustment") != wanted:
+                    desc["color_adjustment"] = wanted
+                    color_segments[color_i] = desc
+                    color_changed = True
+            if color_changed:
+                final_manifest = dict(final_manifest)
+                final_manifest["segments"] = color_segments
+                final_manifest["updated_at"] = time.time()
+                _write_json_atomic(manifest_path, final_manifest)
+
         final_cache_resolution = _resolution_from_manifest(final_manifest)
         cached_count = len(final_manifest.get("segments", []))
         validated_count = 0
