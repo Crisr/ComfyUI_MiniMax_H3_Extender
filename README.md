@@ -9,7 +9,7 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 Recent H3 Extender updates bring a much more self-contained workflow and better long-sequence handling:
 
-Added support for an external prompt pack through the new MiniMax H3 Prompt Pack Bridge node.
+**Added support for an external prompt pack through the new MiniMax H3 Prompt Pack Bridge node.**
 
 ### 🎬 Save Preview
 
