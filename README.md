@@ -11,6 +11,25 @@ Recent H3 Extender updates bring a much more self-contained workflow and better 
 
 **Added support for an external prompt pack through the new MiniMax H3 Prompt Pack Bridge node.**
 
+## Reference Pack Bridge
+
+A new node **MiniMax H3 Reference Pack Bridge** has been added.
+
+This allows external ComfyUI `IMAGE` outputs to be injected directly into the Extender’s existing internal reference slots, while keeping the current internal reference system fully intact.
+
+You can now mix both approaches in the same workflow:
+
+- internal references loaded with the Extender
+- external references coming from `Load Image`, crop/resize nodes, video frames, Kontext-style preprocessing, or any other `IMAGE` source
+- each external input maps directly to its matching `<Picture N>` slot
+- empty external slots leave the existing internal reference untouched
+- reference indices are never compacted or remapped
+- once imported, the external image becomes a normal internal reference with thumbnail, project persistence and Save/Load compatibility
+- disconnecting the external input does not remove the imported internal reference
+- unchanged external images are not rewritten on every run
+
+The Bridge is optional and does not replace the current reference workflow. It simply adds a flexible external entry point for advanced ComfyUI pipelines.
+
 ### 🎬 Save Preview
 
 The **Final Decode / Preview** node now includes a dedicated **Save Preview** button.
