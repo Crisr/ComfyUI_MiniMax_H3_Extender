@@ -5,6 +5,7 @@ const TARGET = "MiniMaxH3Extender";
 const FINAL_TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const PROGRESS_EVENT = "h3_extender_progress";
 const PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import";
+const REF_PACK_EVENT = "h3_extender_ref_pack_import";
 const CARD_WIDTH = 318;
 const UI_MIN_HEIGHT = 600;
 const NODES2_MIN_HEIGHT = 650;
@@ -78,7 +79,7 @@ function normalizeRefDescriptor(value) {
         const n = Number(value[name] ?? 100);
         return Number.isFinite(n) ? Math.min(200, Math.max(0, n)) : 100;
     };
-    return {
+    const descriptor = {
         id,
         source_id,
         original_name: String(value.original_name || value.name || "reference.png"),
@@ -89,6 +90,11 @@ function normalizeRefDescriptor(value) {
         contrast: adjustment("contrast"),
         brightness: adjustment("brightness"),
     };
+    const externalSignature = String(value.external_signature || "").toLowerCase();
+    if (/^[0-9a-f]{64}$/.test(externalSignature)) {
+        descriptor.external_signature = externalSignature;
+    }
+    return descriptor;
 }
 
 function normalizeRefsArray(values) {
@@ -981,6 +987,7 @@ function openReferenceEditor(node, runtime, slotIndex, ref) {
                     saturation: numericValue(saturation),
                     contrast: numericValue(contrast),
                     brightness: numericValue(brightness),
+                    external_signature: ref.external_signature || "",
                 }),
             });
             const payload = await response.json().catch(() => ({}));
@@ -2665,6 +2672,26 @@ app.registerExtension({
             updateHidden(node, runtime);
             render(node, runtime);
             syncDomHeight(node, runtime, false);
+            node.graph?.setDirtyCanvas(true, true);
+        });
+
+        api.addEventListener(REF_PACK_EVENT, ({ detail }) => {
+            const node = findExtenderNodeByExecutionId(detail?.node);
+            if (!node) return;
+
+            const runtime = buildUi(node);
+            if (!runtime || !detail?.refs_json) return;
+
+            runtime.refsWidget.value = String(detail.refs_json);
+            runtime.refsState = parseRefsState(detail.refs_json);
+            const slots = Array.isArray(detail?.imported_slots)
+                ? detail.imported_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
+                : [];
+            const source = String(detail?.source || "External reference pack");
+            runtime.statusText = slots.length
+                ? `${source}: imported Ref ${slots.join(", ")} into internal slots`
+                : `${source}: synchronized`;
+            render(node, runtime);
             node.graph?.setDirtyCanvas(true, true);
         });
 
