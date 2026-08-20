@@ -42,7 +42,8 @@ from PIL import Image, ImageEnhance, ImageOps
 from server import PromptServer
 
 from .motion_context_ram import MiniMaxH3MotionContextRAM
-from .prompt_bridge import PROMPT_PACK_TYPE, _prompt_pack_signature
+from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
+from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
 from .motion_context_disk import (
     CACHE_VERSION,
     CACHE_TYPE,
@@ -60,7 +61,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.61-compact-prompt-bridge"
+BUILD = "minimax-h3-extender-v14.62-reference-pack-bridge"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -77,7 +78,7 @@ PROJECT_SUPPORTED_VERSIONS = {1, 2}
 PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
 PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
 PROJECT_COPY_CHUNK = 8 * 1024 * 1024
-MAX_IMAGE_REFS = 9
+MAX_IMAGE_REFS = MAX_REFERENCE_SLOTS
 REFS_JSON_VERSION = 2
 MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
 MAX_REF_PIXELS = 120_000_000
@@ -218,7 +219,7 @@ def _normalize_ref_descriptor(value):
             number = 100.0
         return max(0.0, min(200.0, number))
 
-    return {
+    descriptor = {
         "id": ref_id,
         "source_id": source_id,
         "original_name": str(value.get("original_name") or value.get("name") or "reference.png"),
@@ -229,6 +230,10 @@ def _normalize_ref_descriptor(value):
         "contrast": _adjustment("contrast"),
         "brightness": _adjustment("brightness"),
     }
+    external_signature = str(value.get("external_signature") or "").lower().strip()
+    if _ref_id_is_safe(external_signature):
+        descriptor["external_signature"] = external_signature
+    return descriptor
 
 
 def _normalize_ref_descriptors(refs):
@@ -341,7 +346,161 @@ def _store_uploaded_reference(source_path, original_name):
             pass
 
 
-def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation):
+
+def _canonical_external_reference(image, slot_index):
+    """Return the first IMAGE batch item as canonical uint8 RGB pixels + hash."""
+    if not torch.is_tensor(image):
+        raise ValueError(
+            f"MiniMax H3 Extender: external Ref {int(slot_index)} is not a valid IMAGE tensor."
+        )
+
+    tensor = image.detach()
+    if tensor.ndim == 3:
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 4 or int(tensor.shape[0]) < 1:
+        raise ValueError(
+            f"MiniMax H3 Extender: external Ref {int(slot_index)} has an invalid IMAGE shape."
+        )
+
+    frame = tensor[0].to(device="cpu", dtype=torch.float32)
+    if int(frame.shape[-1]) == 1:
+        frame = frame.repeat(1, 1, 3)
+    elif int(frame.shape[-1]) >= 3:
+        frame = frame[..., :3]
+    else:
+        raise ValueError(
+            f"MiniMax H3 Extender: external Ref {int(slot_index)} must contain RGB image data."
+        )
+
+    height = int(frame.shape[0])
+    width = int(frame.shape[1])
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"MiniMax H3 Extender: external Ref {int(slot_index)} has invalid dimensions."
+        )
+    if width * height > MAX_REF_PIXELS:
+        raise ValueError(
+            f"MiniMax H3 Extender: external Ref {int(slot_index)} is too large ({width}x{height})."
+        )
+
+    frame = torch.nan_to_num(frame, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    pixels = torch.round(frame * 255.0).to(torch.uint8).numpy()
+    pixels = np.ascontiguousarray(pixels)
+
+    digest = hashlib.sha256()
+    digest.update(f"h3-external-ref-v1:{width}x{height}:rgb8:".encode("ascii"))
+    digest.update(memoryview(pixels))
+    return pixels, digest.hexdigest(), width, height
+
+
+def _store_external_reference(image, slot_index, existing_ref=None):
+    """Import one external IMAGE into the normal content-addressed ref store.
+
+    ``external_signature`` hashes canonical RGB pixels before PNG encoding.  If
+    the same connected image is seen on a later Queue, the current internal
+    descriptor is kept untouched.  This also preserves any brightness/contrast/
+    saturation edit made in the Extender while the upstream image is unchanged.
+    """
+    pixels, external_signature, width, height = _canonical_external_reference(
+        image, slot_index
+    )
+    existing = _normalize_ref_descriptor(existing_ref)
+    if existing is not None and existing.get("external_signature") == external_signature:
+        current_path = _ref_path(existing.get("id"))
+        source_path = _ref_path(existing.get("source_id") or existing.get("id"))
+        if current_path.exists() and source_path.exists():
+            return existing, False
+
+    temp_png = _refs_root() / f".external_{uuid.uuid4().hex}.png"
+    try:
+        Image.fromarray(pixels, mode="RGB").save(
+            temp_png,
+            format="PNG",
+            optimize=False,
+            compress_level=4,
+        )
+        ref_id = _hash_file(temp_png)
+        target = _ref_path(ref_id)
+        if target.exists():
+            temp_png.unlink(missing_ok=True)
+        else:
+            os.replace(temp_png, target)
+
+        descriptor = {
+            "id": ref_id,
+            "source_id": ref_id,
+            "original_name": f"External Ref {int(slot_index)}.png",
+            "width": int(width),
+            "height": int(height),
+            "size_bytes": int(target.stat().st_size),
+            "saturation": 100.0,
+            "contrast": 100.0,
+            "brightness": 100.0,
+            "external_signature": external_signature,
+        }
+        return descriptor, True
+    finally:
+        try:
+            temp_png.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _normalize_external_ref_pack(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("MiniMax H3 Extender: external reference pack is invalid.")
+
+    raw_slots = value.get("slots")
+    if not isinstance(raw_slots, (list, tuple)):
+        raise ValueError("MiniMax H3 Extender: external reference pack has no slot list.")
+
+    slots = list(raw_slots)[:MAX_IMAGE_REFS]
+    slots += [None] * (MAX_IMAGE_REFS - len(slots))
+    return {
+        "type": REF_PACK_TYPE,
+        "version": int(value.get("version", 1) or 1),
+        "source": str(value.get("source") or "External reference pack"),
+        "count": sum(1 for image in slots if image is not None),
+        "slots": slots,
+    }
+
+
+def _sync_refs_from_ref_pack(refs, pack):
+    """Inject connected external slots into the existing internal Ref N slots.
+
+    Empty external slots are deliberately no-ops: they never clear or compact an
+    internal reference.  Connected slots keep their exact logical number.
+    """
+    refs = _normalize_ref_descriptors(refs)
+    if pack is None:
+        return refs, []
+
+    imported_slots = []
+    for index, image in enumerate(pack.get("slots") or [], start=1):
+        if index > MAX_IMAGE_REFS:
+            break
+        if image is None:
+            continue
+        try:
+            descriptor, changed = _store_external_reference(
+                image,
+                index,
+                refs[index - 1],
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"MiniMax H3 Extender: failed to import external Ref {index}: {exc}"
+            ) from exc
+        refs[index - 1] = descriptor
+        if changed:
+            imported_slots.append(index)
+
+    return refs, imported_slots
+
+
+def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation, external_signature=""):
     """Render absolute photographic adjustments from the immutable source ref.
 
     Every edited descriptor keeps ``source_id`` pointing at the pixels that were
@@ -399,7 +558,7 @@ def _edit_internal_reference(source_id, original_name, brightness, contrast, sat
         else:
             os.replace(temp_png, target)
 
-        return {
+        descriptor = {
             "id": new_id,
             "source_id": source_id,
             "original_name": str(original_name or "reference.png"),
@@ -410,6 +569,10 @@ def _edit_internal_reference(source_id, original_name, brightness, contrast, sat
             "contrast": float(contrast_value),
             "brightness": float(brightness_value),
         }
+        external_signature = str(external_signature or "").lower().strip()
+        if _ref_id_is_safe(external_signature):
+            descriptor["external_signature"] = external_signature
+        return descriptor
     finally:
         try:
             temp_png.unlink(missing_ok=True)
@@ -922,17 +1085,10 @@ def _normalize_external_prompt_pack(value):
         raise ValueError("MiniMax H3 Extender: external prompt pack has no prompt list.")
 
     prompts = []
-    found_empty = False
-    for index, raw in enumerate(list(prompts_raw)[:10], start=1):
+    for raw in list(prompts_raw)[:MAX_PROMPTS]:
         text = "" if raw is None else str(raw)
         if not text.strip():
-            found_empty = True
             continue
-        if found_empty:
-            raise ValueError(
-                "MiniMax H3 Extender: external prompt pack contains a gap before "
-                f"prompt {index}."
-            )
         prompts.append(text)
 
     if not prompts:
@@ -986,6 +1142,7 @@ def _manifest_for_extender(owner_id, fps=24.0):
 
 EXTENDER_PROGRESS_EVENT = "h3_extender_progress"
 EXTENDER_PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import"
+EXTENDER_REF_PACK_EVENT = "h3_extender_ref_pack_import"
 
 
 def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=""):
@@ -1005,6 +1162,27 @@ def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=
         )
     except Exception:
         # Prompt import UI feedback must never be able to break generation.
+        pass
+
+
+def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source=""):
+    try:
+        server = PromptServer.instance
+        if server is None:
+            return
+        server.send_sync(
+            EXTENDER_REF_PACK_EVENT,
+            {
+                "node": str(node_id),
+                "refs_json": str(refs_json),
+                "imported_slots": [int(i) for i in imported_slots or []],
+                "ref_count": int(ref_count),
+                "source": str(source or "External reference pack"),
+            },
+            getattr(server, "client_id", None),
+        )
+    except Exception:
+        # Reference import UI feedback must never be able to break generation.
         pass
 
 
@@ -1459,6 +1637,10 @@ def _import_project_archive(owner_id, archive_path):
                                 desc[key] = max(0.0, min(200.0, float(saved.get(key, 100) or 100)))
                             except Exception:
                                 desc[key] = 100.0
+                    if isinstance(saved, dict):
+                        external_signature = str(saved.get("external_signature") or "").lower().strip()
+                        if _ref_id_is_safe(external_signature):
+                            desc["external_signature"] = external_signature
                     imported_refs[index - 1] = desc
                 imported_refs = _normalize_ref_descriptors(imported_refs)
             _write_refs_to_project_payload(project_payload, imported_refs)
@@ -1633,9 +1815,9 @@ class MiniMaxH3Extender:
             ),
         }
 
-        # Standalone audio remains an external socket for now. Image refs are
-        # deliberately no longer graph inputs: they are loaded/previewed/stored
-        # by the Extender itself and embedded in portable .ext projects.
+        # Standalone audio remains an external socket. Image refs continue to be
+        # owned by the Extender's internal manager; ref_pack is only an optional
+        # import path that writes external IMAGEs into those same stable slots.
         optional = {
             "audio_vae": ("VAE", {"forceInput": True}),
             "ref_audio": ("AUDIO", {"forceInput": True}),
@@ -1643,6 +1825,12 @@ class MiniMaxH3Extender:
                 PROMPT_PACK_TYPE,
                 {
                     "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
+                },
+            ),
+            "ref_pack": (
+                REF_PACK_TYPE,
+                {
+                    "tooltip": "Optional external image-reference pack. Connected Ref N slots are imported into the matching internal Ref N slots on Queue; empty slots leave internal references untouched."
                 },
             ),
         }
@@ -1686,6 +1874,7 @@ class MiniMaxH3Extender:
         megapixels=DEFAULT_MEGAPIXELS,
         refs_json=None,
         prompt_pack=None,
+        ref_pack=None,
         unique_id=None,
         **kwargs,
     ):
@@ -1722,6 +1911,16 @@ class MiniMaxH3Extender:
                     break
 
         refs = _parse_refs_json(refs_json)
+        external_ref_pack = _normalize_external_ref_pack(ref_pack)
+        refs, ref_pack_imported_slots = _sync_refs_from_ref_pack(refs, external_ref_pack)
+        if ref_pack_imported_slots and external_ref_pack is not None:
+            _send_extender_ref_pack_import(
+                owner,
+                _refs_json(refs),
+                ref_pack_imported_slots,
+                int(external_ref_pack.get("count", 0) or 0),
+                external_ref_pack.get("source") or "External reference pack",
+            )
         refs_signature = _refs_signature(refs)
         requested_resolution = _resolve_generation_resolution(
             resolution_mode,
@@ -1996,9 +2195,17 @@ class MiniMaxH3Extender:
                 f" | prompt pack {len(external_prompt_pack.get('prompts') or [])}"
                 + (" imported" if prompt_pack_imported else " linked")
             )
+        ref_pack_text = ""
+        if external_ref_pack is not None:
+            connected_ref_count = int(external_ref_pack.get("count", 0) or 0)
+            if ref_pack_imported_slots:
+                imported_text = ",".join(str(i) for i in ref_pack_imported_slots)
+                ref_pack_text = f" | ref pack {connected_ref_count} linked, imported Ref {imported_text}"
+            else:
+                ref_pack_text = f" | ref pack {connected_ref_count} linked"
         status = (
             f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | cached {cached_count}/{len(clips)} | "
-            f"validated {validated_count}{prompt_pack_text} | "
+            f"validated {validated_count}{prompt_pack_text}{ref_pack_text} | "
             + (
                 "generated " + ",".join(str(i + 1) for i in generated)
                 if generated
@@ -2048,6 +2255,9 @@ class MiniMaxH3Extender:
             "prompt_pack_imported": bool(prompt_pack_imported),
             "prompt_pack_count": int(len(external_prompt_pack.get("prompts") or [])) if external_prompt_pack is not None else 0,
             "prompt_pack_signature": str(active_prompt_pack_signature or ""),
+            "ref_pack_connected": external_ref_pack is not None,
+            "ref_pack_count": int(external_ref_pack.get("count", 0) or 0) if external_ref_pack is not None else 0,
+            "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
             "build": BUILD,
         }
 
@@ -2145,6 +2355,7 @@ if getattr(PromptServer, "instance", None) is not None:
                 body.get("brightness", 100),
                 body.get("contrast", 100),
                 body.get("saturation", 100),
+                body.get("external_signature", ""),
             )
             return web.json_response({"ok": True, "ref": ref})
         except Exception as exc:
