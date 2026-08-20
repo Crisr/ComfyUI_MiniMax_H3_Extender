@@ -90,6 +90,9 @@ Loading a project restores the clip settings and color correction state, allowin
 
 ---
 
+<img width="2376" height="1163" alt="Capture d&#39;écran 2026-08-20 062155" src="https://github.com/user-attachments/assets/072885ca-8faa-4d58-b525-4b12d57fe75c" />
+
+
 <img width="1860" height="691" alt="image" src="https://github.com/user-attachments/assets/9f2354a4-d8b7-485d-904f-76481e8fba15" />
 
 
