@@ -208,32 +208,66 @@ function graphLinkById(graph, linkId) {
     return null;
 }
 
-function keepPackInputsLast(node) {
-    // Dynamic addInput() always appends sockets. Keep ref_pack and prompt_pack at
-    // the bottom even after AV autogrow, while preserving existing cables.
+function normalizeDynamicReferenceInputOrder(node) {
+    // addInput() always appends sockets, so an autogrown ref_audio_3 could end up
+    // below the already-visible video sockets. Rebuild only the visual socket
+    // order after each sync while preserving the exact input objects and cables.
+    // Desired order:
+    //   static model inputs
+    //   ref_audio_1..3
+    //   ref_video_1 / fps_1 / video_audio_1
+    //   ref_video_2 / fps_2 / video_audio_2
+    //   ref_video_3 / fps_3 / video_audio_3
+    //   ref_pack / prompt_pack
     if (!node?.inputs?.length) return false;
+
     const packOrder = ["ref_pack", "prompt_pack"];
-    const packs = new Map();
-    const regular = [];
+    const dynamicNames = new Set(packOrder);
+    for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
+        dynamicNames.add(`ref_audio_${i}`);
+    }
+    for (let i = 1; i <= MAX_VIDEO_REFS; i++) {
+        dynamicNames.add(`ref_video_${i}`);
+        dynamicNames.add(`ref_video_fps_${i}`);
+        dynamicNames.add(`ref_video_audio_${i}`);
+    }
+
+    const byName = new Map();
+    const staticInputs = [];
     for (const input of node.inputs) {
         const name = String(input?.name || "");
-        if (packOrder.includes(name)) packs.set(name, input);
-        else regular.push(input);
+        if (dynamicNames.has(name)) byName.set(name, input);
+        else staticInputs.push(input);
     }
-    if (!packs.size) return false;
 
-    const desired = [
-        ...regular,
-        ...packOrder.map((name) => packs.get(name)).filter(Boolean),
-    ];
+    const desired = [...staticInputs];
+    for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
+        const input = byName.get(`ref_audio_${i}`);
+        if (input) desired.push(input);
+    }
+    for (let i = 1; i <= MAX_VIDEO_REFS; i++) {
+        for (const name of [
+            `ref_video_${i}`,
+            `ref_video_fps_${i}`,
+            `ref_video_audio_${i}`,
+        ]) {
+            const input = byName.get(name);
+            if (input) desired.push(input);
+        }
+    }
+    for (const name of packOrder) {
+        const input = byName.get(name);
+        if (input) desired.push(input);
+    }
+
     const alreadyOrdered = desired.length === node.inputs.length
         && desired.every((input, slot) => node.inputs[slot] === input);
     if (alreadyOrdered) return false;
 
     node.inputs.splice(0, node.inputs.length, ...desired);
 
-    // LiteGraph stores the target socket as a numeric slot in each graph link.
-    // Re-point those indices after moving the existing input objects.
+    // LiteGraph stores target sockets as numeric indices. Re-point every linked
+    // input after the visual reorder so existing workflows keep all cables.
     for (let slot = 0; slot < node.inputs.length; slot++) {
         const input = node.inputs[slot];
         if (!inputConnected(input)) continue;
@@ -401,7 +435,7 @@ function syncDynamicAVReferenceInputs(node) {
             }
         }
 
-        changed = keepPackInputsLast(node) || changed;
+        changed = normalizeDynamicReferenceInputOrder(node) || changed;
         if (changed) node.graph?.setDirtyCanvas(true, true);
     } finally {
         node.__h3AVRefSyncing = false;
