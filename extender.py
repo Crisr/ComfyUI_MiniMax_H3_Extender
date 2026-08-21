@@ -61,7 +61,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.68-ref-video-fps-socket"
+BUILD = "minimax-h3-extender-v14.70-audio-ref-fallback"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -982,6 +982,60 @@ def _prepare_standalone_audio_refs(
     return ref_items, ref_blocks
 
 
+_AUDIO_TAG_RE = re.compile(r"<Audio\s+(\d+)>", re.IGNORECASE)
+
+
+def _select_standalone_audio_refs_for_prompt(prompt: str, ref_audios):
+    """Select standalone Audio refs for one clip without accidental stacking.
+
+    Rules:
+    - With exactly one connected standalone audio ref, that ref is always used.
+      This preserves the long-audio timeline behavior across every clip even if
+      a prompt contains a stale/different <Audio N> tag.
+    - With several connected refs, matching <Audio N> tags explicitly select
+      the requested refs for that clip.
+    - With several connected refs and no matching <Audio N> tag, only the first
+      connected logical slot is used as the deterministic default. This avoids
+      silently stacking every connected audio reference on the same clip.
+    """
+    audios = list(ref_audios or [])[:MAX_STANDALONE_AUDIO_REFS]
+    if len(audios) < MAX_STANDALONE_AUDIO_REFS:
+        audios.extend([None] * (MAX_STANDALONE_AUDIO_REFS - len(audios)))
+
+    referenced = {
+        int(match.group(1))
+        for match in _AUDIO_TAG_RE.finditer(str(prompt or ""))
+        if 1 <= int(match.group(1)) <= MAX_STANDALONE_AUDIO_REFS
+    }
+    connected = sorted(
+        slot
+        for slot, audio in enumerate(audios, start=1)
+        if audio is not None
+    )
+
+    if not connected:
+        selected_slots = []
+    elif len(connected) == 1:
+        # A single connected ref is the sequence/global ref. In particular, a
+        # long source keeps advancing through the clip timeline independently of
+        # Audio tags left in individual prompts.
+        selected_slots = list(connected)
+    else:
+        selected_slots = sorted(referenced & set(connected))
+        if not selected_slots:
+            # Several refs with no usable explicit tag: choose the first logical
+            # connected slot instead of combining all refs and causing an
+            # unexpected layered/superimposed audio conditioning.
+            selected_slots = [connected[0]]
+
+    selected_set = set(selected_slots)
+    selected = [
+        audio if slot in selected_set else None
+        for slot, audio in enumerate(audios, start=1)
+    ]
+    return selected, selected_slots
+
+
 def _prepare_shared_refs(
     vae,
     audio_vae,
@@ -1158,8 +1212,21 @@ _PICTURE_TAG_RE = re.compile(r"<Picture\s+(\d+)>", re.IGNORECASE)
 _VIDEO_TAG_RE = re.compile(r"<Video\s+(\d+)>", re.IGNORECASE)
 
 
-def _remap_numbered_tags(prompt: str, active_picture_slots, active_video_slots):
-    """Map stable Extender logical slots to H3 contiguous native ordinals."""
+def _remap_numbered_tags(
+    prompt: str,
+    active_picture_slots,
+    active_video_slots,
+    active_audio_slots=None,
+    audio_native_offset: int = 0,
+):
+    """Map stable Extender logical slots to H3 contiguous native ordinals.
+
+    Picture/Video slots are stable Extender indices. Standalone Audio slots use
+    the same rule per clip: if only ref_audio_2 is selected by <Audio 2>, it is
+    packed as the first standalone native audio item and the prompt is remapped
+    accordingly. Paired video soundtracks already present in ref_items occupy
+    the first native Audio ordinals, hence audio_native_offset.
+    """
     picture_map = {
         int(slot): ordinal
         for ordinal, slot in enumerate(active_picture_slots or [], start=1)
@@ -1167,6 +1234,10 @@ def _remap_numbered_tags(prompt: str, active_picture_slots, active_video_slots):
     video_map = {
         int(slot): ordinal
         for ordinal, slot in enumerate(active_video_slots or [], start=1)
+    }
+    audio_map = {
+        int(slot): int(audio_native_offset) + ordinal
+        for ordinal, slot in enumerate(active_audio_slots or [], start=1)
     }
 
     def replace_picture(match):
@@ -1183,8 +1254,16 @@ def _remap_numbered_tags(prompt: str, active_picture_slots, active_video_slots):
         ordinal = video_map.get(slot)
         return f"<Video {ordinal}>" if ordinal is not None else match.group(0)
 
+    def replace_audio(match):
+        slot = int(match.group(1))
+        if slot < 1 or slot > MAX_STANDALONE_AUDIO_REFS:
+            return match.group(0)
+        ordinal = audio_map.get(slot)
+        return f"<Audio {ordinal}>" if ordinal is not None else match.group(0)
+
     text = _PICTURE_TAG_RE.sub(replace_picture, str(prompt))
-    return _VIDEO_TAG_RE.sub(replace_video, text)
+    text = _VIDEO_TAG_RE.sub(replace_video, text)
+    return _AUDIO_TAG_RE.sub(replace_audio, text)
 
 
 def _make_ref2va_conditioning(
@@ -1198,10 +1277,16 @@ def _make_ref2va_conditioning(
     ref_blocks,
     active_picture_slots,
     active_video_slots,
+    active_audio_slots=None,
+    audio_native_offset: int = 0,
 ):
     latent = _empty_av_latent(width, height, frame_count)
     resolved_prompt = _remap_numbered_tags(
-        prompt, active_picture_slots, active_video_slots
+        prompt,
+        active_picture_slots,
+        active_video_slots,
+        active_audio_slots=active_audio_slots,
+        audio_native_offset=audio_native_offset,
     )
     tokens = clip.tokenize(resolved_prompt, minimax_ref_items=ref_items)
     cond = clip.encode_from_tokens_scheduled(tokens)
@@ -2498,6 +2583,26 @@ class MiniMaxH3Extender:
                 clips[j]["validated"] = False
 
             frame_count = _duration_to_frames(cfg["duration"])
+
+            # Standalone Audio selection is deterministic per clip. One connected
+            # ref remains the global/timeline ref regardless of prompt tags. With
+            # several refs, <Audio N> selects explicitly; without a usable tag,
+            # the first connected logical ref is used instead of stacking them.
+            selected_ref_audios, selected_audio_slots = _select_standalone_audio_refs_for_prompt(
+                cfg["prompt"], ref_audios
+            )
+            selected_ref_audio_count = len(selected_audio_slots)
+            clip_mixed_ref_count = (
+                _reference_count(refs)
+                + active_ref_video_count
+                + selected_ref_audio_count
+            )
+            if clip_mixed_ref_count > MAX_MIXED_REF_ITEMS:
+                raise ValueError(
+                    f"MiniMax H3 Extender: H3 Ref2VA supports at most {MAX_MIXED_REF_ITEMS} mixed reference items for this clip; "
+                    f"got {clip_mixed_ref_count}."
+                )
+
             # Reference-video conditioning is cropped/aligned against the target
             # clip duration. Reuse the prepared payload while duration is the
             # same, but rebuild it if a later card uses a different frame count.
@@ -2519,21 +2624,28 @@ class MiniMaxH3Extender:
                     ref_videos=ref_videos,
                     ref_video_fps=ref_video_fps,
                     ref_video_audios=ref_video_audios,
-                    standalone_audio_count=active_ref_audio_count,
+                    standalone_audio_count=0,
                     frame_count=frame_count,
                 )
                 prepared_ref_frame_count = frame_count
 
             clip_ref_items = list(ref_items or [])
             clip_ref_blocks = list(ref_blocks or [])
-            if active_ref_audio_count:
+            # Paired video soundtracks are already packed before standalone Audio
+            # refs and therefore consume the first native <Audio N> ordinals.
+            audio_native_offset = sum(
+                1
+                for item in (ref_items or [])
+                if isinstance(item, dict) and item.get("type") == "audio"
+            )
+            if selected_ref_audio_count:
                 if (_reference_count(refs) + active_ref_video_count) < 1:
                     raise ValueError(
                         "MiniMax H3 Extender: standalone reference audio requires at least one image or video reference."
                     )
                 audio_items, audio_blocks = _prepare_standalone_audio_refs(
                     audio_vae,
-                    ref_audios,
+                    selected_ref_audios,
                     ref_audio_clip_offsets[i],
                     frame_count / float(FPS),
                     cache=standalone_audio_cache,
@@ -2552,6 +2664,8 @@ class MiniMaxH3Extender:
                 clip_ref_blocks,
                 active_picture_slots,
                 active_video_slots,
+                active_audio_slots=selected_audio_slots,
+                audio_native_offset=audio_native_offset,
             )
 
             trim_frames = None
