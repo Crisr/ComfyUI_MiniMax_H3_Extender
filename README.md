@@ -170,8 +170,7 @@ Loading a project restores the clip settings and color correction state, allowin
 
 ---
 
-
-https://github.com/user-attachments/assets/d52f8a51-fa08-487c-a7ca-579c9a0e26d5
+https://github.com/user-attachments/assets/a18cc6a5-2340-474e-9d3b-b784cd41584a
 
 
 <img width="2307" height="1028" alt="image" src="https://github.com/user-attachments/assets/c1126ae8-2d4b-416c-a8c2-b839cd4c6b15" />
