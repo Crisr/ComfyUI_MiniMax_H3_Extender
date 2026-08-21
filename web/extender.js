@@ -151,6 +151,272 @@ function removeLegacyImageRefInputs(node) {
     return removed;
 }
 
+
+const MAX_VIDEO_REFS = 3;
+const MAX_STANDALONE_AUDIO_REFS = 3;
+const REF_VIDEO_RE = /^ref_video_([1-3])$/;
+const REF_VIDEO_AUDIO_RE = /^ref_video_audio_([1-3])$/;
+const REF_VIDEO_FPS_RE = /^ref_video_fps_([1-3])$/;
+const REF_AUDIO_RE = /^ref_audio_([1-3])$/;
+
+function inputConnected(input) {
+    return input?.link !== null && input?.link !== undefined;
+}
+
+function findInputEntry(node, name) {
+    const inputs = node?.inputs || [];
+    for (let slot = 0; slot < inputs.length; slot++) {
+        if (String(inputs[slot]?.name || "") === String(name)) {
+            return { input: inputs[slot], slot };
+        }
+    }
+    return null;
+}
+
+function addDynamicRefInput(node, name, type, tooltip = "") {
+    if (!node || findInputEntry(node, name)) return false;
+    try {
+        const input = node.addInput(name, type, tooltip ? { tooltip } : undefined);
+        // LiteGraph versions differ on whether addInput returns the slot object.
+        // If it does, keep the tooltip there too; otherwise the socket still works.
+        if (input && tooltip && !input.tooltip) input.tooltip = tooltip;
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function removeDynamicRefInput(node, name) {
+    const entry = findInputEntry(node, name);
+    if (!entry || inputConnected(entry.input)) return false;
+    try {
+        node.removeInput(entry.slot);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function graphLinkById(graph, linkId) {
+    if (!graph || linkId === null || linkId === undefined) return null;
+    try {
+        if (graph.links instanceof Map) return graph.links.get(linkId) || null;
+        if (graph.links && graph.links[linkId] !== undefined) return graph.links[linkId];
+        if (graph._links instanceof Map) return graph._links.get(linkId) || null;
+        if (graph._links && graph._links[linkId] !== undefined) return graph._links[linkId];
+    } catch (_) {}
+    return null;
+}
+
+function keepPackInputsLast(node) {
+    // Dynamic addInput() always appends sockets. Keep ref_pack and prompt_pack at
+    // the bottom even after AV autogrow, while preserving existing cables.
+    if (!node?.inputs?.length) return false;
+    const packOrder = ["ref_pack", "prompt_pack"];
+    const packs = new Map();
+    const regular = [];
+    for (const input of node.inputs) {
+        const name = String(input?.name || "");
+        if (packOrder.includes(name)) packs.set(name, input);
+        else regular.push(input);
+    }
+    if (!packs.size) return false;
+
+    const desired = [
+        ...regular,
+        ...packOrder.map((name) => packs.get(name)).filter(Boolean),
+    ];
+    const alreadyOrdered = desired.length === node.inputs.length
+        && desired.every((input, slot) => node.inputs[slot] === input);
+    if (alreadyOrdered) return false;
+
+    node.inputs.splice(0, node.inputs.length, ...desired);
+
+    // LiteGraph stores the target socket as a numeric slot in each graph link.
+    // Re-point those indices after moving the existing input objects.
+    for (let slot = 0; slot < node.inputs.length; slot++) {
+        const input = node.inputs[slot];
+        if (!inputConnected(input)) continue;
+        const link = graphLinkById(node.graph, input.link);
+        if (link && String(link.target_id) === String(node.id)) {
+            link.target_slot = slot;
+        }
+    }
+    return true;
+}
+
+function renameInputPreservingLink(input, name) {
+    if (!input || !name || String(input.name || "") === name) return false;
+    input.name = name;
+    if (typeof input.label === "string" && /^ref_audio(?:_[1-3])?$/.test(input.label)) {
+        input.label = name;
+    }
+    return true;
+}
+
+function migrateLegacyStandaloneAudio(node) {
+    // v14.64/14.65 kept the old single `ref_audio` socket as a backend alias.
+    // New nodes should not show it. When loading an older workflow with a cable
+    // on that socket, rename the socket in place to ref_audio_1 so the cable is
+    // preserved and the workflow joins the new dynamic group cleanly.
+    const legacy = findInputEntry(node, "ref_audio");
+    if (!legacy) return false;
+
+    const canonical = findInputEntry(node, "ref_audio_1");
+    if (!inputConnected(legacy.input)) {
+        try {
+            node.removeInput(legacy.slot);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    if (canonical && !inputConnected(canonical.input)) {
+        try {
+            node.removeInput(canonical.slot);
+        } catch (_) {
+            return false;
+        }
+    } else if (canonical && inputConnected(canonical.input)) {
+        // Extremely unusual transitional workflow with both sockets connected:
+        // keep both rather than destroying either cable. Backend compatibility
+        // remains authoritative for this one legacy edge case.
+        return false;
+    }
+
+    return renameInputPreservingLink(legacy.input, "ref_audio_1");
+}
+
+function highestConnectedIndex(node, regex, maxIndex) {
+    let highest = 0;
+    for (const input of node?.inputs || []) {
+        const match = String(input?.name || "").match(regex);
+        if (!match || !inputConnected(input)) continue;
+        const index = Number(match[1]);
+        if (Number.isInteger(index) && index >= 1 && index <= maxIndex) {
+            highest = Math.max(highest, index);
+        }
+    }
+    return highest;
+}
+
+function syncDynamicAVReferenceInputs(node) {
+    if (!node || node.__h3AVRefSyncing) return;
+    node.__h3AVRefSyncing = true;
+    let changed = false;
+    try {
+        changed = migrateLegacyStandaloneAudio(node) || changed;
+
+        // ---- Standalone audio refs -------------------------------------------------
+        // Classic autogrow: always show ref_audio_1, then one free socket after
+        // the highest connected audio, up to H3's three-audio limit. Connected
+        // higher slots are never removed, so loading sparse/older workflows does
+        // not destroy cables.
+        const highestAudio = highestConnectedIndex(node, REF_AUDIO_RE, MAX_STANDALONE_AUDIO_REFS);
+        const visibleAudioMax = Math.min(
+            MAX_STANDALONE_AUDIO_REFS,
+            Math.max(1, highestAudio + 1),
+        );
+        for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
+            const name = `ref_audio_${i}`;
+            if (i <= visibleAudioMax) {
+                changed = addDynamicRefInput(
+                    node,
+                    name,
+                    "AUDIO",
+                    `Optional MiniMax H3 standalone reference audio ${i}.`,
+                ) || changed;
+            } else {
+                changed = removeDynamicRefInput(node, name) || changed;
+            }
+        }
+
+        // ---- Paired video + soundtrack refs ---------------------------------------
+        // Stable logical Video slots: never compact or rename a connected Video N.
+        // Connecting Video N reveals its same-numbered optional soundtrack and the
+        // next video socket. A soundtrack with an existing cable is also preserved
+        // even if its video is temporarily disconnected, allowing the user to fix
+        // the pair instead of silently losing the cable.
+        const highestVideo = highestConnectedIndex(node, REF_VIDEO_RE, MAX_VIDEO_REFS);
+        const visibleVideoMax = Math.min(MAX_VIDEO_REFS, Math.max(1, highestVideo + 1));
+
+        for (let i = 1; i <= MAX_VIDEO_REFS; i++) {
+            const videoName = `ref_video_${i}`;
+            const fpsName = `ref_video_fps_${i}`;
+            const audioName = `ref_video_audio_${i}`;
+            const videoEntry = findInputEntry(node, videoName);
+            const fpsEntry = findInputEntry(node, fpsName);
+            const audioEntry = findInputEntry(node, audioName);
+            const videoIsConnected = inputConnected(videoEntry?.input);
+            const fpsIsConnected = inputConnected(fpsEntry?.input);
+            const audioIsConnected = inputConnected(audioEntry?.input);
+            const companionConnected = fpsIsConnected || audioIsConnected;
+
+            // Preserve the numbered video socket if one of its companion cables
+            // is still connected, so dynamic cleanup never strands an FPS/audio
+            // cable without a matching Video N socket.
+            if (i <= visibleVideoMax || videoIsConnected || companionConnected) {
+                changed = addDynamicRefInput(
+                    node,
+                    videoName,
+                    "IMAGE",
+                    `Optional MiniMax H3 reference video ${i} as an IMAGE frame batch. Connect the matching fps output from Get Video Components when the source is not already 24 fps. Use <Video ${i}> in prompts.`,
+                ) || changed;
+            } else {
+                changed = removeDynamicRefInput(node, videoName) || changed;
+            }
+
+            // Re-read after potential video insertion/removal.
+            const liveVideo = findInputEntry(node, videoName);
+            const liveFps = findInputEntry(node, fpsName);
+            const liveAudio = findInputEntry(node, audioName);
+            const liveVideoConnected = inputConnected(liveVideo?.input);
+            const liveFpsConnected = inputConnected(liveFps?.input);
+            const liveAudioConnected = inputConnected(liveAudio?.input);
+
+            // Once Video N is connected, expose both companion inputs directly:
+            // FLOAT fps from Get Video Components + optional matching soundtrack.
+            // Connected companion sockets are preserved during temporary rewiring.
+            if (liveVideoConnected || liveFpsConnected) {
+                changed = addDynamicRefInput(
+                    node,
+                    fpsName,
+                    "FLOAT",
+                    `Source FPS of ref_video_${i}. Connect Get Video Components → fps. Leave disconnected only when the IMAGE batch is already 24 fps.`,
+                ) || changed;
+            } else {
+                changed = removeDynamicRefInput(node, fpsName) || changed;
+            }
+
+            if (liveVideoConnected || liveAudioConnected) {
+                changed = addDynamicRefInput(
+                    node,
+                    audioName,
+                    "AUDIO",
+                    `Optional soundtrack of ref_video_${i}.`,
+                ) || changed;
+            } else {
+                changed = removeDynamicRefInput(node, audioName) || changed;
+            }
+        }
+
+        changed = keepPackInputsLast(node) || changed;
+        if (changed) node.graph?.setDirtyCanvas(true, true);
+    } finally {
+        node.__h3AVRefSyncing = false;
+    }
+}
+
+function deferDynamicAVReferenceSync(node) {
+    if (!node || node.__h3AVRefSyncQueued) return;
+    node.__h3AVRefSyncQueued = true;
+    requestAnimationFrame(() => {
+        node.__h3AVRefSyncQueued = false;
+        syncDynamicAVReferenceInputs(node);
+    });
+}
+
 function randomSeed() {
     try {
         const a = new Uint32Array(2);
@@ -2534,6 +2800,7 @@ function buildUi(node) {
 
         requestAnimationFrame(() => {
             const removedLegacyRefs = removeLegacyImageRefInputs(this);
+            syncDynamicAVReferenceInputs(this);
             runtime.state = parseState(runtime.jsonWidget.value);
             runtime.refsState = parseRefsState(runtime.refsWidget.value);
             updateRefsHidden(this, runtime);
@@ -2561,6 +2828,7 @@ function buildUi(node) {
     requestAnimationFrame(() => {
         requestAnimationFrame(() => {
             removeLegacyImageRefInputs(node);
+            syncDynamicAVReferenceInputs(node);
             runtime.ready = true;
             restoreCacheState(node, runtime);
             syncResolutionMirror(node, runtime);
@@ -2733,12 +3001,24 @@ app.registerExtension({
 
             const runtime = buildUi(this);
             removeLegacyImageRefInputs(this);
+            deferDynamicAVReferenceSync(this);
             if (runtime) {
                 requestAnimationFrame(() => {
                     requestAnimationFrame(() => syncDomHeight(this, runtime, true));
                 });
             }
             return r;
+        };
+
+        const oldConnectionsChange = nodeType.prototype.onConnectionsChange;
+        nodeType.prototype.onConnectionsChange = function () {
+            const result = oldConnectionsChange
+                ? oldConnectionsChange.apply(this, arguments)
+                : undefined;
+            // LiteGraph mutates link target slots during the callback; defer the
+            // socket grow/shrink pass until that mutation has completed.
+            deferDynamicAVReferenceSync(this);
+            return result;
         };
 
         const oldExecuted = nodeType.prototype.onExecuted;
