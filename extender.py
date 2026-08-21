@@ -61,11 +61,19 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.62-reference-pack-bridge"
+BUILD = "minimax-h3-extender-v14.68-ref-video-fps-socket"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
 REF_IMAGE_SHORT_EDGE = 2048
+REF_VIDEO_BASE_SHORT_EDGE = 768
+REF_VIDEO_MAX_PIXELS = 768 * 1344
+MAX_VIDEO_REFS = 3
+MAX_STANDALONE_AUDIO_REFS = 3
+MAX_REF_VIDEO_FRAMES = 362
+MAX_MIXED_REF_ITEMS = 12
+MIN_REF_AUDIO_SECONDS = 2.0
+MAX_REF_AUDIO_SECONDS = 15.0
 MAX_CLIPS = 512
 DEFAULT_DURATION = 10.0
 DEFAULT_MEGAPIXELS = 0.40
@@ -745,8 +753,124 @@ def _resize(image, width: int, height: int):
     return samples.movedim(1, -1)
 
 
+def _adapt_ref_video_canvas(width: int, height: int):
+    """Native H3 Ref2VA reference-video canvas (ComfyUI compatible).
+
+    Reference videos use a 768-pixel short edge with a 768x1344 pixel-area
+    ceiling, then snap each axis to the H3 32-pixel canvas grid.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+    ratio = width / float(height)
+    if ratio >= 1.0:
+        nominal_w, nominal_h = REF_VIDEO_BASE_SHORT_EDGE * ratio, REF_VIDEO_BASE_SHORT_EDGE
+    else:
+        nominal_w, nominal_h = REF_VIDEO_BASE_SHORT_EDGE, REF_VIDEO_BASE_SHORT_EDGE / ratio
+    if nominal_w * nominal_h > REF_VIDEO_MAX_PIXELS:
+        scale = math.sqrt(REF_VIDEO_MAX_PIXELS / float(nominal_w * nominal_h))
+        nominal_w *= scale
+        nominal_h *= scale
+    return (
+        max(CANVAS_MULTIPLE, round(nominal_w / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+        max(CANVAS_MULTIPLE, round(nominal_h / CANVAS_MULTIPLE) * CANVAS_MULTIPLE),
+    )
+
+
+def _normalize_ref_video_fps(value, label: str):
+    try:
+        fps = float(value)
+    except Exception:
+        fps = float(FPS)
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise ValueError(
+            f"MiniMax H3 Extender: {label} must be a positive source FPS value; got {value!r}."
+        )
+    return fps
+
+
+def _resample_ref_video_to_h3_fps(video_frames, source_fps: float, label: str):
+    """Resample a reference-video IMAGE batch to H3's fixed 24 fps.
+
+    IMAGE batches do not carry timestamps/FPS metadata. The Extender therefore
+    accepts an explicit source FPS and resamples the batch so H3 sees the same
+    source duration at its required 24-fps cadence.
+    """
+    fps = _normalize_ref_video_fps(source_fps, label)
+    if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
+        raise ValueError(f"MiniMax H3 Extender: {label} must be an IMAGE batch [frames,H,W,C].")
+    if abs(fps - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
+        return video_frames
+
+    source_count = int(video_frames.shape[0])
+    duration = source_count / fps
+    target_count = max(1, int(round(duration * float(FPS))))
+    idx = torch.round(
+        torch.arange(target_count, device=video_frames.device, dtype=torch.float32) * (fps / float(FPS))
+    ).to(torch.long)
+    idx = torch.clamp(idx, 0, source_count - 1)
+    return video_frames.index_select(0, idx)
+
+
+def _audio_duration_seconds(audio):
+    if not isinstance(audio, dict) or "waveform" not in audio:
+        raise ValueError("MiniMax H3 Extender: invalid AUDIO reference payload.")
+    waveform = audio["waveform"]
+    if not torch.is_tensor(waveform) or waveform.ndim < 2:
+        raise ValueError("MiniMax H3 Extender: invalid AUDIO waveform tensor.")
+    sr = int(audio.get("sample_rate", 0) or 0)
+    if sr <= 0:
+        raise ValueError("MiniMax H3 Extender: invalid AUDIO sample rate.")
+    return float(waveform.shape[-1]) / float(sr)
+
+
+def _slice_ref_audio(audio, start_seconds: float, duration_seconds: float, label: str, require_full: bool):
+    """Return an AUDIO payload cropped before Audio-VAE encoding.
+
+    Long standalone references use require_full=True so every clip gets exactly
+    its own sequential timeline window. Video soundtracks use require_full=False
+    because container audio can be a few samples shorter than the video stream.
+    """
+    if not isinstance(audio, dict) or "waveform" not in audio:
+        raise ValueError(f"MiniMax H3 Extender: {label} is not a valid AUDIO payload.")
+    waveform = audio["waveform"]
+    if not torch.is_tensor(waveform) or waveform.ndim < 2:
+        raise ValueError(f"MiniMax H3 Extender: {label} has an invalid waveform tensor.")
+    sr = int(audio.get("sample_rate", 0) or 0)
+    if sr <= 0:
+        raise ValueError(f"MiniMax H3 Extender: {label} has an invalid sample rate.")
+
+    start_seconds = max(0.0, float(start_seconds))
+    duration_seconds = max(0.0, float(duration_seconds))
+    total_samples = int(waveform.shape[-1])
+    start = int(round(start_seconds * sr))
+    wanted = max(1, int(round(duration_seconds * sr)))
+
+    if start >= total_samples:
+        total_seconds = total_samples / float(sr)
+        raise ValueError(
+            f"MiniMax H3 Extender: {label} is exhausted at {total_seconds:.3f}s; "
+            f"the current clip needs audio starting at {start_seconds:.3f}s."
+        )
+
+    available = total_samples - start
+    if require_full and available < wanted:
+        total_seconds = total_samples / float(sr)
+        required_end = start_seconds + duration_seconds
+        raise ValueError(
+            f"MiniMax H3 Extender: {label} is too short for the current clip. "
+            f"Source duration is {total_seconds:.3f}s but this clip needs the window "
+            f"{start_seconds:.3f}s -> {required_end:.3f}s."
+        )
+
+    end = min(total_samples, start + wanted)
+    return {
+        "waveform": waveform[..., start:end],
+        "sample_rate": sr,
+    }
+
+
 def _encode_ref_audio(audio_vae, audio):
-    """Encode one standalone Ref2VA audio reference exactly like ComfyUI native H3."""
+    """Encode one already-cropped H3 audio reference."""
     waveform = audio["waveform"]  # [B, C, L]
     sr = int(audio["sample_rate"])
     vae_sr = int(getattr(audio_vae, "audio_sample_rate", 32000))
@@ -756,6 +880,108 @@ def _encode_ref_audio(audio_vae, audio):
     return latent, int(latent.shape[-1])
 
 
+def _prepare_standalone_audio_refs(
+    audio_vae,
+    ref_audios,
+    clip_start_seconds: float,
+    clip_duration_seconds: float,
+    cache=None,
+):
+    """Build per-clip standalone audio refs without reusing illegal long audio.
+
+    Native-sized refs (<=15s) remain reusable references: they start at 0 for
+    every clip and are cropped to the current clip duration when useful. A long
+    source (>15s) is treated as a timeline and automatically advanced by the
+    cumulative H3-aligned duration of the preceding cards.
+    """
+    active = [
+        (slot, audio)
+        for slot, audio in enumerate(list(ref_audios or [])[:MAX_STANDALONE_AUDIO_REFS], start=1)
+        if audio is not None
+    ]
+    if not active:
+        return [], []
+    if audio_vae is None:
+        raise ValueError(
+            "MiniMax H3 Extender: standalone audio reference inputs are connected but audio_vae is not. "
+            "Connect the MiniMax H3 Audio VAE to audio_vae."
+        )
+
+    clip_duration_seconds = float(clip_duration_seconds)
+    clip_start_seconds = float(clip_start_seconds)
+    prepared = []
+    total_effective_audio = 0.0
+
+    for slot, audio in active:
+        label = f"ref_audio_{slot}"
+        source_duration = _audio_duration_seconds(audio)
+        timeline_mode = source_duration > MAX_REF_AUDIO_SECONDS + 1e-6
+
+        if timeline_mode:
+            if clip_duration_seconds > MAX_REF_AUDIO_SECONDS + 1e-6:
+                raise ValueError(
+                    f"MiniMax H3 Extender: {label} cannot cover this clip as one H3 audio reference: "
+                    f"effective clip duration is {clip_duration_seconds:.3f}s, above the {MAX_REF_AUDIO_SECONDS:.0f}s reference-audio limit."
+                )
+            start = clip_start_seconds
+            duration = clip_duration_seconds
+            sliced = _slice_ref_audio(audio, start, duration, label, require_full=True)
+        else:
+            # Preserve classic short-reference behavior across every clip, but
+            # never feed more audio than the current generated clip requires.
+            start = 0.0
+            duration = min(source_duration, clip_duration_seconds, MAX_REF_AUDIO_SECONDS)
+            sliced = _slice_ref_audio(audio, start, duration, label, require_full=False)
+
+        effective_duration = _audio_duration_seconds(sliced)
+        if effective_duration + 1e-6 < MIN_REF_AUDIO_SECONDS:
+            raise ValueError(
+                f"MiniMax H3 Extender: {label} provides only {effective_duration:.3f}s for this clip; "
+                f"MiniMax H3 reference audio requires at least {MIN_REF_AUDIO_SECONDS:.0f}s."
+            )
+        total_effective_audio += effective_duration
+        prepared.append((slot, sliced, start, duration, timeline_mode, id(audio["waveform"])))
+
+    if total_effective_audio > MAX_REF_AUDIO_SECONDS + 1e-6:
+        raise ValueError(
+            "MiniMax H3 Extender: the standalone audio references for this clip total "
+            f"{total_effective_audio:.3f}s, above MiniMax H3's {MAX_REF_AUDIO_SECONDS:.0f}s cumulative audio-reference limit."
+        )
+
+    ref_items = []
+    ref_blocks = []
+    cache = cache if isinstance(cache, dict) else {}
+    for slot, sliced, start, duration, timeline_mode, source_waveform_id in prepared:
+        waveform = sliced["waveform"]
+        sr = int(sliced["sample_rate"])
+        # Short reusable refs with equal clip durations can reuse their encoded
+        # latent; long timeline refs naturally use a different start each card.
+        key = (
+            int(slot),
+            int(source_waveform_id),
+            int(sr),
+            int(waveform.shape[-1]),
+            round(float(start), 6),
+            round(float(duration), 6),
+            bool(timeline_mode),
+        )
+        cached = cache.get(key)
+        if cached is None:
+            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, sliced)
+            cache[key] = (audio_latent, int(ref_audio_t))
+        else:
+            audio_latent, ref_audio_t = cached
+        ref_items.append({"type": "audio"})
+        ref_blocks.append(
+            {
+                "kind": "audio",
+                "ref_audio_t": int(ref_audio_t),
+                "audio_latent": audio_latent,
+            }
+        )
+    return ref_items, ref_blocks
+
+
 def _prepare_shared_refs(
     vae,
     audio_vae,
@@ -763,25 +989,59 @@ def _prepare_shared_refs(
     height: int,
     ref_image_size: str,
     refs,
-    ref_audio=None,
+    ref_videos=None,
+    ref_video_fps=None,
+    ref_video_audios=None,
+    standalone_audio_count=0,
+    frame_count=None,
 ):
-    """Encode shared Ref2VA image refs plus one optional standalone audio ref.
+    """Encode shared H3 Ref2VA image/video refs and paired soundtracks.
 
-    Ref slots are stable logical identities. Native H3 numbers only the active
-    images contiguously, so we also return the logical slot order and remap
-    <Picture N> tags just before tokenization. This lets Ref 3 stay Ref 3 even
-    when Ref 2 is empty, without feeding a fake placeholder image to the model.
+    Standalone audio is deliberately prepared per clip by
+    _prepare_standalone_audio_refs(), because long sources advance through the
+    sequence timeline. Image/video payloads remain cached across equal-duration
+    cards so this feature does not force expensive visual re-encoding.
     """
-    active = [
+    active_images = [
         (slot, image)
         for slot, image in enumerate(refs, start=1)
         if image is not None
     ]
+    ref_videos = list(ref_videos or [])[:MAX_VIDEO_REFS]
+    ref_video_fps = list(ref_video_fps or [])[:MAX_VIDEO_REFS]
+    ref_video_audios = list(ref_video_audios or [])[:MAX_VIDEO_REFS]
+
+    active_videos = []
+    for slot, video in enumerate(ref_videos, start=1):
+        fps_hint = ref_video_fps[slot - 1] if slot - 1 < len(ref_video_fps) else float(FPS)
+        soundtrack = ref_video_audios[slot - 1] if slot - 1 < len(ref_video_audios) else None
+        if video is None:
+            if soundtrack is not None:
+                raise ValueError(
+                    f"MiniMax H3 Extender: ref_video_audio_{slot} is connected but ref_video_{slot} is not. "
+                    "Pair each video soundtrack with the same-numbered reference video."
+                )
+            continue
+        active_videos.append((slot, video, fps_hint, soundtrack))
+
+    mixed_ref_count = len(active_images) + len(active_videos) + int(standalone_audio_count or 0)
+    if mixed_ref_count > MAX_MIXED_REF_ITEMS:
+        raise ValueError(
+            f"MiniMax H3 Extender: H3 Ref2VA supports at most {MAX_MIXED_REF_ITEMS} mixed reference items; got {mixed_ref_count}."
+        )
+    if any(soundtrack is not None for _, _, _, soundtrack in active_videos) and audio_vae is None:
+        raise ValueError(
+            "MiniMax H3 Extender: reference-video soundtrack inputs are connected but audio_vae is not. "
+            "Connect the MiniMax H3 Audio VAE to audio_vae."
+        )
 
     ref_items = []
     ref_blocks = []
     active_picture_slots = []
-    for slot, ref in active:
+    active_video_slots = []
+
+    # Official Ref2VA presentation order starts with images.
+    for slot, ref in active_images:
         img = _load_reference_tensor(ref) if isinstance(ref, dict) else ref
         h, w = int(img.shape[1]), int(img.shape[2])
         if ref_image_size == "match":
@@ -811,55 +1071,120 @@ def _prepare_shared_refs(
             }
         )
 
-    # Official Ref2VA presentation order is images first, then standalone audio.
-    # The tokenizer assigns the standalone input the prompt label <Audio 1>.
-    if ref_audio is not None:
-        if audio_vae is None:
+    # Then reference videos, exactly like ComfyUI's native H3 Ref2VA node.
+    target_frames = int(frame_count) if frame_count is not None else MAX_REF_VIDEO_FRAMES
+    target_frames = max(5, min(target_frames, MAX_REF_VIDEO_FRAMES))
+    total_ref_video_frames = 0
+    for slot, video_frames, source_fps, soundtrack in active_videos:
+        frames_24 = _resample_ref_video_to_h3_fps(video_frames, source_fps, f"ref_video_{slot}")
+        if int(frames_24.shape[0]) < int(2 * FPS):
             raise ValueError(
-                "MiniMax H3 Extender: ref_audio is connected but audio_vae is not. "
-                "Connect the MiniMax H3 Audio VAE to audio_vae."
+                f"MiniMax H3 Extender: ref_video_{slot} is shorter than MiniMax H3's 2-second minimum at 24 fps."
             )
-        if not active:
+
+        vh, vw = int(frames_24.shape[1]), int(frames_24.shape[2])
+        cw, ch = _adapt_ref_video_canvas(vw, vh)
+        if vw * vh < cw * ch:
+            cw = max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+            ch = max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+
+        frames = _resize(frames_24, cw, ch)
+        if int(frames.shape[0]) > target_frames:
+            frames = frames[:target_frames]
+
+        n = int(frames.shape[0])
+        while n >= 5 and n % 17 != 5:
+            n -= 1
+        if n < 5:
             raise ValueError(
-                "MiniMax H3 Extender: MiniMax H3 Ref2VA requires an audio "
-                "reference to be used together with at least one image reference."
+                f"MiniMax H3 Extender: ref_video_{slot} cannot be aligned to the H3 17k+5 frame grid."
             )
-        audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, ref_audio)
-        ref_items.append({"type": "audio"})
+        frames = frames[:n]
+        total_ref_video_frames += n
+        if total_ref_video_frames > MAX_REF_VIDEO_FRAMES:
+            raise ValueError(
+                "MiniMax H3 Extender: total effective reference-video duration exceeds MiniMax H3's 15-second limit."
+            )
+
+        z = vae.encode(frames)
+        audio_latent = None
+        ref_audio_t = 0
+        if soundtrack is not None:
+            # The official node encodes the entire soundtrack. The Extender is
+            # safer: crop it to the effective aligned reference-video duration
+            # before Audio-VAE encoding, which also fixes long Load-Video audio.
+            soundtrack = _slice_ref_audio(
+                soundtrack,
+                0.0,
+                n / float(FPS),
+                f"ref_video_audio_{slot}",
+                require_full=False,
+            )
+            if _audio_duration_seconds(soundtrack) + 1e-6 < MIN_REF_AUDIO_SECONDS:
+                raise ValueError(
+                    f"MiniMax H3 Extender: ref_video_audio_{slot} is shorter than {MIN_REF_AUDIO_SECONDS:.0f}s after pairing with ref_video_{slot}."
+                )
+            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
+            # The soundtrack gets its own <Audio j> label immediately before its video.
+            ref_items.append({"type": "audio"})
+
+        sample_step = max(1, FPS // 2)
+        sample_idx = list(range(0, int(frames.shape[0]), sample_step))
+        qwen_frames = frames[sample_idx]
+        ref_items.append(
+            {
+                "type": "video",
+                "data": qwen_frames,
+                "timestamps": [i / 2.0 for i in range(len(sample_idx))],
+            }
+        )
+        active_video_slots.append(int(slot))
         ref_blocks.append(
             {
-                "kind": "audio",
+                "kind": "video_audio" if ref_audio_t else "video",
+                "latent_t": int(z.shape[2]),
+                "latent_h": ch // 16,
+                "latent_w": cw // 16,
                 "ref_audio_t": int(ref_audio_t),
+                "latent": z,
                 "audio_latent": audio_latent,
             }
         )
 
-    return ref_items, ref_blocks, active_picture_slots
+    return ref_items, ref_blocks, active_picture_slots, active_video_slots
 
 
 _PICTURE_TAG_RE = re.compile(r"<Picture\s+(\d+)>", re.IGNORECASE)
+_VIDEO_TAG_RE = re.compile(r"<Video\s+(\d+)>", re.IGNORECASE)
 
 
-def _remap_picture_tags(prompt: str, active_picture_slots):
-    """Map stable UI Ref slots to H3's contiguous active Picture ordinals."""
-    slot_to_ordinal = {
+def _remap_numbered_tags(prompt: str, active_picture_slots, active_video_slots):
+    """Map stable Extender logical slots to H3 contiguous native ordinals."""
+    picture_map = {
         int(slot): ordinal
         for ordinal, slot in enumerate(active_picture_slots or [], start=1)
     }
+    video_map = {
+        int(slot): ordinal
+        for ordinal, slot in enumerate(active_video_slots or [], start=1)
+    }
 
-    def replace(match):
+    def replace_picture(match):
         slot = int(match.group(1))
         if slot < 1 or slot > MAX_IMAGE_REFS:
             return match.group(0)
-        ordinal = slot_to_ordinal.get(slot)
-        # Do not police the user's prompt. An empty logical slot may be an
-        # accidental reference or an intentional use of native H3 numbering.
-        # In that case leave the tag exactly as written and let H3 interpret it.
-        if ordinal is None:
-            return match.group(0)
-        return f"<Picture {ordinal}>"
+        ordinal = picture_map.get(slot)
+        return f"<Picture {ordinal}>" if ordinal is not None else match.group(0)
 
-    return _PICTURE_TAG_RE.sub(replace, str(prompt))
+    def replace_video(match):
+        slot = int(match.group(1))
+        if slot < 1 or slot > MAX_VIDEO_REFS:
+            return match.group(0)
+        ordinal = video_map.get(slot)
+        return f"<Video {ordinal}>" if ordinal is not None else match.group(0)
+
+    text = _PICTURE_TAG_RE.sub(replace_picture, str(prompt))
+    return _VIDEO_TAG_RE.sub(replace_video, text)
 
 
 def _make_ref2va_conditioning(
@@ -872,9 +1197,12 @@ def _make_ref2va_conditioning(
     ref_items,
     ref_blocks,
     active_picture_slots,
+    active_video_slots,
 ):
     latent = _empty_av_latent(width, height, frame_count)
-    resolved_prompt = _remap_picture_tags(prompt, active_picture_slots)
+    resolved_prompt = _remap_numbered_tags(
+        prompt, active_picture_slots, active_video_slots
+    )
     tokens = clip.tokenize(resolved_prompt, minimax_ref_items=ref_items)
     cond = clip.encode_from_tokens_scheduled(tokens)
     if ref_blocks:
@@ -882,6 +1210,7 @@ def _make_ref2va_conditioning(
             cond, {"minimax_refs": ref_blocks}
         )
     return cond, latent
+
 
 
 class _BasicGuider(comfy.samplers.CFGGuider):
@@ -1815,22 +2144,115 @@ class MiniMaxH3Extender:
             ),
         }
 
-        # Standalone audio remains an external socket. Image refs continue to be
-        # owned by the Extender's internal manager; ref_pack is only an optional
-        # import path that writes external IMAGEs into those same stable slots.
+        # Audio and video references remain external sockets. Image refs continue
+        # to be owned by the Extender's internal manager; ref_pack is only an
+        # optional import path that writes external IMAGEs into those same
+        # stable slots.
         optional = {
             "audio_vae": ("VAE", {"forceInput": True}),
-            "ref_audio": ("AUDIO", {"forceInput": True}),
-            "prompt_pack": (
-                PROMPT_PACK_TYPE,
+            "ref_audio": (
+                "AUDIO",
                 {
-                    "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
+                    "forceInput": True,
+                    "tooltip": "Legacy alias of ref_audio_1. Kept for older workflows; new workflows should prefer ref_audio_1..ref_audio_3.",
                 },
             ),
+            "ref_audio_1": (
+                "AUDIO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional MiniMax H3 standalone reference audio 1. Up to three standalone audio references are supported.",
+                },
+            ),
+            "ref_audio_2": (
+                "AUDIO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional MiniMax H3 standalone reference audio 2.",
+                },
+            ),
+            "ref_audio_3": (
+                "AUDIO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional MiniMax H3 standalone reference audio 3.",
+                },
+            ),
+            "ref_video_1": (
+                "IMAGE",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional MiniMax H3 reference video 1 as an IMAGE frame batch. H3 expects 24 fps; use ref_video_fps_1 when the source batch came from another frame rate. Use <Video 1> in prompts.",
+                },
+            ),
+            "ref_video_fps_1": (
+                "FLOAT",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional source FPS from Get Video Components for ref_video_1. When disconnected the Extender assumes the IMAGE batch is already 24 fps.",
+                },
+            ),
+            "ref_video_audio_1": (
+                "AUDIO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional soundtrack of ref_video_1.",
+                },
+            ),
+            "ref_video_2": (
+                "IMAGE",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional MiniMax H3 reference video 2 as an IMAGE frame batch. H3 expects 24 fps; use ref_video_fps_2 when the source batch came from another frame rate. Use <Video 2> in prompts.",
+                },
+            ),
+            "ref_video_fps_2": (
+                "FLOAT",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional source FPS from Get Video Components for ref_video_2. When disconnected the Extender assumes the IMAGE batch is already 24 fps.",
+                },
+            ),
+            "ref_video_audio_2": (
+                "AUDIO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional soundtrack of ref_video_2.",
+                },
+            ),
+            "ref_video_3": (
+                "IMAGE",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional MiniMax H3 reference video 3 as an IMAGE frame batch. H3 expects 24 fps; use ref_video_fps_3 when the source batch came from another frame rate. Use <Video 3> in prompts.",
+                },
+            ),
+            "ref_video_fps_3": (
+                "FLOAT",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional source FPS from Get Video Components for ref_video_3. When disconnected the Extender assumes the IMAGE batch is already 24 fps.",
+                },
+            ),
+            "ref_video_audio_3": (
+                "AUDIO",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional soundtrack of ref_video_3.",
+                },
+            ),
+            # Keep the two pack sockets visually last. The frontend also
+            # preserves this ordering when dynamic AV sockets grow/shrink.
             "ref_pack": (
                 REF_PACK_TYPE,
                 {
                     "tooltip": "Optional external image-reference pack. Connected Ref N slots are imported into the matching internal Ref N slots on Queue; empty slots leave internal references untouched."
+                },
+            ),
+            "prompt_pack": (
+                PROMPT_PACK_TYPE,
+                {
+                    "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
                 },
             ),
         }
@@ -2002,10 +2424,33 @@ class MiniMaxH3Extender:
         resolution_mismatch = False
 
         audio_vae = kwargs.get("audio_vae")
-        ref_audio = kwargs.get("ref_audio")
+        legacy_ref_audio = kwargs.get("ref_audio")
+        ref_audios = [kwargs.get(f"ref_audio_{index}") for index in range(1, MAX_STANDALONE_AUDIO_REFS + 1)]
+        if all(audio is None for audio in ref_audios) and legacy_ref_audio is not None:
+            ref_audios[0] = legacy_ref_audio
+        ref_videos = [kwargs.get(f"ref_video_{index}") for index in range(1, MAX_VIDEO_REFS + 1)]
+        ref_video_fps = [kwargs.get(f"ref_video_fps_{index}", float(FPS)) for index in range(1, MAX_VIDEO_REFS + 1)]
+        ref_video_audios = [kwargs.get(f"ref_video_audio_{index}") for index in range(1, MAX_VIDEO_REFS + 1)]
+        active_ref_video_count = sum(video is not None for video in ref_videos)
+        active_ref_video_audio_count = sum(audio is not None for audio in ref_video_audios)
+        active_ref_audio_count = sum(audio is not None for audio in ref_audios)
+        # Long standalone audio (>15s) is a sequence timeline. Offsets are
+        # computed from every card up front so cached/validated cards do not
+        # change which source window a later re-render receives. H3-aligned
+        # frame durations are used because those are the durations actually
+        # generated by each card.
+        ref_audio_clip_offsets = []
+        ref_audio_cursor = 0.0
+        for clip_cfg in clips:
+            ref_audio_clip_offsets.append(float(ref_audio_cursor))
+            ref_audio_cursor += _duration_to_frames(clip_cfg["duration"]) / float(FPS)
+        standalone_audio_cache = {}
+
         ref_items = None
         ref_blocks = None
         active_picture_slots = None
+        active_video_slots = None
+        prepared_ref_frame_count = None
 
         disk_join = MiniMaxH3MotionContextDiskJoin()
         motion = MiniMaxH3MotionContextRAM()
@@ -2052,18 +2497,50 @@ class MiniMaxH3Extender:
             for j in range(i + 1, len(clips)):
                 clips[j]["validated"] = False
 
-            if ref_items is None or ref_blocks is None or active_picture_slots is None:
-                ref_items, ref_blocks, active_picture_slots = _prepare_shared_refs(
+            frame_count = _duration_to_frames(cfg["duration"])
+            # Reference-video conditioning is cropped/aligned against the target
+            # clip duration. Reuse the prepared payload while duration is the
+            # same, but rebuild it if a later card uses a different frame count.
+            needs_ref_prepare = (
+                ref_items is None
+                or ref_blocks is None
+                or active_picture_slots is None
+                or active_video_slots is None
+                or (active_ref_video_count and prepared_ref_frame_count != frame_count)
+            )
+            if needs_ref_prepare:
+                ref_items, ref_blocks, active_picture_slots, active_video_slots = _prepare_shared_refs(
                     vae,
                     audio_vae,
                     resolved_width,
                     resolved_height,
                     str(ref_image_size),
                     refs,
-                    ref_audio=ref_audio,
+                    ref_videos=ref_videos,
+                    ref_video_fps=ref_video_fps,
+                    ref_video_audios=ref_video_audios,
+                    standalone_audio_count=active_ref_audio_count,
+                    frame_count=frame_count,
                 )
+                prepared_ref_frame_count = frame_count
 
-            frame_count = _duration_to_frames(cfg["duration"])
+            clip_ref_items = list(ref_items or [])
+            clip_ref_blocks = list(ref_blocks or [])
+            if active_ref_audio_count:
+                if (_reference_count(refs) + active_ref_video_count) < 1:
+                    raise ValueError(
+                        "MiniMax H3 Extender: standalone reference audio requires at least one image or video reference."
+                    )
+                audio_items, audio_blocks = _prepare_standalone_audio_refs(
+                    audio_vae,
+                    ref_audios,
+                    ref_audio_clip_offsets[i],
+                    frame_count / float(FPS),
+                    cache=standalone_audio_cache,
+                )
+                clip_ref_items.extend(audio_items)
+                clip_ref_blocks.extend(audio_blocks)
+
             positive, latent = _make_ref2va_conditioning(
                 clip,
                 vae,
@@ -2071,9 +2548,10 @@ class MiniMaxH3Extender:
                 resolved_width,
                 resolved_height,
                 frame_count,
-                ref_items,
-                ref_blocks,
+                clip_ref_items,
+                clip_ref_blocks,
                 active_picture_slots,
+                active_video_slots,
             )
 
             trim_frames = None
@@ -2204,7 +2682,8 @@ class MiniMaxH3Extender:
             else:
                 ref_pack_text = f" | ref pack {connected_ref_count} linked"
         status = (
-            f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | cached {cached_count}/{len(clips)} | "
+            f"{str(run_mode)} | {resolution_text} | refs {_reference_count(refs)} | video refs {active_ref_video_count}"
+            f" | video audios {active_ref_video_audio_count} | audio refs {active_ref_audio_count} | cached {cached_count}/{len(clips)} | "
             f"validated {validated_count}{prompt_pack_text}{ref_pack_text} | "
             + (
                 "generated " + ",".join(str(i + 1) for i in generated)
@@ -2248,6 +2727,9 @@ class MiniMaxH3Extender:
             "resolution_cache_reset": bool(resolution.get("cache_reset", False)),
             "reference_cache_reset": False,
             "reference_count": int(_reference_count(refs)),
+            "reference_video_count": int(active_ref_video_count),
+            "reference_video_audio_count": int(active_ref_video_audio_count),
+            "reference_audio_count": int(active_ref_audio_count),
             "refs_json": _refs_json(refs),
             "requested_width": int(resolution.get("requested_width", resolved_width)),
             "requested_height": int(resolution.get("requested_height", resolved_height)),
