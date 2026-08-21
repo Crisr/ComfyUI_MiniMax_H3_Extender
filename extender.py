@@ -49,6 +49,8 @@ from .motion_context_disk import (
     CACHE_TYPE,
     _DATA_START,
     _chain_paths,
+    _decoded_audio_cache_path,
+    _decoded_audio_cache_end,
     _decoded_preview_cache_path,
     _decoded_preview_video_cache_path,
     _ensure_cache_root,
@@ -61,7 +63,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.70-audio-ref-fallback"
+BUILD = "minimax-h3-extender-v14.75-unified-audio-seams"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -892,7 +894,8 @@ def _prepare_standalone_audio_refs(
     Native-sized refs (<=15s) remain reusable references: they start at 0 for
     every clip and are cropped to the current clip duration when useful. A long
     source (>15s) is treated as a timeline and automatically advanced by the
-    cumulative H3-aligned duration of the preceding cards.
+    cumulative H3-aligned duration of preceding cards that selected the same
+    logical Audio slot.
     """
     active = [
         (slot, audio)
@@ -908,7 +911,11 @@ def _prepare_standalone_audio_refs(
         )
 
     clip_duration_seconds = float(clip_duration_seconds)
-    clip_start_seconds = float(clip_start_seconds)
+    # clip_start_seconds may be a scalar (legacy/global timeline) or a mapping
+    # {logical_audio_slot: start_seconds}. The mapping form lets each long
+    # standalone Audio reference keep its own independent timeline cursor.
+    clip_start_offsets = clip_start_seconds if isinstance(clip_start_seconds, dict) else None
+    default_clip_start = 0.0 if clip_start_offsets is not None else float(clip_start_seconds)
     prepared = []
     total_effective_audio = 0.0
 
@@ -923,7 +930,7 @@ def _prepare_standalone_audio_refs(
                     f"MiniMax H3 Extender: {label} cannot cover this clip as one H3 audio reference: "
                     f"effective clip duration is {clip_duration_seconds:.3f}s, above the {MAX_REF_AUDIO_SECONDS:.0f}s reference-audio limit."
                 )
-            start = clip_start_seconds
+            start = float(clip_start_offsets.get(slot, 0.0)) if clip_start_offsets is not None else default_clip_start
             duration = clip_duration_seconds
             sliced = _slice_ref_audio(audio, start, duration, label, require_full=True)
         else:
@@ -1034,6 +1041,28 @@ def _select_standalone_audio_refs_for_prompt(prompt: str, ref_audios):
         for slot, audio in enumerate(audios, start=1)
     ]
     return selected, selected_slots
+
+
+def _build_standalone_audio_clip_plan(clips, ref_audios):
+    """Precompute per-clip Audio selection and independent source offsets.
+
+    Each logical standalone Audio slot owns its own timeline cursor. A slot only
+    advances on clips that actually select/use that slot. This keeps rerenders
+    deterministic because validated/cached cards are included in the plan even
+    when they are skipped by the sampler.
+    """
+    cursors = {slot: 0.0 for slot in range(1, MAX_STANDALONE_AUDIO_REFS + 1)}
+    plan = []
+    for clip_cfg in clips:
+        selected_ref_audios, selected_audio_slots = _select_standalone_audio_refs_for_prompt(
+            clip_cfg.get("prompt", ""), ref_audios
+        )
+        offsets = {slot: float(cursors[slot]) for slot in selected_audio_slots}
+        duration = _duration_to_frames(clip_cfg["duration"]) / float(FPS)
+        for slot in selected_audio_slots:
+            cursors[slot] += duration
+        plan.append((selected_ref_audios, selected_audio_slots, offsets))
+    return plan
 
 
 def _prepare_shared_refs(
@@ -1732,12 +1761,33 @@ def _project_cache_snapshot(owner_id, project_payload):
     if int(data_path.stat().st_size) < data_limit:
         raise IOError("MiniMax H3 Extender Project: cache changed while snapshotting; retry Save Project.")
 
+    audio_path = _decoded_audio_cache_path(data_path)
+    audio_limit = _decoded_audio_cache_end(segments)
+    has_audio_cache = any(
+        isinstance(desc.get("decoded_audio"), dict)
+        and desc["decoded_audio"].get("storage") == "audio_cache"
+        for desc in segments
+    )
+    if has_audio_cache:
+        if not audio_path.exists():
+            raise FileNotFoundError(
+                "MiniMax H3 Extender Project: decoded audio cache is missing."
+            )
+        if int(audio_path.stat().st_size) < int(audio_limit):
+            raise IOError(
+                "MiniMax H3 Extender Project: decoded audio cache changed while snapshotting; retry Save Project."
+            )
+    else:
+        audio_limit = 0
+
     return {
         "data_path": data_path,
         "manifest_path": manifest_path,
+        "audio_path": audio_path,
         "preview_path": _decoded_preview_cache_path(data_path),
         "manifest": manifest,
         "data_limit": data_limit,
+        "audio_limit": int(audio_limit),
     }
 
 
@@ -1829,6 +1879,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "clip_count": int(len(snapshot["manifest"].get("segments", []))) if snapshot else 0,
             "frame_count": int(snapshot["manifest"].get("final_frame_count", 0)) if snapshot else 0,
             "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
+            "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
         },
     }
 
@@ -1868,6 +1919,13 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 snapshot["data_path"],
                 snapshot["data_limit"],
             )
+            if int(snapshot.get("audio_limit", 0)) > 0:
+                _zip_write_prefix(
+                    zf,
+                    "cache/chain.audio.h3cache",
+                    snapshot["audio_path"],
+                    snapshot["audio_limit"],
+                )
             if snapshot["preview_path"].exists():
                 zf.write(
                     snapshot["preview_path"],
@@ -1899,14 +1957,15 @@ def _zip_copy_member(zf, member_name, destination):
         os.fsync(dst.fileno())
 
 
-def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None):
+def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None, new_audio=None):
     target_data, target_manifest = _chain_paths(f"extender_{_safe_name(owner_id)}")
     target_preview = _decoded_preview_cache_path(target_data)
     target_preview_video = _decoded_preview_video_cache_path(target_data)
-    # The video-only preview prefix is a derived v14.42 sidecar. It is not
-    # required in .ext archives, but it MUST be cleared on project replacement
-    # so a previous project's prefix can never be reused accidentally.
-    targets = [target_data, target_manifest, target_preview, target_preview_video]
+    target_audio = _decoded_audio_cache_path(target_data)
+    # The video-only preview prefix is derived and is intentionally not stored
+    # in .ext. The decoded-audio cache is primary cache data and is restored
+    # together with the latent chain when present.
+    targets = [target_data, target_manifest, target_preview, target_preview_video, target_audio]
     backups = []
     token = uuid.uuid4().hex[:10]
 
@@ -1922,6 +1981,8 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
             os.replace(str(new_manifest), target_manifest)
             if new_preview is not None and Path(new_preview).exists():
                 os.replace(str(new_preview), target_preview)
+            if new_audio is not None and Path(new_audio).exists():
+                os.replace(str(new_audio), target_audio)
         # No imported cache means an intentionally empty project. The old cache
         # remains only in backups until this transaction succeeds.
     except Exception:
@@ -1948,6 +2009,7 @@ def _import_project_archive(owner_id, archive_path):
     work_root.mkdir(parents=True, exist_ok=True)
     new_data = work_root / "chain.h3cache"
     new_manifest = work_root / "chain.json"
+    new_audio = work_root / "chain.audio.h3cache"
     new_preview = work_root / "chain.preview.mp4"
 
     try:
@@ -2068,12 +2130,31 @@ def _import_project_archive(owner_id, archive_path):
             if has_data:
                 _zip_copy_member(zf, "cache/chain.h3cache", new_data)
                 _zip_copy_member(zf, "cache/chain.json", new_manifest)
+                if "cache/chain.audio.h3cache" in names:
+                    _zip_copy_member(zf, "cache/chain.audio.h3cache", new_audio)
                 if "cache/chain.preview.mp4" in names:
                     _zip_copy_member(zf, "cache/chain.preview.mp4", new_preview)
 
                 imported_manifest = _load_manifest_from_paths(new_data, new_manifest)
                 if imported_manifest is None:
                     raise ValueError("MiniMax H3 Extender Project: cache manifest is empty.")
+
+                imported_segments = [dict(x) for x in imported_manifest.get("segments", [])]
+                needs_audio_cache = any(
+                    isinstance(desc.get("decoded_audio"), dict)
+                    and desc["decoded_audio"].get("storage") == "audio_cache"
+                    for desc in imported_segments
+                )
+                if needs_audio_cache:
+                    if not new_audio.exists():
+                        raise ValueError(
+                            "MiniMax H3 Extender Project: decoded audio cache is missing."
+                        )
+                    required_audio = _decoded_audio_cache_end(imported_segments)
+                    if int(new_audio.stat().st_size) < int(required_audio):
+                        raise ValueError(
+                            "MiniMax H3 Extender Project: decoded audio cache is truncated."
+                        )
 
                 # A hand-edited project may contain fewer cards than cached clips.
                 # Keep only the portable prefix represented by the saved UI state.
@@ -2129,6 +2210,7 @@ def _import_project_archive(owner_id, archive_path):
                 new_data if imported_manifest is not None else None,
                 new_manifest if imported_manifest is not None else None,
                 new_preview if imported_manifest is not None and new_preview.exists() else None,
+                new_audio if imported_manifest is not None and new_audio.exists() else None,
             )
 
             validated_count = 0
@@ -2519,16 +2601,12 @@ class MiniMaxH3Extender:
         active_ref_video_count = sum(video is not None for video in ref_videos)
         active_ref_video_audio_count = sum(audio is not None for audio in ref_video_audios)
         active_ref_audio_count = sum(audio is not None for audio in ref_audios)
-        # Long standalone audio (>15s) is a sequence timeline. Offsets are
-        # computed from every card up front so cached/validated cards do not
-        # change which source window a later re-render receives. H3-aligned
-        # frame durations are used because those are the durations actually
-        # generated by each card.
-        ref_audio_clip_offsets = []
-        ref_audio_cursor = 0.0
-        for clip_cfg in clips:
-            ref_audio_clip_offsets.append(float(ref_audio_cursor))
-            ref_audio_cursor += _duration_to_frames(clip_cfg["duration"]) / float(FPS)
+        # Long standalone audio (>15s) uses independent logical timelines.
+        # Precompute the complete plan so cached/validated cards still advance
+        # only the Audio slot(s) they actually use. Example: Clip 1 <Audio 1>,
+        # Clip 2 <Audio 2> starts both sources at 0; a later <Audio 1> resumes
+        # after the duration previously consumed from Audio 1.
+        standalone_audio_clip_plan = _build_standalone_audio_clip_plan(clips, ref_audios)
         standalone_audio_cache = {}
 
         ref_items = None
@@ -2588,9 +2666,7 @@ class MiniMaxH3Extender:
             # ref remains the global/timeline ref regardless of prompt tags. With
             # several refs, <Audio N> selects explicitly; without a usable tag,
             # the first connected logical ref is used instead of stacking them.
-            selected_ref_audios, selected_audio_slots = _select_standalone_audio_refs_for_prompt(
-                cfg["prompt"], ref_audios
-            )
+            selected_ref_audios, selected_audio_slots, selected_audio_offsets = standalone_audio_clip_plan[i]
             selected_ref_audio_count = len(selected_audio_slots)
             clip_mixed_ref_count = (
                 _reference_count(refs)
@@ -2646,7 +2722,7 @@ class MiniMaxH3Extender:
                 audio_items, audio_blocks = _prepare_standalone_audio_refs(
                     audio_vae,
                     selected_ref_audios,
-                    ref_audio_clip_offsets[i],
+                    selected_audio_offsets,
                     frame_count / float(FPS),
                     cache=standalone_audio_cache,
                 )

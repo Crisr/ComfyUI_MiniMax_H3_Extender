@@ -59,7 +59,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.68-ref-video-fps-socket"
+BUILD = "motion-context-disk-v14.75-unified-audio-seams"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -151,6 +151,8 @@ _NODE_DIR = Path(__file__).resolve().parent
 _CACHE_ROOT = _NODE_DIR / "cache"
 _DATA_MAGIC = b"H3MCACHE12\x00"
 _DATA_START = len(_DATA_MAGIC)
+_AUDIO_CACHE_MAGIC = b"H3MAUDIO1\x00"
+_AUDIO_CACHE_START = len(_AUDIO_CACHE_MAGIC)
 
 _DTYPE_MAP = {
     "float64": torch.float64,
@@ -188,6 +190,30 @@ def _chain_paths(owner_id):
     root = _ensure_cache_root()
     stem = "chain_" + _safe_name(owner_id)
     return root / f"{stem}.h3cache", root / f"{stem}.json"
+
+
+def _decoded_audio_cache_path(data_path):
+    return Path(data_path).with_suffix(".audio.h3cache")
+
+
+def _new_audio_cache_file(path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(_AUDIO_CACHE_MAGIC)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _ensure_audio_cache_file(path):
+    path = Path(path)
+    if not path.exists():
+        _new_audio_cache_file(path)
+        return
+    with open(path, "rb") as f:
+        magic = f.read(_AUDIO_CACHE_START)
+    if magic != _AUDIO_CACHE_MAGIC:
+        raise ValueError(f"H3 decoded audio cache: invalid cache data file: {path}")
 
 
 def _write_json_atomic(path, payload):
@@ -350,7 +376,8 @@ def _cache_size_mb(data_path, manifest_path):
     data_path = Path(data_path)
     preview_path = data_path.with_suffix(".preview.mp4")
     preview_video_path = data_path.with_suffix(".preview.video.mp4")
-    for p in (data_path, Path(manifest_path), preview_path, preview_video_path):
+    audio_cache_path = _decoded_audio_cache_path(data_path)
+    for p in (data_path, Path(manifest_path), preview_path, preview_video_path, audio_cache_path):
         try:
             total += p.stat().st_size
         except OSError:
@@ -484,6 +511,11 @@ def _truncate_chain(data_path, manifest_path, manifest, index):
         f.truncate(truncate_at)
         f.flush()
         os.fsync(f.fileno())
+
+    # The decoded PCM cache follows the same retained clip prefix. Full-batch
+    # and clip-by-clip therefore keep exactly the audio cache that belongs to
+    # the surviving segments, with no recovery/redecode path.
+    _truncate_decoded_audio_cache(data_path, prefix)
     return reduced
 
 
@@ -545,6 +577,7 @@ def _manifest_for_first(owner_id, fps):
     manifest = _load_manifest_from_paths(data_path, manifest_path)
     if manifest is None:
         _new_data_file(data_path)
+        _new_audio_cache_file(_decoded_audio_cache_path(data_path))
         manifest = {
             "version": CACHE_VERSION,
             "build": BUILD,
@@ -1663,6 +1696,49 @@ def _copy_blob_to_file(data_path, spec, destination):
             remaining -= len(chunk)
 
 
+def _decoded_audio_meta_from_waveform(file_obj, rendered_audio):
+    wave = rendered_audio["waveform"]
+    if wave.ndim == 2:
+        wave = wave.unsqueeze(0)
+    if wave.ndim != 3 or int(wave.shape[0]) != 1:
+        raise ValueError(
+            f"H3 progressive preview: invalid decoded audio shape {tuple(wave.shape)}."
+        )
+    wave = wave.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    spec = _write_tensor_raw(file_obj, wave)
+    return {
+        "storage": "audio_cache",
+        "waveform": spec,
+        "sample_rate": int(rendered_audio["sample_rate"]),
+        "timeline_gain": 1.0,
+    }
+
+
+def _decoded_audio_cache_end(segments):
+    end = int(_AUDIO_CACHE_START)
+    for desc in segments:
+        meta = desc.get("decoded_audio")
+        if not isinstance(meta, dict) or meta.get("storage") != "audio_cache":
+            continue
+        spec = meta.get("waveform")
+        if not isinstance(spec, dict):
+            continue
+        end = max(end, int(spec.get("offset", 0)) + int(spec.get("nbytes", 0)))
+    return int(end)
+
+
+def _truncate_decoded_audio_cache(data_path, segments):
+    audio_path = _decoded_audio_cache_path(data_path)
+    if not audio_path.exists():
+        return
+    _ensure_audio_cache_file(audio_path)
+    truncate_at = _decoded_audio_cache_end(segments)
+    with open(audio_path, "r+b", buffering=0) as f:
+        f.truncate(truncate_at)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def _cache_candidate_render(
     data_path,
     manifest_path,
@@ -1671,13 +1747,12 @@ def _cache_candidate_render(
     rendered_mp4,
     rendered_audio,
 ):
-    """Persist the corrected candidate render next to its latent payload.
+    """Persist one clip-by-clip candidate render.
 
-    The MP4 blob is video-only and is kept for the already-decoded video cache.
-    Starting with v14.42 we ALSO persist the corrected decoded waveform losslessly. Full
-    previews can then concatenate PCM and perform one AAC encode for the whole
-    timeline instead of stream-copying independently primed AAC streams at each
-    seam.
+    Video remains beside the latent payload in the main .h3cache. Decoded PCM
+    uses the dedicated primary audio cache shared by both clip-by-clip and
+    full-batch modes. This gives both execution modes the same per-clip audio
+    cache without rebuilding anything when switching modes.
     """
     segments = [dict(x) for x in manifest.get("segments", [])]
     idx = int(clip_index)
@@ -1689,30 +1764,26 @@ def _cache_candidate_render(
     desc = dict(segments[idx])
     latent_end = int(desc.get("latent_end", _latent_payload_end(desc)))
 
-    wave = rendered_audio["waveform"]
-    if wave.ndim == 2:
-        wave = wave.unsqueeze(0)
-    if wave.ndim != 3 or int(wave.shape[0]) != 1:
-        raise ValueError(
-            f"H3 progressive preview: invalid decoded audio shape {tuple(wave.shape)}."
-        )
-
+    # Main cache: latent payload + video-only decoded candidate.
     with open(data_path, "r+b", buffering=0) as f:
         f.truncate(latent_end)
         f.seek(latent_end)
         render_spec = _write_blob_raw(f, rendered_mp4)
-        audio_spec = _write_tensor_raw(f, wave)
         segment_end = int(f.tell())
         f.flush()
         os.fsync(f.fileno())
 
+    # Primary decoded-audio cache: one sequential PCM tensor per clip.
+    audio_path = _decoded_audio_cache_path(data_path)
+    _ensure_audio_cache_file(audio_path)
+    with open(audio_path, "ab", buffering=0) as af:
+        audio_meta = _decoded_audio_meta_from_waveform(af, rendered_audio)
+        af.flush()
+        os.fsync(af.fileno())
+
     desc["latent_end"] = latent_end
     desc["decoded_mp4_blob"] = render_spec
-    desc["decoded_audio"] = {
-        "waveform": audio_spec,
-        "sample_rate": int(rendered_audio["sample_rate"]),
-        "timeline_gain": 1.0,
-    }
+    desc["decoded_audio"] = audio_meta
     desc["segment_end"] = segment_end
     segments[idx] = desc
 
@@ -1722,7 +1793,6 @@ def _cache_candidate_render(
     updated["updated_at"] = time.time()
     _write_json_atomic(manifest_path, updated)
     return updated, desc
-
 
 def _encode_corrected_segment_video_mp4(
     ffmpeg,
@@ -1735,7 +1805,7 @@ def _encode_corrected_segment_video_mp4(
 
     Keeping AAC out of the per-clip cache avoids both audio encoder priming and
     MP4 audio edit-list timestamps from ever participating in an internal join.
-    The matching lossless PCM is stored separately inside .h3cache.
+    The matching lossless PCM is stored in the dedicated primary audio cache.
     """
     root = _ensure_cache_root()
     video_log = root / f"_{token}_video.log"
@@ -1788,7 +1858,19 @@ def _load_cached_decoded_audio(data_path, desc):
     spec = meta.get("waveform")
     if not isinstance(spec, dict):
         return None
-    wave = _map_tensor(data_path, spec)
+
+    if meta.get("storage") == "audio_cache":
+        source_path = _decoded_audio_cache_path(data_path)
+        if not source_path.exists():
+            return None
+        _ensure_audio_cache_file(source_path)
+    else:
+        # Embedded PCM from pre-primary-cache live chains remains readable.
+        # There is no decode/recovery fallback: newly generated caches always
+        # use the dedicated primary audio cache.
+        source_path = Path(data_path)
+
+    wave = _map_tensor(source_path, spec)
     if wave.ndim == 2:
         wave = wave.unsqueeze(0)
     if wave.ndim != 3 or int(wave.shape[0]) != 1:
@@ -1804,61 +1886,6 @@ def _load_cached_decoded_audio(data_path, desc):
         "waveform": wave,
         "sample_rate": int(meta.get("sample_rate", 32000)),
     }
-
-
-def _decode_legacy_segment_mp4_audio(
-    ffmpeg,
-    data_path,
-    desc,
-    sample_rate,
-    channels,
-    token,
-):
-    """Compatibility path for v14.41-and-older decoded MP4 blobs.
-
-    Old caches contain AAC only.  Decode that *individual* clip before fitting
-    it to the exact frame-derived sample count.  This removes AAC priming at the
-    internal seam instead of stream-copying it into the full preview.
-    """
-    blob = desc.get("decoded_mp4_blob")
-    if blob is None:
-        return None
-
-    root = _ensure_cache_root()
-    temp_mp4 = root / f"_{token}_legacy_audio.mp4"
-    try:
-        _copy_blob_to_file(data_path, blob, temp_mp4)
-        cmd = [
-            ffmpeg, "-v", "error",
-            "-i", str(temp_mp4),
-            "-map", "0:a:0",
-            "-vn",
-            "-f", "f32le",
-            "-acodec", "pcm_f32le",
-            "-ar", str(int(sample_rate)),
-            "-ac", str(int(channels)),
-            "pipe:1",
-        ]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if p.returncode != 0:
-            tail = p.stderr[-12000:].decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"H3 progressive preview legacy audio decode failed with "
-                f"code {p.returncode}.\n{tail}"
-            )
-        raw = np.frombuffer(p.stdout, dtype=np.float32)
-        if raw.size == 0 or raw.size % int(channels) != 0:
-            raise RuntimeError("H3 progressive preview: invalid legacy PCM decode.")
-        frames = raw.size // int(channels)
-        arr = raw.reshape(frames, int(channels)).T.copy()
-        return torch.from_numpy(arr).unsqueeze(0)
-    finally:
-        try:
-            if temp_mp4.exists():
-                temp_mp4.unlink()
-        except OSError:
-            pass
-
 
 def _upgrade_cached_audio_gain_chain(
     data_path,
@@ -1925,7 +1952,6 @@ def _write_preview_pcm_audio(
     fps,
     raw_audio_path,
     token,
-    audio_overrides=None,
 ):
     """Write exact timeline PCM for a progressive preview.
 
@@ -1936,13 +1962,10 @@ def _write_preview_pcm_audio(
     count = max(0, min(int(count), len(segments)))
     if count <= 0:
         raise ValueError("H3 progressive preview PCM builder has no segments.")
-    audio_overrides = audio_overrides or {}
-
     sample_rate = None
     channels = None
     for i in range(count):
-        override = audio_overrides.get(i)
-        cached = override if override is not None else _load_cached_decoded_audio(data_path, segments[i])
+        cached = _load_cached_decoded_audio(data_path, segments[i])
         if cached is not None:
             sample_rate = int(cached["sample_rate"])
             wave = cached["waveform"]
@@ -1961,9 +1984,7 @@ def _write_preview_pcm_audio(
     with open(raw_audio_path, "wb") as af:
         for i in range(count):
             desc = segments[i]
-            audio = audio_overrides.get(i)
-            if audio is None:
-                audio = _load_cached_decoded_audio(data_path, desc)
+            audio = _load_cached_decoded_audio(data_path, desc)
 
             if audio is not None:
                 sr = int(audio["sample_rate"])
@@ -1973,18 +1994,9 @@ def _write_preview_pcm_audio(
                 if sr != int(sample_rate):
                     raise RuntimeError("H3 progressive preview: cached audio sample rate changed.")
             else:
-                wave = _decode_legacy_segment_mp4_audio(
-                    ffmpeg,
-                    data_path,
-                    desc,
-                    sample_rate,
-                    channels,
-                    f"{token}_{i}",
+                raise RuntimeError(
+                    "H3 progressive preview: decoded audio cache is missing."
                 )
-                if wave is None:
-                    raise RuntimeError(
-                        "H3 progressive preview: decoded audio cache is missing."
-                    )
 
             if i > 0:
                 wave = _smooth_segment_entry_level(previous_tail, wave, sample_rate)
@@ -2066,7 +2078,6 @@ def _assemble_progressive_preview(
     fps,
     output_path,
     token,
-    audio_overrides=None,
 ):
     """Assemble a full preview with video stream-copy + one AAC encode."""
     root = _ensure_cache_root()
@@ -2086,7 +2097,6 @@ def _assemble_progressive_preview(
             fps,
             raw_audio,
             token,
-            audio_overrides=audio_overrides,
         )
         if Path(output_path).exists():
             Path(output_path).unlink()
@@ -2110,13 +2120,11 @@ def _assemble_progressive_preview(
                 pass
 
 
-def _render_one_final_segment(
+def _render_one_final_video_segment(
     data_path,
     segments,
     index,
     vae,
-    audio_vae,
-    fps,
     progress=None,
 ):
     i = int(index)
@@ -2137,10 +2145,8 @@ def _render_one_final_segment(
                 f"H3 progressive preview: clip 1 decoded {video.shape[0]}, "
                 f"expected {expected}."
             )
-        audio = _decode_single_audio(data_path, curr, audio_vae, fps)
-        if progress is not None:
-            progress.advance()
-        return video, audio, 0
+        del v
+        return video, 0
 
     prev = segments[i - 1]
     chain, meta = _build_pair_video(data_path, prev, curr)
@@ -2150,7 +2156,32 @@ def _render_one_final_segment(
     if progress is not None:
         progress.advance()
     current_video = _correct_current_segment(previous_raw, current_raw)
+    del chain, decoded, previous_raw, current_raw
+    return current_video, int(shift)
 
+
+def _render_one_final_segment(
+    data_path,
+    segments,
+    index,
+    vae,
+    audio_vae,
+    fps,
+    progress=None,
+):
+    i = int(index)
+    curr = segments[i]
+    video, shift = _render_one_final_video_segment(
+        data_path, segments, i, vae, progress=progress
+    )
+
+    if i == 0:
+        audio = _decode_single_audio(data_path, curr, audio_vae, fps)
+        if progress is not None:
+            progress.advance()
+        return video, audio, 0
+
+    prev = segments[i - 1]
     pair_audio, prev_frames, curr_frames = _decode_pair_audio(
         data_path,
         prev,
@@ -2188,9 +2219,8 @@ def _render_one_final_segment(
         "sample_rate": sr,
     }
 
-    del chain, decoded, previous_raw, current_raw, pair_audio, wave, previous_audio
-    return current_video, audio, int(shift)
-
+    del pair_audio, wave, previous_audio
+    return video, audio, int(shift)
 
 def _sync_committed_preview(
     data_path,
@@ -2245,7 +2275,6 @@ def _sync_committed_preview(
     start_i = 0 if rebuild else current_count
     video_inputs = [] if rebuild else [committed_video_path]
     temp_segments = []
-    audio_overrides = {}
     root = _ensure_cache_root()
     joined_video_tmp = committed_video_path.with_name(
         committed_video_path.stem + f"_{token}.tmp.mp4"
@@ -2265,15 +2294,20 @@ def _sync_committed_preview(
             if blob is not None:
                 _copy_blob_to_file(data_path, blob, segment_tmp)
             else:
-                # Legacy/recovery path only. Keep constant-memory video decode
-                # and retain the exact decoded PCM for the single final AAC pass.
-                video, audio, _ = _render_one_final_segment(
+                # Full Batch does not need to keep duplicate per-clip decoded
+                # video files. When entering Clip by Clip, bootstrap only the
+                # required video prefix from latent cache. Decoded audio is
+                # already present in the primary per-clip audio cache and is
+                # never decoded again here.
+                if _load_cached_decoded_audio(data_path, desc) is None:
+                    raise RuntimeError(
+                        "H3 progressive preview: decoded audio cache is missing."
+                    )
+                video, _ = _render_one_final_video_segment(
                     data_path,
                     segments,
                     i,
                     vae,
-                    audio_vae,
-                    fps,
                 )
                 _encode_corrected_segment_video_mp4(
                     ffmpeg,
@@ -2282,7 +2316,6 @@ def _sync_committed_preview(
                     segment_tmp,
                     f"{token}_bootstrap_{i}",
                 )
-                audio_overrides[i] = audio
                 del video
 
             video_inputs.append(segment_tmp)
@@ -2303,7 +2336,6 @@ def _sync_committed_preview(
             fps,
             raw_audio,
             f"{token}_commit_pcm",
-            audio_overrides=audio_overrides,
         )
         _mux_final(
             ffmpeg,
@@ -2567,7 +2599,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
         }
 
     # Otherwise rebuild the full current preview from the per-clip decoded video
-    # blobs plus cached PCM already stored inside .h3cache. Video is stream-copied
+    # blobs plus cached PCM from the primary decoded-audio cache. Video is stream-copied
     # and audio gets one cheap AAC encode; no VAE/sampler runs on application load.
     # It remains available even if the last clip was only a candidate when the
     # application was closed.
@@ -2997,6 +3029,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         token = uuid.uuid4().hex[:10]
         temp_video = temp_root / f"_export_{token}_video.{extension}"
         raw_audio = temp_root / f"_export_{token}_audio.f32le"
+        temp_audio_cache = temp_root / f"_export_{token}_decoded_audio.h3cache"
         video_log = temp_root / f"_export_{token}_video.log"
         mux_log = temp_root / f"_export_{token}_mux.log"
         color_temp = temp_root / f"_export_{token}_color.{extension}"
@@ -3058,86 +3091,101 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     f"Disk Final Decode wrote {written_frames} frames, expected {expected_frames}."
                 )
 
-            # AUDIO - same pair-local policy, exact video seam shift, streaming
-            # raw f32 to disk. RAM holds only the current pair plus one small
-            # previous-clip PCM reference used to keep pair normalization gain
-            # continuous across the timeline.
-            written_samples = 0
-            cumulative_frames = 0
-            previous_tail = None
-            previous_clip_wave = None
+            # AUDIO - build the SAME primary per-clip PCM cache as Clip by Clip,
+            # then assemble the final Full Batch timeline through the exact same
+            # _write_preview_pcm_audio() seam path. There is only one definition
+            # of entry smoothing/declick and cumulative sample fitting now.
+            #
+            # Clip 1 is intentionally decoded on its own, matching the way it is
+            # cached when generated in Clip by Clip. Each later clip comes from
+            # its adjacent pair and matches gain against the previous UNSMOOTHED
+            # cached clip, again exactly like _render_one_final_segment().
             sample_rate = None
             channels = None
+            cached_audio_meta = [None] * len(segments)
 
-            with open(raw_audio, "wb") as af:
-                if len(segments) == 1:
-                    audio0 = _decode_single_audio(data_path, segments[0], audio_vae, fps)
-                    progress.advance()
-                    sample_rate = int(audio0["sample_rate"])
-                    wave0 = audio0["waveform"]
-                    channels = int(wave0.shape[1])
-                    cumulative_frames = int(segments[0]["frames"])
-                    target = int(round(float(cumulative_frames) / float(fps) * sample_rate))
-                    wave0 = _fit_audio_segment_to_cumulative(wave0, target, written_samples)
-                    _write_audio_raw(af, wave0)
-                    written_samples += int(wave0.shape[-1])
-                    previous_tail = _audio_seam_tail(wave0, sample_rate)
-                    del audio0, wave0
-                else:
-                    for i in range(1, len(segments)):
-                        pair, prev_frames, curr_frames = _decode_pair_audio(
-                            data_path,
-                            segments[i - 1],
-                            segments[i],
-                            audio_vae,
-                            fps,
-                            int(seam_shifts.get(i, 0)),
-                        )
-                        progress.advance()
-                        sr = int(pair["sample_rate"])
-                        w = pair["waveform"]
-                        prev_n = int(round(float(prev_frames) / float(fps) * sr))
-                        pair_previous = w[..., :prev_n]
-                        current = w[..., prev_n:]
+            with open(temp_audio_cache, "wb", buffering=0) as acf:
+                acf.write(_AUDIO_CACHE_MAGIC)
 
-                        if sample_rate is None:
-                            sample_rate = sr
-                            channels = int(w.shape[1])
-                            cumulative_frames = int(prev_frames)
-                            target = int(round(float(cumulative_frames) / float(fps) * sr))
-                            first = _fit_audio_segment_to_cumulative(
-                                pair_previous, target, written_samples
-                            )
-                            _write_audio_raw(af, first)
-                            written_samples += int(first.shape[-1])
-                            previous_tail = _audio_seam_tail(first, sr)
-                            previous_clip_wave = first.detach().clone()
-                            del first
-                        else:
-                            if sr != sample_rate:
-                                raise RuntimeError("Disk Final Decode: audio sample rate changed.")
-                            gain = _match_pair_gain_to_previous(
-                                previous_clip_wave, pair_previous, sr
-                            )
-                            if abs(gain - 1.0) > 1.0e-8:
-                                current = current * gain
-
-                        current = _smooth_segment_entry_level(previous_tail, current, sr)
-                        current = _declick_segment(previous_tail, current, sr, 12.0)
-                        cumulative_frames += int(curr_frames)
-                        target = int(round(float(cumulative_frames) / float(fps) * sr))
-                        current = _fit_audio_segment_to_cumulative(current, target, written_samples)
-                        _write_audio_raw(af, current)
-                        written_samples += int(current.shape[-1])
-                        previous_tail = _audio_seam_tail(current, sr)
-                        previous_clip_wave = current.detach().clone()
-                        del pair, w, pair_previous, current
-
-            if int(cumulative_frames) != int(expected_frames):
-                raise RuntimeError(
-                    f"Disk Final Decode audio represents {cumulative_frames} frames, "
-                    f"expected {expected_frames}."
+                audio0 = _decode_single_audio(data_path, segments[0], audio_vae, fps)
+                progress.advance()
+                sample_rate = int(audio0["sample_rate"])
+                first_wave = audio0["waveform"]
+                channels = int(first_wave.shape[1])
+                cached_audio_meta[0] = _decoded_audio_meta_from_waveform(
+                    acf, {"waveform": first_wave, "sample_rate": sample_rate}
                 )
+                previous_clip_wave = first_wave.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                del audio0, first_wave
+
+                for i in range(1, len(segments)):
+                    pair, prev_frames, curr_frames = _decode_pair_audio(
+                        data_path,
+                        segments[i - 1],
+                        segments[i],
+                        audio_vae,
+                        fps,
+                        int(seam_shifts.get(i, 0)),
+                    )
+                    progress.advance()
+                    sr = int(pair["sample_rate"])
+                    if sr != int(sample_rate):
+                        raise RuntimeError("Disk Final Decode: audio sample rate changed.")
+
+                    w = pair["waveform"]
+                    if int(w.shape[1]) != int(channels):
+                        raise RuntimeError("Disk Final Decode: audio channel count changed.")
+                    prev_n = int(round(float(prev_frames) / float(fps) * sr))
+                    pair_previous = w[..., :prev_n]
+                    current_audio = w[..., prev_n:]
+
+                    gain = _match_pair_gain_to_previous(
+                        previous_clip_wave, pair_previous, sr
+                    )
+                    if abs(gain - 1.0) > 1.0e-8:
+                        current_audio = current_audio * gain
+
+                    wanted = int(round(float(curr_frames) / float(fps) * sr))
+                    current_audio = _fit_audio_segment_to_cumulative(
+                        current_audio, wanted, 0
+                    )
+                    cached_audio_meta[i] = _decoded_audio_meta_from_waveform(
+                        acf, {"waveform": current_audio, "sample_rate": sr}
+                    )
+                    previous_clip_wave = current_audio.detach().to(device="cpu", dtype=torch.float32).contiguous()
+                    del pair, w, pair_previous, current_audio
+
+                acf.flush()
+                os.fsync(acf.fileno())
+
+            # Commit the complete primary cache before assembling the timeline,
+            # because _write_preview_pcm_audio() reads exactly these per-clip PCM
+            # entries. No fallback/recovery path and no second seam algorithm.
+            if any(meta is None for meta in cached_audio_meta):
+                raise RuntimeError("Disk Final Decode: incomplete decoded audio cache generation.")
+            audio_cache_path = _decoded_audio_cache_path(data_path)
+            os.replace(temp_audio_cache, audio_cache_path)
+            segments = [dict(x) for x in segments]
+            for i, meta in enumerate(cached_audio_meta):
+                segments[i]["decoded_audio"] = meta
+            manifest = dict(manifest)
+            manifest["segments"] = segments
+            manifest["build"] = BUILD
+            manifest["updated_at"] = time.time()
+            _write_json_atomic(manifest_path, manifest)
+
+            # One common seam assembler for both modes. This applies the same
+            # entry-level smoothing, declick and sample-exact cumulative fitting
+            # that Clip by Clip already uses for its progressive preview.
+            sample_rate, channels, written_samples = _write_preview_pcm_audio(
+                ffmpeg,
+                data_path,
+                segments,
+                len(segments),
+                fps,
+                raw_audio,
+                f"{token}_full_pcm",
+            )
 
             _mux_final(
                 ffmpeg,
@@ -3208,7 +3256,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     video_log_f.close()
                 except Exception:
                     pass
-            for p in (temp_video, raw_audio, video_log, mux_log, color_temp):
+            for p in (temp_video, raw_audio, temp_audio_cache, video_log, mux_log, color_temp):
                 try:
                     if Path(p).exists():
                         Path(p).unlink()
