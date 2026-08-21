@@ -5,9 +5,70 @@ A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous v
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
 
 ---
-## 🆕 Latest updates
+## 🎬 New — Video & Audio References for MiniMax H3
 
-Recent H3 Extender updates bring a much more self-contained workflow and better long-sequence handling:
+The Extender now supports **MiniMax H3 video references** directly inside the workflow.
+
+You can now use external video frames as `<Video N>` references, combine them with image references, and optionally attach the matching video audio for motion, timing, camera behavior and lip-sync guidance.
+
+### What’s new
+
+- up to **3 video references**
+- up to **3 matching video-audio references**
+- up to **3 standalone audio references**
+- `<Video 1>`, `<Video 2>`, `<Video 3>` support in prompts
+- stable logical video slots with no automatic remapping
+- dynamic AV inputs in the node UI
+- optional paired `ref_video_audio_N` inputs
+- long standalone audio references are automatically sliced along the clip timeline
+- video soundtracks are cropped to the effective reference-video duration
+- reference-video inputs are automatically aligned to H3’s required `17k+5` frame structure
+- external Prompt Pack and Reference Pack sockets remain at the bottom of the node
+
+### Automatic FPS correction
+
+MiniMax H3 expects reference-video frames at **24 fps**, but real source videos can be 23.976, 25, 30, 45, 50, 60 fps, etc.
+
+The Extender now accepts the original source FPS through:
+
+- `ref_video_fps_1`
+- `ref_video_fps_2`
+- `ref_video_fps_3`
+
+The reference-video frame batch is then automatically **resampled to 24 fps while preserving the original duration** before it is sent to H3.
+
+This fixes cases where the end of a reference video appeared to be missing because a non-24-fps image batch was previously interpreted as if it were already 24 fps.
+
+Typical workflow:
+
+~~~text
+Load Video
+   ↓
+Get Video Components
+   ├── images → ref_video_1
+   ├── fps    → ref_video_fps_1
+   └── audio  → ref_video_audio_1
+~~~
+
+### Character replacement
+
+Video references can be combined with image references for workflows such as:
+
+- character replacement
+- motion transfer
+- pose and body-performance transfer
+- camera-motion transfer
+- timing preservation
+- lip-sync guidance from the original video audio
+
+For example:
+
+- `<Picture 1>` defines the new character identity
+- `<Video 1>` provides the original performance, timing and camera behavior
+- `ref_video_audio_1` provides the matching audio reference
+
+This keeps the Extender’s existing internal image-reference system fully intact while adding proper H3 Ref2VA video/audio support.
+
 
 **Added support for an external prompt pack through the new MiniMax H3 Prompt Pack Bridge node.**
 
