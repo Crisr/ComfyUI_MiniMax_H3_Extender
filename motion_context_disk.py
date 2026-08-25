@@ -2891,6 +2891,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         crf,
         preset,
         audio_bitrate,
+        autoplay=True,
         unique_id=None,
     ):
         data_path, manifest_path, manifest = _load_manifest(cache)
