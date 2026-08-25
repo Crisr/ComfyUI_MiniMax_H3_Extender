@@ -2868,6 +2868,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "crf": ("INT", {"default": 17, "min": 0, "max": 51, "step": 1}),
                 "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], {"default": "fast"}),
                 "audio_bitrate": (["128k", "192k", "256k", "320k"], {"default": "192k"}),
+                "autoplay": ("BOOLEAN", {"default": True, "tooltip": "Auto-play the video preview when generating finishes or the node is loaded."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
