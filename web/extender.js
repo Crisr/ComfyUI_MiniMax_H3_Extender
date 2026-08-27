@@ -1384,8 +1384,7 @@ async function openClipColorEditor(node, runtime, clipIndex) {
     video.addEventListener("loadedmetadata", () => {
         video.currentTime = loopStart;
         updateLiveFilter();
-        
-        // video.play().catch(() => {}); // Disabled to prevent autoplay
+        video.play().catch(() => {});
     });
     video.addEventListener("timeupdate", () => {
         if (video.currentTime >= loopEnd - 0.015 || video.currentTime < loopStart - 0.05) {
