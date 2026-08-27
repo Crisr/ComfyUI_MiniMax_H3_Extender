@@ -7,8 +7,8 @@ Ref2VA -> Motion Context -> Sampler -> Disk Join graph while keeping the
 validated disk cache and the separate Final Decode / Preview node.
 
 The node intentionally accepts an already-patched H3 MODEL. Sigma-shift,
-LoRA, Spectrum or other model patches therefore remain external and compose
-normally before the Extender.
+upstream LoRA, Spectrum or other model patches therefore compose normally
+before the Extender; optional card-local LoRAs can be stacked on top per clip.
 """
 
 from __future__ import annotations
@@ -31,11 +31,13 @@ import numpy as np
 import torch
 import torchaudio
 import comfy.model_management
+import comfy.sd
 import comfy.nested_tensor
 import comfy.sample
 import comfy.samplers
 import comfy.utils
 import latent_preview
+import folder_paths
 import node_helpers
 from aiohttp import web
 from PIL import Image, ImageEnhance, ImageOps
@@ -63,7 +65,7 @@ from .motion_context_disk import (
     _truncate_chain,
 )
 
-BUILD = "minimax-h3-extender-v14.75-unified-audio-seams"
+BUILD = "minimax-h3-extender-v14.79-dynamic-per-clip-loras"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -1412,6 +1414,118 @@ def _normalize_color_adjustment(value=None):
     }
 
 
+def _normalize_clip_lora(value=None):
+    raw = value if isinstance(value, dict) else {}
+    name = str(raw.get("name") or "").strip()
+
+    # v14.77 stored `strength_model`; keep accepting it when loading a project
+    # created with that test build. Per-clip H3 LoRAs are model-only: the text
+    # encoder is deliberately left untouched.
+    candidate = raw.get("strength", raw.get("strength_model", 1.0))
+    try:
+        strength = float(candidate)
+    except Exception:
+        strength = 1.0
+    if not math.isfinite(strength):
+        strength = 1.0
+
+    return {
+        "name": name,
+        "strength": max(-100.0, min(100.0, strength)),
+    }
+
+
+def _normalize_clip_loras(value=None, legacy=None):
+    """Normalize the ordered model-only LoRA stack stored on one clip card.
+
+    v14.79 stores `loras: [...]`. v14.77/v14.78 stored one `lora` object, which
+    is migrated automatically when loading those test-project states.
+    Empty entries are discarded; the UI owns the trailing empty autogrow row.
+    """
+    raw_items = value if isinstance(value, list) else []
+    if not raw_items and isinstance(legacy, dict):
+        raw_items = [legacy]
+
+    out = []
+    for raw in raw_items:
+        cfg = _normalize_clip_lora(raw)
+        if cfg["name"]:
+            out.append(cfg)
+    return out
+
+
+def _apply_per_clip_loras(owner, model, clip, lora_cfgs, clip_index):
+    """Apply an ordered stack of card-local, model-only LoRAs.
+
+    Every card starts from the incoming MODEL. LoRAs selected on that card are
+    then patched one after another using ComfyUI's native loader path. The text
+    encoder is intentionally untouched, and the patched model is returned only
+    for this card so local LoRA state cannot leak into following clips.
+    """
+    cfgs = _normalize_clip_loras(lora_cfgs)
+    if not cfgs:
+        return model, clip
+
+    patched_model = model
+    for lora_index, cfg in enumerate(cfgs, start=1):
+        name = cfg["name"]
+        strength = float(cfg["strength"])
+        if abs(strength) < 1e-12:
+            continue
+
+        try:
+            lora_path = folder_paths.get_full_path_or_raise("loras", name)
+        except Exception as exc:
+            raise ValueError(
+                f"MiniMax H3 Extender: LoRA {name!r} selected for clip {int(clip_index) + 1} "
+                f"(slot {lora_index}) was not found in ComfyUI's LoRA folders."
+            ) from exc
+
+        # Keep the native loader's lightweight single-payload cache semantics.
+        # This deliberately avoids retaining an unbounded collection of large
+        # LoRA tensors in CPU RAM. Multiple LoRAs are still applied in order.
+        loaded = getattr(owner, "_h3_loaded_lora", None)
+        lora = None
+        lora_metadata = None
+        if isinstance(loaded, tuple) and len(loaded) >= 2 and loaded[0] == lora_path:
+            lora = loaded[1]
+            lora_metadata = loaded[2] if len(loaded) > 2 else None
+
+        if lora is None:
+            try:
+                lora, lora_metadata = comfy.utils.load_torch_file(
+                    lora_path, safe_load=True, return_metadata=True
+                )
+            except TypeError:
+                # Compatibility with older ComfyUI builds lacking return_metadata.
+                lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                lora_metadata = None
+            owner._h3_loaded_lora = (lora_path, lora, lora_metadata)
+
+        try:
+            try:
+                patched_model, _ = comfy.sd.load_lora_for_models(
+                    patched_model,
+                    None,
+                    lora,
+                    strength,
+                    0.0,
+                    lora_metadata=lora_metadata,
+                )
+            except TypeError:
+                # Compatibility with older signatures before LoRA metadata support.
+                patched_model, _ = comfy.sd.load_lora_for_models(
+                    patched_model, None, lora, strength, 0.0
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                f"MiniMax H3 Extender: failed to apply LoRA {name!r} to clip "
+                f"{int(clip_index) + 1} (slot {lora_index}): {exc}"
+            ) from exc
+
+    return patched_model, clip
+
+
 def _default_clip(index: int = 0):
     return {
         "id": f"clip_{index + 1}",
@@ -1422,6 +1536,7 @@ def _default_clip(index: int = 0):
         "duration": DEFAULT_DURATION,
         "validated": False,
         "color_adjustment": _normalize_color_adjustment(),
+        "loras": [],
     }
 
 
@@ -1474,6 +1589,7 @@ def _parse_clips_json(value: str):
                 "duration": duration,
                 "validated": bool(raw.get("validated", False)),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
+                "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
             }
         )
 
@@ -2729,8 +2845,12 @@ class MiniMaxH3Extender:
                 clip_ref_items.extend(audio_items)
                 clip_ref_blocks.extend(audio_blocks)
 
+            clip_model, clip_text_encoder = _apply_per_clip_loras(
+                self, model, clip, cfg.get("loras"), i
+            )
+
             positive, latent = _make_ref2va_conditioning(
-                clip,
+                clip_text_encoder,
                 vae,
                 cfg["prompt"],
                 resolved_width,
@@ -2767,7 +2887,7 @@ class MiniMaxH3Extender:
             )
 
             sampled = _sample_h3(
-                model,
+                clip_model,
                 positive,
                 latent,
                 cfg["seed"],
@@ -2799,8 +2919,10 @@ class MiniMaxH3Extender:
                 f"Clip {i + 1}/{len(clips)} complete",
             )
 
-            # Drop full sampled/conditioning references before the next clip.
-            del sampled, positive, latent
+            # Drop full sampled/conditioning and card-local patched MODEL/CLIP
+            # references before the next clip. The incoming base model remains
+            # untouched, so a LoRA selected on one card cannot leak to another.
+            del sampled, positive, latent, clip_model, clip_text_encoder
 
             if str(run_mode) == "clip_by_clip":
                 break
@@ -2930,6 +3052,7 @@ class MiniMaxH3Extender:
             "ref_pack_connected": external_ref_pack is not None,
             "ref_pack_count": int(external_ref_pack.get("count", 0) or 0) if external_ref_pack is not None else 0,
             "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
+            "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }
 
@@ -2956,6 +3079,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 
 if getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.get("/h3_extender/loras")
+    async def h3_extender_loras(request):
+        """Return the current ComfyUI LoRA filename list for card dropdowns."""
+        try:
+            names = sorted(
+                {str(name) for name in folder_paths.get_filename_list("loras") if str(name).strip()},
+                key=lambda value: value.lower(),
+            )
+            return web.json_response({"ok": True, "loras": names})
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc), "loras": []}, status=500)
+
     @PromptServer.instance.routes.post("/h3_extender/ref/upload")
     async def h3_extender_ref_upload(request):
         """Upload one image reference and store the actual pixels internally."""
