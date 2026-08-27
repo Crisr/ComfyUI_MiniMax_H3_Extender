@@ -5,6 +5,23 @@ A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous v
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
 
 ---
+
+## 🎛️ New — Per-Clip LoRAs
+
+Each clip card can now use its own LoRA.
+
+- choose a LoRA directly inside the clip card
+- set its strength per clip
+- add multiple LoRAs to the same clip
+- LoRA rows grow automatically as needed
+- remove a LoRA and the list compacts automatically
+- clips without LoRAs continue to use the incoming model unchanged
+- global LoRAs applied before the Extender still work as before
+- per-clip LoRA choices are saved with the project
+
+This makes it possible to change style, motion or behavior from one clip to another while keeping the Extender’s normal continuity workflow.
+
+---
 ## 🎬 New — Video & Audio References for MiniMax H3
 
 The Extender now supports **MiniMax H3 video references** directly inside the workflow.
