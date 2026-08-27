@@ -7,8 +7,8 @@ const PROGRESS_EVENT = "h3_extender_progress";
 const PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import";
 const REF_PACK_EVENT = "h3_extender_ref_pack_import";
 const CARD_WIDTH = 318;
-const UI_MIN_HEIGHT = 600;
-const NODES2_MIN_HEIGHT = 650;
+const UI_MIN_HEIGHT = 650;
+const NODES2_MIN_HEIGHT = 700;
 // Keep a real visual gap between the native Nodes 2.0 widgets and the CLIP
 // panel. This is internal padding only: we deliberately do NOT rewrite Vue
 // grid tracks or absolutely position the DOM widget.
@@ -18,7 +18,7 @@ const BOTTOM_PAD = 16;
 // Leave an empty gutter under each card so an overlay horizontal scrollbar
 // never covers the Validated/footer row.
 const CARD_SCROLLBAR_SPACE = 24;
-const CARD_MIN_HEIGHT = 355;
+const CARD_MIN_HEIGHT = 405;
 const NODES2_CARDS_MIN_HEIGHT = CARD_MIN_HEIGHT + CARD_SCROLLBAR_SPACE;
 const REF_SLOT_WIDTH = 96;
 const REF_THUMB_HEIGHT = 96;
@@ -485,6 +485,25 @@ function cssColorFilter(value) {
     return `saturate(${c.saturation}%) contrast(${c.contrast}%) brightness(${c.brightness}%)`;
 }
 
+function normalizeClipLora(value) {
+    const raw = value && typeof value === "object" ? value : {};
+    const candidate = raw.strength ?? raw.strength_model ?? 1.0;
+    const n = Number(candidate);
+    const strength = Number.isFinite(n) ? Math.max(-100, Math.min(100, n)) : 1.0;
+    return {
+        name: String(raw.name || "").trim(),
+        strength,
+    };
+}
+
+function normalizeClipLoras(value, legacy = null) {
+    let source = Array.isArray(value) ? value : [];
+    if (!source.length && legacy && typeof legacy === "object") source = [legacy];
+    return source
+        .map((entry) => normalizeClipLora(entry))
+        .filter((entry) => Boolean(entry.name));
+}
+
 function newClip(index) {
     return {
         id: `clip_${index + 1}_${Date.now().toString(36)}`,
@@ -495,6 +514,7 @@ function newClip(index) {
         duration: 10.0,
         validated: false,
         color_adjustment: normalizeColorAdjustment(),
+        loras: [],
     };
 }
 
@@ -518,6 +538,7 @@ function parseState(raw) {
                     duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
                     validated: Boolean(c?.validated),
                     color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
+                    loras: normalizeClipLoras(c?.loras, c?.lora),
                 })),
             };
         }
@@ -532,6 +553,29 @@ function serializeState(state) {
         payload.prompt_pack_signature = String(state.prompt_pack_signature);
     }
     return JSON.stringify(payload);
+}
+
+async function refreshLoraNames(node, runtime) {
+    if (!node || !runtime || runtime.loraListLoading) return;
+    runtime.loraListLoading = true;
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/loras"), { cache: "no-store" });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `LoRA list failed (${response.status})`);
+        }
+        runtime.loraNames = Array.isArray(payload?.loras)
+            ? payload.loras.map((name) => String(name)).filter(Boolean)
+            : [];
+        runtime.loraListError = "";
+    } catch (error) {
+        runtime.loraNames = [];
+        runtime.loraListError = String(error?.message || error);
+    } finally {
+        runtime.loraListLoading = false;
+        runtime.loraListLoaded = true;
+        render(node, runtime);
+    }
 }
 
 function validatedPrefixFromState(state) {
@@ -2285,6 +2329,110 @@ function render(node, runtime) {
         prompt.addEventListener("blur", () => render(node, runtime));
         card.appendChild(prompt);
 
+        clip.loras = normalizeClipLoras(clip.loras, clip.lora);
+        // Remove the old single-LoRA property after migration so serialized
+        // state has one authoritative representation from v14.79 onward.
+        if (Object.prototype.hasOwnProperty.call(clip, "lora")) delete clip.lora;
+
+        const loraGroup = document.createElement("div");
+        loraGroup.style.display = "flex";
+        loraGroup.style.flexDirection = "column";
+        loraGroup.style.gap = "5px";
+        loraGroup.style.marginTop = "6px";
+
+        // Autogrow pattern: every selected LoRA gets its own row, followed by
+        // exactly one empty selector. Choosing that empty selector appends a new
+        // LoRA row; choosing (no LoRA) on an existing row removes it and compacts
+        // the stack automatically.
+        const loraRows = [...clip.loras, normalizeClipLora()];
+        for (let loraIndex = 0; loraIndex < loraRows.length; loraIndex++) {
+            const cfg = loraRows[loraIndex];
+            const isAddRow = loraIndex >= clip.loras.length;
+            const selectedLora = String(cfg.name || "");
+
+            const loraRow = document.createElement("div");
+            loraRow.style.display = "grid";
+            loraRow.style.gridTemplateColumns = "minmax(0, 1fr) 70px";
+            loraRow.style.gap = "6px";
+            loraRow.style.alignItems = "end";
+
+            const loraBox = document.createElement("div");
+            loraBox.appendChild(makeFieldLabel(isAddRow ? "Add LoRA" : `LoRA ${loraIndex + 1}`));
+            const loraSelect = document.createElement("select");
+            loraSelect.style.width = "100%";
+            loraSelect.style.minWidth = "0";
+            loraSelect.style.boxSizing = "border-box";
+            loraSelect.style.background = "rgba(0,0,0,.25)";
+            loraSelect.style.border = "1px solid rgba(255,255,255,.15)";
+            loraSelect.style.color = "inherit";
+            loraSelect.style.borderRadius = "5px";
+            loraSelect.style.padding = "4px 5px";
+            loraSelect.title = runtime.loraListError
+                ? `Could not refresh ComfyUI LoRAs: ${runtime.loraListError}`
+                : "Optional model-only LoRA stack applied only to this clip. Selecting a LoRA automatically creates another empty selector.";
+
+            const noneOption = document.createElement("option");
+            noneOption.value = "";
+            noneOption.textContent = runtime.loraListLoading
+                ? "Loading LoRAs…"
+                : (isAddRow ? "(no additional LoRA)" : "(remove LoRA)");
+            loraSelect.appendChild(noneOption);
+
+            const usedByOtherRows = new Set(
+                clip.loras
+                    .filter((_, index) => index !== loraIndex)
+                    .map((entry) => String(entry?.name || ""))
+                    .filter(Boolean)
+            );
+            const loraNames = Array.isArray(runtime.loraNames) ? [...runtime.loraNames] : [];
+            if (selectedLora && !loraNames.includes(selectedLora)) {
+                loraNames.unshift(selectedLora);
+            }
+            for (const loraName of loraNames) {
+                if (usedByOtherRows.has(loraName) && loraName !== selectedLora) continue;
+                const option = document.createElement("option");
+                option.value = loraName;
+                option.textContent = loraName === selectedLora && !runtime.loraNames?.includes?.(loraName)
+                    ? `${loraName} (missing)`
+                    : loraName;
+                loraSelect.appendChild(option);
+            }
+            loraSelect.value = selectedLora;
+            loraSelect.addEventListener("change", () => {
+                const name = String(loraSelect.value || "").trim();
+                if (isAddRow) {
+                    if (name) clip.loras.push(normalizeClipLora({ name, strength: 1.0 }));
+                } else if (!name) {
+                    clip.loras.splice(loraIndex, 1);
+                } else {
+                    clip.loras[loraIndex] = normalizeClipLora({
+                        ...clip.loras[loraIndex],
+                        name,
+                    });
+                }
+                updateHidden(node, runtime);
+                render(node, runtime);
+            });
+            loraBox.appendChild(loraSelect);
+
+            const loraStrengthBox = document.createElement("div");
+            loraStrengthBox.appendChild(makeFieldLabel("Strength"));
+            const loraStrength = makeNumberInput(cfg.strength, -100, 100, 0.01);
+            loraStrength.title = "Per-clip LoRA strength applied to the H3 diffusion model.";
+            loraStrength.disabled = isAddRow || !selectedLora;
+            loraStrength.style.opacity = selectedLora && !isAddRow ? "1" : ".45";
+            loraStrength.addEventListener("change", () => {
+                if (isAddRow || !clip.loras[loraIndex]) return;
+                clip.loras[loraIndex].strength = Math.max(-100, Math.min(100, Number(loraStrength.value || 0)));
+                updateHidden(node, runtime);
+            });
+            loraStrengthBox.appendChild(loraStrength);
+
+            loraRow.append(loraBox, loraStrengthBox);
+            loraGroup.appendChild(loraRow);
+        }
+        card.appendChild(loraGroup);
+
         const row = document.createElement("div");
         row.style.display = "grid";
         row.style.gridTemplateColumns = "1fr 92px";
@@ -2764,6 +2912,10 @@ function buildUi(node) {
         // True after a live resolution change has made the on-disk cache stale.
         // The backend clears/rebuilds that cache on the next Queue.
         resolutionInvalidated: false,
+        loraNames: [],
+        loraListLoading: false,
+        loraListLoaded: false,
+        loraListError: "",
         ready: false,
     };
 
@@ -2815,6 +2967,7 @@ function buildUi(node) {
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
     render(node, runtime);
+    refreshLoraNames(node, runtime);
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {
