@@ -45,6 +45,10 @@ const PROJECT_WIDGETS = [
     "resolution_mode",
     "megapixels",
     "refs_json",
+    // Appended after refs_json to match the backend widget ordering.
+    "rtx_super_resolution",
+    "rtx_scale",
+    "rtx_quality",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -637,6 +641,41 @@ async function restoreCacheState(node, runtime) {
 
 function getWidget(node, name) {
     return node?.widgets?.find((w) => w?.name === name);
+}
+
+const RTX_WIDGET_NAMES = [
+    "rtx_scale",
+    "rtx_quality",
+];
+
+function setWidgetsDisabled(node, names, disabled) {
+    for (const name of names) {
+        const w = getWidget(node, name);
+        if (!w) continue;
+        w.disabled = disabled;
+        w.options = w.options || {};
+        w.options.disabled = disabled;
+        if (w.inputEl) w.inputEl.disabled = disabled;
+    }
+}
+
+function rtxAvailable(node) {
+    return getWidget(node, "rtx_super_resolution")?.options?.rtx_available !== false;
+}
+
+function syncRtxWidgets(node) {
+    const toggle = getWidget(node, "rtx_super_resolution");
+    const available = rtxAvailable(node);
+    // The RTX pack is a hard requirement: while it is missing the toggle must
+    // stay disabled and cannot be flipped on.
+    if (toggle) {
+        toggle.disabled = !available;
+        toggle.options = toggle.options || {};
+        toggle.options.disabled = !available;
+        if (toggle.inputEl) toggle.inputEl.disabled = !available;
+    }
+    const enabled = available && toggle?.value === true;
+    setWidgetsDisabled(node, RTX_WIDGET_NAMES, !enabled);
 }
 
 function effectiveManualResolution(width, height) {
@@ -2985,6 +3024,43 @@ function buildUi(node) {
             setWidgetValue(this, "resolution_mode", "manual");
         }
 
+        // Workflows saved while the progressive-sampler widgets existed carry a
+        // 7-entry tail after refs_json: sample_mode, schedule, upscale_method,
+        // progressive_verbose, rtx_super_resolution, rtx_scale, rtx_quality.
+        // The backend now exposes only the last three, so a positional widget
+        // restore would put schedule's string into rtx_scale and the upscale
+        // method into rtx_quality. Detect that legacy tail, drop the four
+        // removed entries from the saved array in place, and pull the RTX
+        // values back to the positions the backend now expects.
+        const refsJsonIndex = PROJECT_WIDGETS.indexOf("refs_json");
+        if (
+            savedWidgetValues &&
+            refsJsonIndex >= 0 &&
+            savedWidgetValues.length >= refsJsonIndex + 5 &&
+            (savedWidgetValues[refsJsonIndex + 1] === "standard" ||
+                savedWidgetValues[refsJsonIndex + 1] === "progressive")
+        ) {
+            const rtxEnabled = Boolean(savedWidgetValues[refsJsonIndex + 5]);
+            const rtxScale = Number(savedWidgetValues[refsJsonIndex + 6]) || 2.0;
+            const rtxQuality = String(savedWidgetValues[refsJsonIndex + 7] || "ULTRA");
+            const values = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
+            if (values) {
+                // Rewrite the tail in place so the frontend's positional
+                // restore (which runs after this hook) assigns the correct
+                // values to the three remaining RTX widgets.
+                values[refsJsonIndex + 1] = rtxEnabled;
+                values[refsJsonIndex + 2] = rtxScale;
+                values[refsJsonIndex + 3] = rtxQuality;
+                values.length = refsJsonIndex + 4;
+            }
+            setWidgetValue(this, "rtx_super_resolution", rtxEnabled);
+            setWidgetValue(this, "rtx_scale", rtxScale);
+            if (["LOW", "MEDIUM", "HIGH", "ULTRA"].includes(rtxQuality)) {
+                setWidgetValue(this, "rtx_quality", rtxQuality);
+            }
+            syncRtxWidgets(this);
+        }
+
         requestAnimationFrame(() => {
             const removedLegacyRefs = removeLegacyImageRefInputs(this);
             syncDynamicAVReferenceInputs(this);
@@ -3185,6 +3261,37 @@ app.registerExtension({
             // still migrated to Manual later in onConfigure when they do not
             // contain the v14.25+ resolution widgets.
             setWidgetValue(this, "resolution_mode", "auto_from_ref");
+
+            const node = this;
+
+            // New combo/string widgets appended for saved workflows can come up
+            // empty on fresh page loads; ComfyUI then refuses to queue until a
+            // value is chosen. Back-fill declared defaults.
+            const WIDGET_DEFAULTS = {
+                rtx_super_resolution: false,
+                rtx_scale: 2.0,
+                rtx_quality: "ULTRA",
+            };
+            for (const wname of Object.keys(WIDGET_DEFAULTS)) {
+                const w = getWidget(node, wname);
+                if (w && (w.value === undefined || w.value === null || w.value === "")) {
+                    w.value = WIDGET_DEFAULTS[wname];
+                }
+            }
+
+            // RTX super resolution: the toggle stays disabled while the
+            // comfyui_nvidia_rtx_nodes pack is unavailable, and the sub-controls
+            // only matter once the toggle is on.
+            const rtxToggle = getWidget(node, "rtx_super_resolution");
+            if (rtxToggle && !rtxToggle.__h3_rtx_bound) {
+                rtxToggle.__h3_rtx_bound = true;
+                const oldRtx = rtxToggle.callback;
+                rtxToggle.callback = function (value, canvas, wnode) {
+                    if (oldRtx) oldRtx.call(this, value, canvas, wnode);
+                    syncRtxWidgets(node);
+                };
+            }
+            syncRtxWidgets(node);
 
             const runtime = buildUi(this);
             removeLegacyImageRefInputs(this);

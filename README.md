@@ -1,4 +1,6 @@
-# ComfyUI MiniMax H3 Extender
+﻿# ComfyUI MiniMax H3 Extender
+
+> ΓÜá∩╕Å **Vibe coded** ΓÇö built with AI assistance. Expect rapid iteration, experimental changes, and the occasional rough edge. PRs and bug reports are welcome.
 
 A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous video sequences from multiple clips while preserving motion, visual continuity, and audio continuity between generations.
 
@@ -6,7 +8,29 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
-## 🎛️ New — Per-Clip LoRAs
+## Γ£¿ New ΓÇö NVIDIA RTX Super Resolution
+
+This fork adds **RTX Video Super Resolution** on the decoded final video via [`comfyui_nvidia_rtx_nodes`](https://github.com/NVIDIA/comfyui_nvidia_rtx_nodes) (requires the NVIDIA **nvvfx** runtime / RTX GPU). It upscales decoded frames at export time ΓÇö latents, Motion Context and cache are untouched.
+
+**Requirements:** Install [`comfyui_nvidia_rtx_nodes`](https://github.com/NVIDIA/comfyui_nvidia_rtx_nodes) (and its `nvvfx` dependency) alongside this node and restart ComfyUI. Without it, the RTX toggle in the Extender UI stays disabled and queuing with RTX enabled raises a clear error.
+
+**Extender inputs (appended after `refs_json`):**
+
+- `rtx_super_resolution` (BOOLEAN, default `False`) ΓÇö enable RTX upscale on Final Decode. Disabled until the RTX pack is detected.
+- `rtx_scale` (FLOAT 1.0ΓÇô4.0, default `2.0`) ΓÇö scale factor (e.g. `2.0` doubles width/height, frame count/FPS unchanged so audio stays in sync).
+- `rtx_quality` (`LOW` / `MEDIUM` / `HIGH` / `ULTRA`, default `ULTRA`).
+
+The settings are stored in the disk cache manifest (`rtx: {enabled, scale, quality}`) as export metadata ΓÇö changing them does not invalidate latents or validation state; the next **Disk Final Decode** reads them back.
+
+**Fixes in this release:**
+
+- Audio crash `shape mismatch: value tensor of shape [800, 32] cannot be broadcast to [874, 32]` at `comfy/ldm/minimax/model.py:659` ΓÇö `patch_motion_payload.py` now rebuilds `cond_audio_latents` from keyframes + refs (was refs-only, dropping the carried 37-step motion-context audio tail) and correctly wraps foreign `extra_conds` patches.
+
+Legacy workflows saved with the (removed) progressive-sampler tail after `refs_json` are auto-migrated on load.
+
+---
+
+## ≡ƒÄ¢∩╕Å New ΓÇö Per-Clip LoRAs
 
 Each clip card can now use its own LoRA.
 
@@ -19,16 +43,16 @@ Each clip card can now use its own LoRA.
 - global LoRAs applied before the Extender still work as before
 - per-clip LoRA choices are saved with the project
 
-This makes it possible to change style, motion or behavior from one clip to another while keeping the Extender’s normal continuity workflow.
+This makes it possible to change style, motion or behavior from one clip to another while keeping the ExtenderΓÇÖs normal continuity workflow.
 
 ---
-## 🎬 New — Video & Audio References for MiniMax H3
+## ≡ƒÄ¼ New ΓÇö Video & Audio References for MiniMax H3
 
 The Extender now supports **MiniMax H3 video references** directly inside the workflow.
 
 You can now use external video frames as `<Video N>` references, combine them with image references, and optionally attach the matching video audio for motion, timing, camera behavior and lip-sync guidance.
 
-### What’s new
+### WhatΓÇÖs new
 
 - up to **3 video references**
 - up to **3 matching video-audio references**
@@ -39,7 +63,7 @@ You can now use external video frames as `<Video N>` references, combine them wi
 - optional paired `ref_video_audio_N` inputs
 - long standalone audio references are automatically sliced along the clip timeline
 - video soundtracks are cropped to the effective reference-video duration
-- reference-video inputs are automatically aligned to H3’s required `17k+5` frame structure
+- reference-video inputs are automatically aligned to H3ΓÇÖs required `17k+5` frame structure
 - external Prompt Pack and Reference Pack sockets remain at the bottom of the node
 
 ### Automatic FPS correction
@@ -60,11 +84,11 @@ Typical workflow:
 
 ~~~text
 Load Video
-   ↓
+   Γåô
 Get Video Components
-   ├── images → ref_video_1
-   ├── fps    → ref_video_fps_1
-   └── audio  → ref_video_audio_1
+   Γö£ΓöÇΓöÇ images ΓåÆ ref_video_1
+   Γö£ΓöÇΓöÇ fps    ΓåÆ ref_video_fps_1
+   ΓööΓöÇΓöÇ audio  ΓåÆ ref_video_audio_1
 ~~~
 
 ### Character replacement
@@ -84,7 +108,7 @@ For example:
 - `<Video 1>` provides the original performance, timing and camera behavior
 - `ref_video_audio_1` provides the matching audio reference
 
-This keeps the Extender’s existing internal image-reference system fully intact while adding proper H3 Ref2VA video/audio support.
+This keeps the ExtenderΓÇÖs existing internal image-reference system fully intact while adding proper H3 Ref2VA video/audio support.
 
 
 **Added support for an external prompt pack through the new MiniMax H3 Prompt Pack Bridge node.**
@@ -93,7 +117,7 @@ This keeps the Extender’s existing internal image-reference system fully intac
 
 A new node **MiniMax H3 Reference Pack Bridge** has been added.
 
-This allows external ComfyUI `IMAGE` outputs to be injected directly into the Extender’s existing internal reference slots, while keeping the current internal reference system fully intact.
+This allows external ComfyUI `IMAGE` outputs to be injected directly into the ExtenderΓÇÖs existing internal reference slots, while keeping the current internal reference system fully intact.
 
 You can now mix both approaches in the same workflow:
 
@@ -108,7 +132,7 @@ You can now mix both approaches in the same workflow:
 
 The Bridge is optional and does not replace the current reference workflow. It simply adds a flexible external entry point for advanced ComfyUI pipelines.
 
-### 🎬 Save Preview
+### ≡ƒÄ¼ Save Preview
 
 The **Final Decode / Preview** node now includes a dedicated **Save Preview** button.
 
@@ -122,9 +146,9 @@ It saves the currently assembled Extender preview exactly as shown, including:
 
 The saved MP4 can be dragged back into ComfyUI to restore the workflow.
 
-### 🎨 Real-Time Per-Clip Color Editor
+### ≡ƒÄ¿ Real-Time Per-Clip Color Editor
 
-Each generated clip now has its own **color editor**, accessible directly from the clip card with the `🎨` button.
+Each generated clip now has its own **color editor**, accessible directly from the clip card with the `≡ƒÄ¿` button.
 
 You can adjust:
 
@@ -144,9 +168,9 @@ Corrections are:
 
 Color correction is applied only to the decoded video and **does not modify Motion Context, latent data or clip validation**.
 
-A small `✓` next to the palette indicates that a clip has an active color correction.
+A small `Γ£ô` next to the palette indicates that a clip has an active color correction.
 
-### ⚡ Full Batch Integration
+### ΓÜí Full Batch Integration
 
 Full Batch correctly preserves and applies all previously configured clip corrections during final assembly.
 
@@ -158,7 +182,7 @@ You can therefore:
 4. Run Full Batch
 5. Obtain the complete sequence with all previous adjustments preserved
 
-### 💾 Save / Load Project
+### ≡ƒÆ╛ Save / Load Project
 
 Per-clip color adjustments are stored inside `.ext` projects.
 
@@ -193,7 +217,7 @@ https://github.com/user-attachments/assets/a18cc6a5-2340-474e-9d3b-b784cd41584a
 <img width="2307" height="1028" alt="image" src="https://github.com/user-attachments/assets/c1126ae8-2d4b-416c-a8c2-b839cd4c6b15" />
 
 
-<img width="2376" height="1163" alt="Capture d&#39;écran 2026-08-20 062155" src="https://github.com/user-attachments/assets/072885ca-8faa-4d58-b525-4b12d57fe75c" />
+<img width="2376" height="1163" alt="Capture d&#39;├⌐cran 2026-08-20 062155" src="https://github.com/user-attachments/assets/072885ca-8faa-4d58-b525-4b12d57fe75c" />
 
 
 <img width="1860" height="691" alt="image" src="https://github.com/user-attachments/assets/9f2354a4-d8b7-485d-904f-76481e8fba15" />
@@ -205,7 +229,7 @@ https://github.com/user-attachments/assets/a18cc6a5-2340-474e-9d3b-b784cd41584a
 <img width="2091" height="948" alt="image" src="https://github.com/user-attachments/assets/905dcd01-09f8-4dfe-9d20-2f949637f938" />
 
 
-<img width="2557" height="1212" alt="Capture d&#39;écran 2026-08-15 083401" src="https://github.com/user-attachments/assets/99ca1fc4-d8b9-4662-a869-1fa06e5e58e1" />
+<img width="2557" height="1212" alt="Capture d&#39;├⌐cran 2026-08-15 083401" src="https://github.com/user-attachments/assets/99ca1fc4-d8b9-4662-a869-1fa06e5e58e1" />
 
 ## Keeping References Consistent Across Clips
 
@@ -286,16 +310,16 @@ When a clip is validated:
 
 A typical workflow is:
 
-    Clip 1 → Generate
-    Clip 1 → Validate
+    Clip 1 ΓåÆ Generate
+    Clip 1 ΓåÆ Validate
 
-    Clip 2 → Generate
-    Clip 2 → Retry if needed
-    Clip 2 → Validate
+    Clip 2 ΓåÆ Generate
+    Clip 2 ΓåÆ Retry if needed
+    Clip 2 ΓåÆ Validate
 
-    Clip 3 → Generate
-    Clip 3 → Retry if needed
-    Clip 3 → Validate
+    Clip 3 ΓåÆ Generate
+    Clip 3 ΓåÆ Retry if needed
+    Clip 3 ΓåÆ Validate
 
 This makes it possible to build a sequence one clip at a time while preserving all previously accepted generations.
 
@@ -303,10 +327,10 @@ Validation always forms a continuous chain from the beginning of the sequence.
 
 For example:
 
-    Clip 1 ✅
-    Clip 2 ✅
-    Clip 3 ⬜
-    Clip 4 ⬜
+    Clip 1 Γ£à
+    Clip 2 Γ£à
+    Clip 3 Γ¼£
+    Clip 4 Γ¼£
 
 If an earlier clip is unvalidated, every clip after it is automatically unvalidated as well, because each continuation depends on the previous generated clip.
 
@@ -327,7 +351,7 @@ In **clip_by_clip** mode, the Extender works on the first unvalidated clip in th
 
 The intended workflow is therefore:
 
-    Generate → Preview → Retry if needed → Validate → Continue
+    Generate ΓåÆ Preview ΓåÆ Retry if needed ΓåÆ Validate ΓåÆ Continue
 
 This allows long MiniMax H3 sequences to be created progressively without repeatedly regenerating clips that are already approved.
 
@@ -351,11 +375,30 @@ Open a terminal in:
 
 Then run:
 
-    git clone https://github.com/tritant/ComfyUI_MiniMax_H3_Extender.git
+    git clone https://github.com/Crisr/ComfyUI_MiniMax_H3_Extender.git
 
 Restart ComfyUI after installation.
 
-### ℹ️ About the old Disk Join nodes
+### Fork maintenance ΓÇö upstream
+
+This is a fork of **[tritant/ComfyUI_MiniMax_H3_Extender](https://github.com/tritant/ComfyUI_MiniMax_H3_Extender)**.
+
+Git remotes for this clone:
+
+- `origin` ΓåÆ `https://github.com/Crisr/ComfyUI_MiniMax_H3_Extender.git` (this fork ΓÇö what ComfyUI Manager checks for updates)
+- `upstream` ΓåÆ `https://github.com/tritant/ComfyUI_MiniMax_H3_Extender.git` (original ΓÇö pull merges from here)
+
+To merge upstream changes:
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+# resolve conflicts, then
+git push origin main
+```
+
+### Γä╣∩╕Å About the old Disk Join nodes
 
 The old low-level **Motion Context Disk Join** workflow is now considered **deprecated** and is no longer actively maintained.
 
