@@ -358,9 +358,28 @@ Open a terminal in:
 
 Then run:
 
-    git clone https://github.com/tritant/ComfyUI_MiniMax_H3_Extender.git
+    git clone https://github.com/Crisr/ComfyUI_MiniMax_H3_Extender.git
 
 Restart ComfyUI after installation.
+
+### Fork maintenance — upstream
+
+This is a fork of **[tritant/ComfyUI_MiniMax_H3_Extender](https://github.com/tritant/ComfyUI_MiniMax_H3_Extender)**.
+
+Git remotes for this clone:
+
+- `origin` → `https://github.com/Crisr/ComfyUI_MiniMax_H3_Extender.git` (this fork — what ComfyUI Manager checks for updates)
+- `upstream` → `https://github.com/tritant/ComfyUI_MiniMax_H3_Extender.git` (original — pull merges from here)
+
+To merge upstream changes:
+
+```bash
+git fetch upstream
+git checkout main
+git merge upstream/main
+# resolve conflicts, then
+git push origin main
+```
 
 ### ℹ️ About the old Disk Join nodes
 
