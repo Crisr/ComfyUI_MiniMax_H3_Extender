@@ -5,6 +5,28 @@ A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous v
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
 
 ---
+
+## ✨ New — NVIDIA RTX Super Resolution
+
+This fork adds **RTX Video Super Resolution** on the decoded final video via [`comfyui_nvidia_rtx_nodes`](https://github.com/NVIDIA/comfyui_nvidia_rtx_nodes) (requires the NVIDIA **nvvfx** runtime / RTX GPU). It upscales decoded frames at export time — latents, Motion Context and cache are untouched.
+
+**Requirements:** Install [`comfyui_nvidia_rtx_nodes`](https://github.com/NVIDIA/comfyui_nvidia_rtx_nodes) (and its `nvvfx` dependency) alongside this node and restart ComfyUI. Without it, the RTX toggle in the Extender UI stays disabled and queuing with RTX enabled raises a clear error.
+
+**Extender inputs (appended after `refs_json`):**
+
+- `rtx_super_resolution` (BOOLEAN, default `False`) — enable RTX upscale on Final Decode. Disabled until the RTX pack is detected.
+- `rtx_scale` (FLOAT 1.0–4.0, default `2.0`) — scale factor (e.g. `2.0` doubles width/height, frame count/FPS unchanged so audio stays in sync).
+- `rtx_quality` (`LOW` / `MEDIUM` / `HIGH` / `ULTRA`, default `ULTRA`).
+
+The settings are stored in the disk cache manifest (`rtx: {enabled, scale, quality}`) as export metadata — changing them does not invalidate latents or validation state; the next **Disk Final Decode** reads them back.
+
+**Fixes in this release:**
+
+- Audio crash `shape mismatch: value tensor of shape [800, 32] cannot be broadcast to [874, 32]` at `comfy/ldm/minimax/model.py:659` — `patch_motion_payload.py` now rebuilds `cond_audio_latents` from keyframes + refs (was refs-only, dropping the carried 37-step motion-context audio tail) and correctly wraps foreign `extra_conds` patches.
+
+Legacy workflows saved with the (removed) progressive-sampler tail after `refs_json` are auto-migrated on load.
+
+---
 ## 🎬 New — Video & Audio References for MiniMax H3
 
 The Extender now supports **MiniMax H3 video references** directly inside the workflow.

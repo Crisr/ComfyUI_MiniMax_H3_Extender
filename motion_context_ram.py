@@ -58,23 +58,33 @@ def _native_guide_api_supported():
 
 
 def _ensure_patches():
-    if _native_guide_api_supported():
-        return "native"
+    native = _native_guide_api_supported()
 
-    if not _layout_patch_applied():
+    if not native and not _layout_patch_applied():
         if not _apply_layout_patch():
             raise RuntimeError(
                 "MiniMax H3 Motion Context RAM: could not enable interior H3 "
                 "keyframe anchors. Check the ComfyUI log for a conflicting H3 "
                 "custom-node patch."
             )
+
+    # Native ComfyUI merges keyframes and refs correctly on its own, but
+    # other packs monkey-patch MiniMaxH3.extra_conds with stale wrappers
+    # that rebuild the audio list from refs alone, dropping the carried
+    # keyframe audio latents. The payload patch repairs that on any build.
     if not _payload_patch_applied():
         if not _apply_payload_patch():
-            raise RuntimeError(
-                "MiniMax H3 Motion Context RAM: could not enable Ref2VA "
-                "keyframe/reference coexistence. Check the ComfyUI log."
+            if not native:
+                raise RuntimeError(
+                    "MiniMax H3 Motion Context RAM: could not enable Ref2VA "
+                    "keyframe/reference coexistence. Check the ComfyUI log."
+                )
+            _LOG.warning(
+                "MiniMax H3 Motion Context RAM: payload coexistence patch "
+                "not applied; a foreign owner controls MiniMaxH3.extra_conds."
             )
-    return "compat"
+
+    return "native" if native else "compat"
 
 
 def _streams_from_latent(latent, name):
