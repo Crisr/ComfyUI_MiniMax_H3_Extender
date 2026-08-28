@@ -1,5 +1,7 @@
 # ComfyUI MiniMax H3 Extender
 
+> ⚠️ **Vibe coded** — built with AI assistance. Expect rapid iteration, experimental changes, and the occasional rough edge. PRs and bug reports are welcome.
+
 A ComfyUI custom node for **MiniMax H3** designed to generate long, continuous video sequences from multiple clips while preserving motion, visual continuity, and audio continuity between generations.
 
 The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-clip generation, image references, audio references, and final video/audio decoding** into a much simpler workflow.
