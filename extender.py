@@ -60,6 +60,7 @@ from .motion_context_disk import (
     _cache_size_mb,
     _load_manifest_from_paths,
     _manifest_for_first,
+    _rtx_super_resolution_class,
     _truncate_chain,
 )
 
@@ -81,6 +82,8 @@ DEFAULT_DURATION = 10.0
 DEFAULT_MEGAPIXELS = 0.40
 MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
+
+RTX_QUALITY_OPTIONS = ["LOW", "MEDIUM", "HIGH", "ULTRA"]
 
 PROJECT_FORMAT = "MiniMax H3 Extender Project"
 PROJECT_FORMAT_VERSION = 2
@@ -2309,6 +2312,31 @@ class MiniMaxH3Extender:
                     "multiline": True,
                 },
             ),
+            # NVIDIA RTX super resolution on the decoded final video. Append-only
+            # like the widgets above: new inputs must stay at the end so old
+            # workflow widget arrays keep their positional mapping.
+            "rtx_super_resolution": (
+                "BOOLEAN",
+                {
+                    "default": False,
+                    "rtx_available": _rtx_super_resolution_class() is not None,
+                    "tooltip": "Upscale the decoded FINAL video with the NVIDIA RTX Super Resolution node (comfyui_nvidia_rtx_nodes + nvvfx). It runs on the decoded frames, not on the latent. Requires that node pack to be installed and loaded at ComfyUI start; the toggle is disabled until it is available.",
+                },
+            ),
+            "rtx_scale": (
+                "FLOAT",
+                {
+                    "default": 2.0, "min": 1.0, "max": 4.0, "step": 0.01,
+                    "tooltip": "RTX Super Resolution scale factor (e.g. 2.0 doubles the output size).",
+                },
+            ),
+            "rtx_quality": (
+                RTX_QUALITY_OPTIONS,
+                {
+                    "default": "ULTRA",
+                    "tooltip": "RTX Video Super Resolution quality level; higher is slower and sharper.",
+                },
+            ),
         }
 
         # Audio and video references remain external sockets. Image refs continue
@@ -2462,6 +2490,9 @@ class MiniMaxH3Extender:
         resolution_mode="auto_from_ref",
         megapixels=DEFAULT_MEGAPIXELS,
         refs_json=None,
+        rtx_super_resolution=False,
+        rtx_scale=2.0,
+        rtx_quality="ULTRA",
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -2813,8 +2844,9 @@ class MiniMaxH3Extender:
             raise RuntimeError("MiniMax H3 Extender: sequence produced no cache handle.")
 
         final_manifest = _load_manifest_from_paths(data_path, manifest_path)
-        # Color grading is montage metadata only. Keep it attached to each cached
-        # decoded segment without invalidating latents or validation state.
+        # Color grading and RTX export settings are montage/export metadata only.
+        # Keep them attached without invalidating latents or validation state; the
+        # Disk Final Decode reads the RTX settings back from this manifest.
         if final_manifest is not None:
             color_segments = [dict(x) for x in final_manifest.get("segments", [])]
             color_changed = False
@@ -2826,9 +2858,16 @@ class MiniMaxH3Extender:
                     desc["color_adjustment"] = wanted
                     color_segments[color_i] = desc
                     color_changed = True
-            if color_changed:
+            rtx_cfg = {
+                "enabled": bool(rtx_super_resolution),
+                "scale": float(rtx_scale),
+                "quality": str(rtx_quality),
+            }
+            if color_changed or final_manifest.get("rtx") != rtx_cfg:
                 final_manifest = dict(final_manifest)
-                final_manifest["segments"] = color_segments
+                if color_changed:
+                    final_manifest["segments"] = color_segments
+                final_manifest["rtx"] = rtx_cfg
                 final_manifest["updated_at"] = time.time()
                 _write_json_atomic(manifest_path, final_manifest)
 

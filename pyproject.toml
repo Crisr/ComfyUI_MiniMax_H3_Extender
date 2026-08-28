@@ -1,12 +1,12 @@
 [project]
 name = "ComfyUI_MiniMax_H3_Extender"
 description = "ComfyUI node for MiniMax H3 that chains multiple video clips with motion context, disk caching, dynamic image references, audio reference support, and seamless final video/audio decoding."
-version = "1.9.2"
+version = "1.10.0"
 license = { file = "LICENSE.txt" }
 
 [project.urls]
-Repository = "https://github.com/tritant/ComfyUI_MiniMax_H3_Extender"
+Repository = "https://github.com/Crisr/ComfyUI_MiniMax_H3_Extender"
 
 [tool.comfy]
-PublisherId = "tritant"
+PublisherId = "Crisr"
 DisplayName = "ComfyUI MiniMax H3 Extender"

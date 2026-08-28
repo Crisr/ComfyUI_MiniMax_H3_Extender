@@ -29,32 +29,36 @@ def _patched_extra_conds(self, **kwargs):
     if not keyframes or not refs:
         return out
 
-    if not (
-        any(MC_KEY in kf for kf in keyframes)
-        or any(MC_AUDIO_KEY in ref for ref in refs)
-    ):
-        # Completely unrelated H3 graph: preserve stock behavior exactly.
-        return out
-
     cond = out.get("minimax_payload", None)
     payload = getattr(cond, "cond", None) if cond is not None else None
     if not isinstance(payload, dict):
         _LOG.warning(
             "MiniMax H3 Motion Context RAM: could not access minimax_payload; "
-            "Ref2VA refs may overwrite carried video conditioning."
+            "Ref2VA refs may overwrite carried conditioning."
         )
         return out
 
     # Layout order is: keyframe cond rows first, then Ref2VA reference rows.
+    # New ComfyUI carries the motion-context audio tail as a keyframe
+    # audio_latent, so both lists must keep that keyframes-first order or the
+    # packed row count desyncs from PackedLayout. Rebuilding the audio list
+    # from refs alone (as older compat wrappers do) drops the carried audio.
     payload["cond_video_latents"] = (
-        [kf["latent"] for kf in keyframes if "latent" in kf]
+        [kf["latent"] for kf in keyframes if kf.get("latent") is not None]
         + [ref["latent"] for ref in refs if "latent" in ref]
     )
-    payload["cond_audio_latents"] = [
-        ref["audio_latent"]
-        for ref in refs
-        if ref.get("audio_latent") is not None
-    ]
+    payload["cond_audio_latents"] = (
+        [
+            kf["audio_latent"]
+            for kf in keyframes
+            if kf.get("audio_latent") is not None
+        ]
+        + [
+            ref["audio_latent"]
+            for ref in refs
+            if ref.get("audio_latent") is not None
+        ]
+    )
 
     frame_count = kwargs.get("minimax_frame_count", None)
     if frame_count is not None:
@@ -71,9 +75,16 @@ def _already_patched(cls):
     if fn is None:
         return None
     if getattr(fn, PATCH_MARKER, False):
-        return "same"
+        if getattr(fn, "__module__", None) == __name__:
+            return "same"
+        # Another pack installed a marker-compatible wrapper (e.g.
+        # H3-Multishot's AVBank probe). Those rebuild the audio list from
+        # refs alone and drop keyframe audio latents; wrap on top and repair.
+        return "compatible"
     if getattr(fn, "__name__", "") == "_patched_extra_conds":
-        return "other"
+        # Vendored copy of this patch from another pack; same refs-only
+        # audio gap, so wrap on top.
+        return "compatible"
     if hasattr(fn, "__wrapped__"):
         return "foreign"
     home = getattr(cls, "__module__", None)
@@ -104,20 +115,22 @@ def apply_patch():
         )
         return False
 
-    if who in ("same", "other"):
+    if who == "same":
         _applied = True
-        _LOG.info(
-            "MiniMax H3 Motion Context RAM: compatible keyframe/ref payload "
-            "patch already active; standing down."
-        )
         return True
 
     _orig_extra_conds = cls.extra_conds
     cls.extra_conds = _patched_extra_conds
     _applied = True
-    _LOG.info(
-        "MiniMax H3 Motion Context RAM: keyframe/ref coexistence enabled"
-    )
+    if who == "compatible":
+        _LOG.info(
+            "MiniMax H3 Motion Context RAM: wrapped a compatible "
+            "extra_conds patch to keep keyframe audio latents"
+        )
+    else:
+        _LOG.info(
+            "MiniMax H3 Motion Context RAM: keyframe/ref coexistence enabled"
+        )
     return True
 
 

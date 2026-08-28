@@ -298,7 +298,10 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 
         // Browsers can block autoplay after a page reload. The preview is still
         // immediately visible and ready; play() succeeds when policy allows it.
-        state.video.play().catch(() => {});
+        const autoplayWidget = getWidget(node, "autoplay");
+        if (autoplayWidget && autoplayWidget.value) {
+            state.video.play().catch(() => {});
+        }
         state.restoreLoaded = true;
 
         requestAnimationFrame(() => {
@@ -804,7 +807,11 @@ app.registerExtension({
             state.saveButton.disabled = false;
             state.video.src = mediaUrl(info) + "&t=" + Date.now();
             state.video.load();
-            state.video.play().catch(() => {});
+            
+            const autoplayWidget = getWidget(this, "autoplay");
+            if (autoplayWidget && autoplayWidget.value) {
+                state.video.play().catch(() => {});
+            }
 
             // Do not reset a node the user already enlarged.
             // Only enforce the minimum if necessary, then fit the player

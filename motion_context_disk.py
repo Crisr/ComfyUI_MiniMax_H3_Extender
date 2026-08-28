@@ -1013,6 +1013,71 @@ def _write_image_frames(proc, images, batch_frames=8):
         del part
 
 
+_RTX_SR_CLASS = None
+_RTX_SR_MOD = None
+_RTX_SR_LOADED = False
+
+
+def _rtx_super_resolution_class():
+    """Lazily load comfyui_nvidia_rtx_nodes' RTXVideoSuperResolution node.
+
+    Returns None when the pack (or its nvvfx dependency) is not installed; the
+    Extender frontend disables the RTX toggle in that case.
+    """
+    global _RTX_SR_CLASS, _RTX_SR_MOD, _RTX_SR_LOADED
+    if _RTX_SR_LOADED:
+        return _RTX_SR_CLASS
+    try:
+        import importlib.util
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "comfyui_nvidia_rtx_nodes",
+            "__init__.py",
+        )
+        spec = importlib.util.spec_from_file_location("nvidia_rtx_nodes", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _RTX_SR_CLASS = getattr(mod, "RTXVideoSuperResolution", None)
+        _RTX_SR_MOD = mod
+    except Exception as exc:
+        _LOG.warning(
+            "MiniMax H3 Extender: NVIDIA RTX super resolution unavailable (%s)", exc
+        )
+        _RTX_SR_CLASS = None
+        _RTX_SR_MOD = None
+    _RTX_SR_LOADED = True
+    return _RTX_SR_CLASS
+
+
+def _apply_rtx_super_resolution(video, rtx):
+    """Upscale decoded image frames with the NVIDIA RTX video super-res node.
+
+    Returns (upscaled, out_h, out_w). Frames are [N,H,W,C] float in [0,1]; the
+    frame count and fps are unchanged so downstream audio stays in sync.
+    """
+    cls = _rtx_super_resolution_class()
+    if cls is None:
+        raise RuntimeError(
+            "Disk Final Decode: RTX Super Resolution is enabled but the "
+            "comfyui_nvidia_rtx_nodes pack (nvvfx) is not installed. Install it "
+            "and restart ComfyUI, or disable the Extender's RTX toggle."
+        )
+    scale = float(rtx.get("scale", 2.0))
+    quality = str(rtx.get("quality", "ULTRA"))
+    try:
+        result = cls.execute(
+            video[..., :3].float(),
+            {"resize_type": _RTX_SR_MOD.UpscaleType.SCALE_BY, "scale": scale},
+            quality,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Disk Final Decode: RTX Super Resolution failed: {exc}"
+        ) from exc
+    out = result.result[0]
+    return out, int(out.shape[1]), int(out.shape[2])
+
+
 def _finish_process(proc, log_f, log_path, label):
     if proc.stdin is not None and not proc.stdin.closed:
         proc.stdin.close()
@@ -2900,6 +2965,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "crf": ("INT", {"default": 17, "min": 0, "max": 51, "step": 1}),
                 "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], {"default": "fast"}),
                 "audio_bitrate": (["128k", "192k", "256k", "320k"], {"default": "192k"}),
+                "autoplay": ("BOOLEAN", {"default": True, "tooltip": "Auto-play the video preview when generating finishes or the node is loaded."}),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
@@ -2922,6 +2988,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         crf,
         preset,
         audio_bitrate,
+        autoplay=True,
         unique_id=None,
     ):
         data_path, manifest_path, manifest = _load_manifest(cache)
@@ -2933,6 +3000,22 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
         color_timeline = _color_timeline(segments, float(fps))
+
+        rtx = manifest.get("rtx") or {}
+        rtx_on = bool(rtx.get("enabled"))
+        if rtx_on and _rtx_super_resolution_class() is None:
+            raise RuntimeError(
+                "Disk Final Decode: RTX Super Resolution is enabled on the "
+                "Extender, but the comfyui_nvidia_rtx_nodes pack (nvvfx) is not "
+                "installed. Install it and restart ComfyUI, or disable the "
+                "Extender's RTX toggle."
+            )
+        if rtx_on:
+            _LOG.info(
+                "Disk Final Decode: RTX Super Resolution enabled "
+                "(scale=%.2fx, quality=%s)",
+                float(rtx.get("scale", 2.0)), str(rtx.get("quality", "ULTRA")),
+            )
 
         ffmpeg = _find_ffmpeg()
 
@@ -3048,7 +3131,10 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     raise RuntimeError(
                         f"Disk Final Decode: VAE returned {decoded.shape[0]}, expected {expected0}."
                     )
-                h, w = int(decoded.shape[1]), int(decoded.shape[2])
+                if rtx_on:
+                    decoded, h, w = _apply_rtx_super_resolution(decoded, rtx)
+                else:
+                    h, w = int(decoded.shape[1]), int(decoded.shape[2])
                 video_proc, video_log_f = _start_video_encoder(
                     ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
                 )
@@ -3064,16 +3150,23 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     seam_shifts[i] = int(shift)
 
                     if video_proc is None:
-                        h, w = int(previous_raw.shape[1]), int(previous_raw.shape[2])
+                        if rtx_on:
+                            prev_upscaled, h, w = _apply_rtx_super_resolution(previous_raw, rtx)
+                        else:
+                            h, w = int(previous_raw.shape[1]), int(previous_raw.shape[2])
                         video_proc, video_log_f = _start_video_encoder(
                             ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
                         )
-                        # First pair supplies clip 1 exactly once.
-                        _write_image_frames(video_proc, previous_raw)
+                        # First pair supplies clip 1 exactly once. The raw
+                        # previous_raw stays untouched here: the seam correction
+                        # below still compares against the native-resolution pair.
+                        _write_image_frames(video_proc, prev_upscaled if rtx_on else previous_raw)
                         written_frames += int(previous_raw.shape[0])
                         last_frame = previous_raw[-1:].detach().cpu().clone()
 
                     current_out = _correct_current_segment(previous_raw, current_raw)
+                    if rtx_on:
+                        current_out, _, _ = _apply_rtx_super_resolution(current_out, rtx)
                     _write_image_frames(video_proc, current_out)
                     written_frames += int(current_out.shape[0])
                     last_frame = current_out[-1:].detach().cpu().clone()
