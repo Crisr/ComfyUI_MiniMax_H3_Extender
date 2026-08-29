@@ -3061,6 +3061,12 @@ function buildUi(node) {
             syncRtxWidgets(this);
         }
 
+        // onNodeCreated ran when the toggle was still at its default (off), so
+        // the scale/quality sub-widgets were disabled there. A restored workflow
+        // may carry RTX already enabled; re-sync now that configure has applied
+        // the saved widget values.
+        syncRtxWidgets(this);
+
         requestAnimationFrame(() => {
             const removedLegacyRefs = removeLegacyImageRefInputs(this);
             syncDynamicAVReferenceInputs(this);

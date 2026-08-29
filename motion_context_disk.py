@@ -2297,6 +2297,7 @@ def _sync_committed_preview(
     fps,
     ffmpeg,
     token,
+    rtx=None,
 ):
     target = max(0, int(target_count))
     segments = [dict(x) for x in manifest.get("segments", [])]
@@ -2304,6 +2305,8 @@ def _sync_committed_preview(
     committed_video_path = _decoded_preview_video_cache_path(data_path)
     current_count = int(manifest.get("preview_committed_count", 0))
     current_audio_mode = str(manifest.get("preview_audio_mode", ""))
+    rtx_sig = dict(rtx) if rtx else None
+    current_rtx = manifest.get("preview_rtx")
 
     if target <= 0:
         for p in (committed_path, committed_video_path):
@@ -2315,6 +2318,7 @@ def _sync_committed_preview(
         updated = dict(manifest)
         updated["preview_committed_count"] = 0
         updated.pop("preview_audio_mode", None)
+        updated.pop("preview_rtx", None)
         updated["build"] = BUILD
         updated["updated_at"] = time.time()
         _write_json_atomic(manifest_path, updated)
@@ -2326,6 +2330,7 @@ def _sync_committed_preview(
     if (
         current_count == target
         and current_audio_mode == PREVIEW_AUDIO_MODE
+        and current_rtx == rtx_sig
         and committed_path.exists()
         and committed_video_path.exists()
     ):
@@ -2333,6 +2338,7 @@ def _sync_committed_preview(
 
     rebuild = (
         current_audio_mode != PREVIEW_AUDIO_MODE
+        or current_rtx != rtx_sig
         or current_count <= 0
         or current_count > target
         or not committed_video_path.exists()
@@ -2356,7 +2362,10 @@ def _sync_committed_preview(
             desc = segments[i]
             segment_tmp = root / f"_{token}_commit_{i:04d}.mp4"
             blob = desc.get("decoded_mp4_blob")
-            if blob is not None:
+            # RTX re-scales every frame, so a cached native-resolution blob
+            # cannot be stream-copied into an RTX preview. Re-render from the
+            # latent cache instead and upscale before encoding.
+            if blob is not None and rtx is None:
                 _copy_blob_to_file(data_path, blob, segment_tmp)
             else:
                 # Full Batch does not need to keep duplicate per-clip decoded
@@ -2374,6 +2383,8 @@ def _sync_committed_preview(
                     i,
                     vae,
                 )
+                if rtx is not None:
+                    video, _, _ = _apply_rtx_super_resolution(video, rtx)
                 _encode_corrected_segment_video_mp4(
                     ffmpeg,
                     video,
@@ -2433,6 +2444,10 @@ def _sync_committed_preview(
     updated = dict(manifest)
     updated["preview_committed_count"] = target
     updated["preview_audio_mode"] = PREVIEW_AUDIO_MODE
+    if rtx_sig is not None:
+        updated["preview_rtx"] = rtx_sig
+    else:
+        updated.pop("preview_rtx", None)
     updated["build"] = BUILD
     updated["updated_at"] = time.time()
     _write_json_atomic(manifest_path, updated)
@@ -2451,6 +2466,7 @@ def _export_live_candidate_preview(
     ffmpeg,
     unique_id,
     progress=None,
+    rtx=None,
 ):
     segments = [dict(x) for x in segments]
     if not segments:
@@ -2479,6 +2495,7 @@ def _export_live_candidate_preview(
         fps,
         ffmpeg,
         token,
+        rtx=rtx,
     )
     segments = [dict(x) for x in manifest.get("segments", [])]
 
@@ -2535,6 +2552,8 @@ def _export_live_candidate_preview(
         fps,
         progress=progress,
     )
+    if rtx is not None:
+        current_video, _, _ = _apply_rtx_super_resolution(current_video, rtx)
 
     candidate_mp4 = root / f"_{token}_candidate.mp4"
 
@@ -3052,6 +3071,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 ffmpeg=ffmpeg,
                 unique_id=unique_id,
                 progress=progress,
+                rtx=rtx if rtx_on else None,
             )
             progress.advance()  # preview encode/cache/concat completed
 
