@@ -737,11 +737,12 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
     //   ref_video_3 / fps_3 / video_audio_3
     //   ref_pack / prompt_pack
     //   sigmas
-    //   continue_existing_video (v2.9.0 append-only socket; always last)
+    //   continue_existing_video (v2.9.0 append-only socket)
+    //   color_match_image (v3.0.12 append-only socket; always last)
     if (!node?.inputs?.length) return false;
 
     const packOrder = ["ref_pack", "prompt_pack"];
-    const trailingOrder = ["sigmas", "continue_existing_video"];
+    const trailingOrder = ["sigmas", "continue_existing_video", "color_match_image"];
     const dynamicNames = new Set([...packOrder, ...trailingOrder]);
     for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
         dynamicNames.add(`ref_audio_${i}`);
@@ -1994,6 +1995,40 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
             .lg-node-widget:has([name="height"]) {
             display: none !important;
         }
+
+        /* Image Color Match is inert until an IMAGE is wired into the
+           color_match_image pin: the space/factor rows stay hidden without a
+           reference image. "Process Clip 0" additionally needs a Clip 0 video. */
+        [data-node-id]:has([data-h3-hide-color-match-widgets="1"])
+            .lg-node-widget:has(button[data-testid="widget-select-default-trigger"][aria-label="color_match_space"]),
+        [data-node-id]:has([data-h3-hide-color-match-widgets="1"])
+            .lg-node-widget:has([aria-label="color_match_space"]),
+        [data-node-id]:has([data-h3-hide-color-match-widgets="1"])
+            .lg-node-widget:has([name="color_match_space"]),
+        [data-node-id]:has([data-h3-hide-color-match-widgets="1"])
+            .lg-node-widget:has([aria-label="color_match_factor"]),
+        [data-node-id]:has([data-h3-hide-color-match-widgets="1"])
+            .lg-node-widget:has([name="color_match_factor"]) {
+            display: none !important;
+        }
+
+        [data-node-id]:has([data-h3-hide-color-match-clip0="1"])
+            .lg-node-widget:has([aria-label="color_match_process_clip0"]),
+        [data-node-id]:has([data-h3-hide-color-match-clip0="1"])
+            .lg-node-widget:has([name="color_match_process_clip0"]) {
+            display: none !important;
+        }
+
+        /* The three Image Color Match rows are relocated to the top of the
+           widget grid, directly under the color_match_image pin, by
+           syncColorMatchRowPlacement(). The indent marks them as belonging to
+           that pin. A row's second child is the control cell spanning the two
+           control columns; the first child is the empty socket column. */
+        [data-node-id] .lg-node-widget[data-widget-name="color_match_space"] > div:nth-child(2),
+        [data-node-id] .lg-node-widget[data-widget-name="color_match_factor"] > div:nth-child(2),
+        [data-node-id] .lg-node-widget[data-widget-name="color_match_process_clip0"] > div:nth-child(2) {
+            margin-left: 14px;
+        }
     `;
     document.head.appendChild(style);
 })();
@@ -2109,9 +2144,20 @@ function syncModeSpecificNativeWidgets(node, runtime) {
     // CSS above then removes exactly the two native context rows for this node.
     // Legacy keeps using setNativeWidgetVisibility() below unchanged.
     const sourceLocked = Boolean(activeContinueVideoDescriptor(runtime));
+
+    // Image Color Match stays inert until an IMAGE is actually wired into the
+    // color_match_image pin, so the space/factor rows only appear once a
+    // reference image exists. "Process Clip 0" additionally needs a Clip 0
+    // continuation source, otherwise there is nothing extra to match.
+    const colorMatchEntry = findInputEntry(node, "color_match_image");
+    const colorMatchReady = Boolean(colorMatchEntry && inputConnected(colorMatchEntry.input));
+    const clip0MatchReady = colorMatchReady && sourceLocked;
+
     if (runtime?.root) {
         runtime.root.dataset.h3HideContextWidgets = causalRef2va ? "0" : "1";
         runtime.root.dataset.h3HideResolutionWidgets = sourceLocked ? "1" : "0";
+        runtime.root.dataset.h3HideColorMatchWidgets = colorMatchReady ? "0" : "1";
+        runtime.root.dataset.h3HideColorMatchClip0 = clip0MatchReady ? "0" : "1";
     }
 
     setNativeWidgetVisibility(node, runtime?.contextLengthWidget, causalRef2va);
@@ -2119,6 +2165,157 @@ function syncModeSpecificNativeWidgets(node, runtime) {
     for (const name of ["resolution_mode", "megapixels", "width", "height"]) {
         setNativeWidgetVisibility(node, getWidget(node, name), !sourceLocked);
     }
+    for (const name of ["color_match_space", "color_match_factor"]) {
+        setNativeWidgetVisibility(node, getWidget(node, name), colorMatchReady);
+    }
+    setNativeWidgetVisibility(node, getWidget(node, "color_match_process_clip0"), clip0MatchReady);
+
+    // Re-assert a valid value whether or not the pin is wired: a workflow saved
+    // before this feature arrives with the appended widgets unset.
+    seedColorMatchWidgets(node);
+
+    if (colorMatchReady) {
+        // The three options belong to the pin above them: keep their rows at the
+        // top of the widget grid, and mirror the seeded value into the Vue-side
+        // store. That store is what the rows display, and a workflow saved
+        // before this feature registered no value for these widgets, which
+        // renders the space row empty instead of LAB.
+        syncColorMatchRowPlacement(node, runtime);
+        publishColorMatchWidgetValues(node, runtime);
+    }
+}
+
+// Image Color Match options. The list order is the visual order, and it must
+// match the widget order appended in the Python INPUT_TYPES.
+const COLOR_MATCH_WIDGET_NAMES = ["color_match_space", "color_match_factor", "color_match_process_clip0"];
+const COLOR_MATCH_SPACE_VALUES = ["LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ"];
+const COLOR_MATCH_FALLBACK_FACTOR = 1.0;
+
+function normalizeColorMatchSpace(value) {
+    const space = String(value ?? "");
+    return COLOR_MATCH_SPACE_VALUES.includes(space) ? space : "LAB";
+}
+
+function normalizeColorMatchFactor(value) {
+    const factor = Number(value);
+    if (!Number.isFinite(factor)) return COLOR_MATCH_FALLBACK_FACTOR;
+    return Math.min(1.0, Math.max(0.0, factor));
+}
+
+function colorMatchWidgetValue(node, name) {
+    const widget = getWidget(node, name);
+    if (!widget) return undefined;
+    if (name === "color_match_space") return normalizeColorMatchSpace(widget.value);
+    if (name === "color_match_factor") return normalizeColorMatchFactor(widget.value);
+    return boolValue(widget.value, false);
+}
+
+function seedColorMatchWidgets(node) {
+    // A workflow saved before this feature has a shorter positional
+    // widgets_values array, so the appended widgets arrive with no value.
+    for (const name of COLOR_MATCH_WIDGET_NAMES) {
+        const value = colorMatchWidgetValue(node, name);
+        if (value === undefined) continue;
+        if (getWidget(node, name)?.value === value) continue;
+        setWidgetValue(node, name, value);
+    }
+}
+
+// Nodes 2.0 renders each native widget as a row inside an explicit-row CSS grid
+// ([data-testid="node-widgets"]). The grid's children are one section div per
+// widget, auto-placed in DOM order, so moving a section to the front of the grid
+// moves its row to the top of the widget area, i.e. directly under the last
+// input slot row (the color_match_image pin). Legacy LiteGraph rendering has no
+// such DOM, so this is a silent no-op there.
+function syncColorMatchRowPlacement(node, runtime) {
+    const grid = runtime?.root?.closest?.('[data-testid="node-widgets"]');
+    if (!grid) return;
+    const sections = [];
+    for (const name of COLOR_MATCH_WIDGET_NAMES) {
+        const row = grid.querySelector(`.lg-node-widget[data-widget-name="${name}"]`);
+        const section = row?.parentElement;
+        // Each of these names is dot-free, so the grid renders it as its own
+        // single-row section. Leave any other shape to the frontend.
+        if (section && section.parentElement === grid && section.children.length === 1) {
+            sections.push(section);
+        }
+    }
+    if (!sections.length) return;
+    const head = Array.from(grid.children).slice(0, sections.length);
+    if (head.length === sections.length && head.every((element, index) => element === sections[index])) {
+        return;
+    }
+    // Insert right to left so the visual order stays space, factor, clip 0.
+    for (let index = sections.length - 1; index >= 0; index -= 1) {
+        grid.insertBefore(sections[index], grid.firstElementChild);
+    }
+}
+
+function widgetValueStoreFrom(vueApp) {
+    try {
+        const provides = vueApp?._context?.provides;
+        if (!provides) return null;
+        const candidates = Object.values(provides);
+        for (const symbol of Object.getOwnPropertySymbols(provides)) {
+            candidates.push(provides[symbol]);
+        }
+        for (const candidate of candidates) {
+            const registry = candidate?._s;
+            if (!registry || typeof registry.get !== "function") continue;
+            const store = registry.get("widgetValue");
+            if (store && typeof store.setValue === "function") return store;
+        }
+    } catch (error) {
+        return null;
+    }
+    return null;
+}
+
+function vueWidgetValueStore() {
+    const containers = [
+        document.getElementById("graph-canvas"),
+        document.getElementById("app"),
+        document.body,
+    ];
+    for (const container of containers) {
+        const store = widgetValueStoreFrom(container?.__vue_app__);
+        if (store) return store;
+    }
+    return null;
+}
+
+// Nodes 2.0 renders the native rows from its own Vue-side widget value store,
+// which is the display source of truth: assigning node.widgets[].value does not
+// refresh a row. The frontend exposes no custom-node API for that store, so the
+// lookup is reflective and fully guarded. Every failure is a silent no-op and
+// the row keeps whatever value the store already had.
+function publishColorMatchWidgetValues(node, runtime) {
+    if (!runtime) return false;
+    if (!runtime.colorMatchValueStore) {
+        runtime.colorMatchValueStore = vueWidgetValueStore();
+    }
+    const store = runtime.colorMatchValueStore;
+    if (!store) return false;
+    let touched = false;
+    try {
+        const graphId = globalThis.app?.rootGraph?.id ?? node?.graph?.rootGraph?.id;
+        if (graphId === undefined || graphId === null) return false;
+        const ids = store.getNodeWidgetIds(String(graphId), String(node.id)) || [];
+        for (const name of COLOR_MATCH_WIDGET_NAMES) {
+            const value = colorMatchWidgetValue(node, name);
+            if (value === undefined) continue;
+            for (const id of ids) {
+                const state = store.getWidget(id);
+                if (state?.name !== name) continue;
+                // setValue is a no-op when the store already holds the value.
+                store.setValue(id, value);
+                touched = true;
+            }
+        }
+    } catch (error) {
+        return false;
+    }
+    return touched;
 }
 
 function domWidgetRenderMode(element) {
@@ -7060,6 +7257,12 @@ function buildUi(node) {
     if (getWidget(node, "refine_steps")) hideNativeWidget(node, refineStepsWidget);
     if (getWidget(node, "refine_denoise")) hideNativeWidget(node, refineDenoiseWidget);
 
+    // The color match widgets are appended after every legacy widget, so a
+    // workflow saved before this feature arrives without a value for them and
+    // the space row would render empty instead of LAB. Seed the defaults here,
+    // at node construction; the mode sync then pushes them into the Vue store.
+    seedColorMatchWidgets(node);
+
     const state = parseState(jsonWidget.value);
     state.refine_enabled = boolValue(refineEnabledWidget.value, false);
     // Initial node construction can happen before a saved workflow has been
@@ -7075,6 +7278,10 @@ function buildUi(node) {
 
     const root = document.createElement("div");
     root.dataset.h3ExtenderRoot = "1";
+    // The Image Color Match rows start hidden: syncModeSpecificNativeWidgets()
+    // publishes the real state as soon as the color_match_image pin exists.
+    root.dataset.h3HideColorMatchWidgets = "1";
+    root.dataset.h3HideColorMatchClip0 = "1";
     root.style.width = "100%";
     root.style.minWidth = "0";
     const initialUiMinHeight = uiMinHeightForState(state);
@@ -8014,7 +8221,12 @@ app.registerExtension({
             deferDynamicAVReferenceSync(this);
             const runtime = this.__h3Extender;
             if (runtime) {
-                setTimeout(() => refreshContinueVideoSocketState(this, runtime), 0);
+                setTimeout(() => {
+                    refreshContinueVideoSocketState(this, runtime);
+                    // Wiring/unwiring the color_match_image or Clip 0 socket
+                    // changes which Image Color Match rows are relevant.
+                    syncModeSpecificNativeWidgets(this, runtime);
+                }, 0);
             }
             return result;
         };

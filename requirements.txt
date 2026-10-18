@@ -1,1 +1,5 @@
 imageio-ffmpeg
+
+# Image Color Match needs kornia for the non-RGB color spaces (LAB, YCbCr,
+# LUV, YUV, XYZ). ComfyUI already ships kornia, so it is not pinned here.
+# The "RGB" color space works without kornia.

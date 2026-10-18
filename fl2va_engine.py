@@ -636,6 +636,7 @@ def _ensure_plan_video_cache(
     encode_preset="ultrafast",
     final_export_profile=None,
     final_color_adjustment=None,
+    final_color_match=None,
     final_handoff_enabled=False,
     require_continuity=True,
 ):
@@ -643,6 +644,8 @@ def _ensure_plan_video_cache(
 
     When either cache is missing/dirty, the latent is VideoVAE-decoded once and
     the same decoded RGB tensor feeds every required encode before being freed.
+    The Image Color Match spec is baked into the exact-final encode only; the
+    rolling plan preview stays neutral.
     """
     from . import motion_context_disk as d
     clip_id = str(desc.get("clip_id") or f"clip_{int(desc.get('index', 0)) + 1}")
@@ -670,6 +673,9 @@ def _ensure_plan_video_cache(
         if final_color_adjustment is not None
         else desc.get("color_adjustment")
     )
+    match_spec = d._normalize_color_match(
+        final_color_match if final_color_match is not None else desc.get("color_match")
+    )
     final_path = None
     final_ready = profile is None
     visible_frames = None
@@ -679,7 +685,8 @@ def _ensure_plan_video_cache(
         )
         final_path = _plan_final_video_cache_path(data_path, clip_id, profile)
         final_ready = d._final_segment_cache_meta_matches(
-            desc, profile, adjustment, final_path, visible_frames=visible_frames
+            desc, profile, adjustment, final_path, visible_frames=visible_frames,
+            color_match=match_spec,
         )
 
     if video_ready and continuity_ok and final_ready:
@@ -748,7 +755,8 @@ def _ensure_plan_video_cache(
             # Recheck against descriptor metadata. A color edit or changed visible
             # handoff marks this plan only as requiring a fresh final encode.
             if not d._final_segment_cache_meta_matches(
-                desc, profile, adjustment, final_path, visible_frames=visible_frames
+                desc, profile, adjustment, final_path, visible_frames=visible_frames,
+                color_match=match_spec,
             ):
                 final_temp = final_path.with_name(
                     final_path.stem + f".tmp_{os.urandom(4).hex()}" + final_path.suffix
@@ -762,6 +770,7 @@ def _ensure_plan_video_cache(
                         f"fl2va_final_{clip_id}_{os.urandom(3).hex()}",
                         profile,
                         adjustment,
+                        match_spec,
                     )
                     os.replace(final_temp, final_path)
                 finally:
@@ -784,7 +793,8 @@ def _ensure_plan_video_cache(
 
 
 def _tag_fl2va_final_segment_cache(
-    manifest_path, manifest, clip_id, export_profile, color_adjustment, visible_frames
+    manifest_path, manifest, clip_id, export_profile, color_adjustment, visible_frames,
+    color_match=None,
 ):
     from . import motion_context_disk as d
     segments = [dict(x) for x in manifest.get("segments", [])]
@@ -797,9 +807,11 @@ def _tag_fl2va_final_segment_cache(
         item["final_video_cache_version"] = int(d.FULL_BATCH_FINAL_CACHE_VERSION)
         item["final_video_profile_signature"] = d._full_batch_export_profile_signature(export_profile)
         item["final_video_color_signature"] = d._color_adjustment_signature(color_adjustment)
+        item["final_video_match_signature"] = d._color_match_signature(color_match)
         item["final_video_codec"] = d.normalize_full_batch_export_profile(export_profile)["codec"]
         item["final_video_visible_frames"] = int(visible_frames)
         item["color_adjustment"] = d._normalize_color_adjustment(color_adjustment)
+        item["color_match"] = d._normalize_color_match(color_match)
         item.pop("final_video_dirty", None)
         segments[idx] = item
         found = True
@@ -1021,6 +1033,7 @@ def cache_full_batch_fl2va_plan(
     audio_vae=None,
     export_profile=None,
     color_adjustment=None,
+    color_match=None,
     handoff_enabled=False,
 ):
     """Secure one FL2VA Full-Batch plan as preview + exact-final caches."""
@@ -1038,6 +1051,9 @@ def cache_full_batch_fl2va_plan(
     adjustment = d._normalize_color_adjustment(
         color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
     )
+    match_spec = d._normalize_color_match(
+        color_match if color_match is not None else desc.get("color_match")
+    )
     profile = (
         d.normalize_full_batch_export_profile(export_profile)
         if export_profile is not None
@@ -1047,6 +1063,7 @@ def cache_full_batch_fl2va_plan(
     # end-of-run metadata synchronization writes it to the manifest.
     cache_desc = dict(desc)
     cache_desc["color_adjustment"] = adjustment
+    cache_desc["color_match"] = match_spec
 
     ffmpeg = d._find_ffmpeg()
     video_path, decoded_now = _ensure_plan_video_cache(
@@ -1059,6 +1076,7 @@ def cache_full_batch_fl2va_plan(
         encode_preset=d.FULL_BATCH_H264_CACHE_PRESET,
         final_export_profile=profile,
         final_color_adjustment=adjustment,
+        final_color_match=match_spec,
         final_handoff_enabled=bool(handoff_enabled),
     )
 
@@ -1068,6 +1086,7 @@ def cache_full_batch_fl2va_plan(
         if str(item.get("clip_id") or "") == wanted_id:
             item["decoded_video_profile"] = d.FULL_BATCH_H264_CACHE_PROFILE
             item["color_adjustment"] = adjustment
+            item["color_match"] = match_spec
             break
     manifest = dict(manifest)
     manifest["segments"] = tagged_segments
@@ -1090,7 +1109,8 @@ def cache_full_batch_fl2va_plan(
         # safely in place.
         if final_path.exists() and final_path.stat().st_size > 0:
             manifest = _tag_fl2va_final_segment_cache(
-                manifest_path, manifest, wanted_id, profile, adjustment, visible_frames
+                manifest_path, manifest, wanted_id, profile, adjustment, visible_frames,
+                color_match=match_spec,
             )
             final_cached = True
 
@@ -1660,6 +1680,7 @@ def export_fl2va_final(
         for i, desc in enumerate(segments):
             handoff_enabled = _next_uses_previous(segments, i)
             adjustment = d._normalize_color_adjustment(desc.get("color_adjustment"))
+            match_spec = d._normalize_color_match(desc.get("color_match"))
             path, _ = _ensure_plan_video_cache(
                 data_path,
                 desc,
@@ -1669,6 +1690,7 @@ def export_fl2va_final(
                 progress=progress,
                 final_export_profile=clip_by_clip_export_profile,
                 final_color_adjustment=adjustment,
+                final_color_match=match_spec,
                 final_handoff_enabled=handoff_enabled,
                 require_continuity=bool(require_continuity),
             )
@@ -1696,6 +1718,7 @@ def export_fl2va_final(
                     clip_by_clip_export_profile,
                     adjustment,
                     visible_frames,
+                    color_match=match_spec,
                 )
 
             video_inputs.append(
@@ -1866,6 +1889,7 @@ def export_fl2va_final(
     for i, desc in enumerate(segments):
         handoff_enabled = _next_uses_previous(segments, i)
         adjustment = d._normalize_color_adjustment(desc.get("color_adjustment"))
+        match_spec = d._normalize_color_match(desc.get("color_match"))
         path, _decoded_now = _ensure_plan_video_cache(
             data_path,
             desc,
@@ -1877,6 +1901,7 @@ def export_fl2va_final(
             encode_preset=d.FULL_BATCH_H264_CACHE_PRESET,
             final_export_profile=export_profile,
             final_color_adjustment=adjustment,
+            final_color_match=match_spec,
             final_handoff_enabled=handoff_enabled,
             require_continuity=bool(require_continuity),
         )
@@ -1906,6 +1931,7 @@ def export_fl2va_final(
             export_profile,
             adjustment,
             visible_frames,
+            color_match=match_spec,
         )
         exact_segment_paths.append(final_path)
 
@@ -1986,7 +2012,10 @@ def export_fl2va_final(
     extension = d._full_batch_export_profile_extension(export_profile)
     output_path = d._next_output_path(out_dir, filename_prefix, extension)
     source_final_segment = (
-        d._ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token)
+        d._ensure_source_final_video(
+            data_path, manifest, ffmpeg, export_profile, token,
+            manifest.get("color_match"),
+        )
         if source_meta is not None else None
     )
     final_video_mode, individual_export_info = d._export_final_from_exact_segment_caches(

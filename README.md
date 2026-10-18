@@ -308,6 +308,66 @@ Color correction is applied only to the decoded video and **does not modify Moti
 
 A small `✓` next to the palette indicates that a clip has an active color correction.
 
+### 🧪 Image Color Match
+
+The Extender can color match every generated clip against a reference image.
+
+The node has an additional input pin named **color_match_image**.
+
+Wire an image into that pin. The color match options then become available:
+
+- **color_match_space** - LAB (default), YCbCr, RGB, LUV, YUV or XYZ
+- **color_match_factor** - blend amount, 0.0 to 1.0, default 1.0
+- **color_match_process_clip0** - also match the Clip 0 continuation source
+
+The three rows appear directly under the `color_match_image` pin, with a left indent.
+The indent shows that the rows belong to that pin.
+
+Rules:
+
+1. The options stay hidden while the pin is empty.
+2. `color_match_process_clip0` appears only when a Clip 0 video is attached.
+3. The match always uses the default GPU (device 0). A CPU is used only when the machine has no CUDA device. The reference statistics are always computed on the CPU.
+4. The `device` and `reference_mask` options of the original node are not exposed.
+5. `color_match_space` falls back to LAB when a saved workflow carries no value for it.
+
+What the match does:
+
+- The match is applied before the images are combined for the video compression.
+- The match runs inside the final encode of each clip.
+- The live preview, and the preview file that the node writes into the output folder, show the match too.
+- The per-clip Saturation / Contrast / Brightness corrections apply on top of the match.
+- Clip 0 is matched only when `color_match_process_clip0` is ON.
+- Toggling `color_match_process_clip0` never invalidates a generated clip.
+
+The `RGB` space needs no extra library. The other spaces need `kornia`. ComfyUI already installs `kornia`.
+
+Matched preview:
+
+- The node writes the matched preview of each clip to `<cache>.preview.match/preview_<index>_<match signature>.mp4`.
+- The match signature is part of the file name. A change of space, factor, reference image or the Clip 0 switch builds new files. Old files are never shown again.
+- The Clip 0 preview is matched only when `color_match_process_clip0` is ON.
+- The node rebuilds a missing matched preview from the neutral preview clip of that clip. No VAE work is needed.
+- Clip 0 keeps its original colors while `color_match_process_clip0` is OFF.
+- The node does not rewrite the append-only cache body. That body stays neutral.
+- The final export always carries the match. The node assembles it from the matched final sidecars.
+- The first run after an update rebuilds the preview one time. Later runs reuse the files.
+
+Console messages:
+
+The node reports every match step on the ComfyUI console. Each step writes one `start` line and one `stop` line.
+
+```text
+[H3 Extender] Image Color Match: start (clip final encode target=ref2va_0002.mp4 space=LAB factor=1.00 frames=374 device=cuda:0)
+[H3 Extender] Image Color Match: stop (clip final encode target=ref2va_0002.mp4)
+```
+
+The `device` field shows the accelerator in use. It reads `cuda:0` on a GPU machine. A `cpu` value means the machine has no CUDA device.
+
+Tests:
+
+`tests/test_color_match.py`, `tests/test_color_match_preview.py` and `tests/test_color_match_device.py` cover the match, the matched preview files and the device selection. Run a file with `python tests/<file>.py`. These modules cannot be imported outside ComfyUI, so each test loads only the functions that it exercises.
+
 ### ⚡ Full Batch Integration
 
 Full Batch correctly preserves and applies all previously configured clip corrections during final assembly.

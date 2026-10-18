@@ -80,6 +80,9 @@ from .motion_context_disk import (
     normalize_full_batch_export_profile,
     _find_ffmpeg,
     _resolve_full_batch_export_profile,
+    COLOR_MATCH_SPACES,
+    _normalize_color_match,
+    _color_match_reference_stats,
 )
 from .fl2va_engine import (
     normalize_mode as _normalize_generation_mode,
@@ -2812,6 +2815,74 @@ def _refine_fl2va_sample(
     return preserve_first_pass_audio(refined, first_audio), out_w, out_h
 
 
+def _color_match_reference_signature(image):
+    """Short, device-stable fingerprint of a reference IMAGE batch.
+
+    Used to detect that the connected reference image changed even when its
+    per-channel statistics happen to match. A tiny pooled copy keeps the cost
+    bounded for large references.
+    """
+    try:
+        tensor = torch.as_tensor(image).detach().to(dtype=torch.float32, device="cpu")
+    except Exception:
+        return ""
+    if tensor.dim() != 4 or int(tensor.shape[-1]) != 3 or int(tensor.shape[0]) < 1:
+        return ""
+    try:
+        pooled = torch.nn.functional.adaptive_avg_pool2d(
+            tensor[:1].permute(0, 3, 1, 2).contiguous(), (4, 4)
+        )
+        payload = (
+            pooled.mul(255).round().clamp(0, 255).to(torch.uint8).contiguous().numpy().tobytes()
+        )
+    except Exception:
+        return ""
+    digest = hashlib.sha256()
+    digest.update(
+        ("%d:%d:%d" % (int(tensor.shape[0]), int(tensor.shape[1]), int(tensor.shape[2]))).encode("utf-8")
+    )
+    digest.update(payload)
+    return digest.hexdigest()[:16]
+
+
+def _build_color_match(image=None, space="LAB", factor=1.0, process_clip0=False):
+    """Build one run's color-match spec from the optional IMAGE socket.
+
+    The spec is inert unless a valid RGB IMAGE batch is actually connected, so
+    the widgets can stay on screen while the socket is empty. The reference
+    statistics are always computed on the CPU: they are cached in the manifest
+    and must not depend on the current accelerator.
+    """
+    spec = _normalize_color_match(
+        {
+            "enabled": False,
+            "space": space,
+            "factor": factor,
+            "process_clip0": process_clip0,
+        }
+    )
+    if image is None:
+        return spec
+    try:
+        tensor = torch.as_tensor(image)
+    except Exception:
+        return spec
+    if tensor.dim() != 4 or int(tensor.shape[-1]) != 3 or int(tensor.shape[0]) < 1:
+        return spec
+    mean, std = _color_match_reference_stats(tensor, space=spec["space"], device="cpu")
+    if mean is None or std is None:
+        return spec
+    reference_mean = [float(x) for x in mean.flatten()]
+    reference_std = [float(x) for x in std.flatten()]
+    if len(reference_mean) != 3 or len(reference_std) != 3:
+        return spec
+    spec["enabled"] = True
+    spec["reference_mean"] = reference_mean
+    spec["reference_std"] = reference_std
+    spec["reference_signature"] = _color_match_reference_signature(tensor)
+    return spec
+
+
 def _normalize_color_adjustment(value=None):
     raw = value if isinstance(value, dict) else {}
 
@@ -5048,6 +5119,22 @@ class MiniMaxH3Extender:
                 "FLOAT",
                 {"default": 0.30, "min": 0.01, "max": 1.0, "step": 0.01},
             ),
+            # Appended after every legacy widget. These control the optional
+            # Image Color Match pass that runs before the final video encode.
+            # They stay inert until an IMAGE is wired into the color_match_image
+            # socket; the frontend hides them otherwise.
+            "color_match_space": (
+                COLOR_MATCH_SPACES,
+                {"default": "LAB", "tooltip": "Color space used by the Image Color Match. Changing this invalidates generated clips."},
+            ),
+            "color_match_factor": (
+                "FLOAT",
+                {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Blend between the original frame (0.0) and the fully matched frame (1.0). Changing this invalidates generated clips."},
+            ),
+            "color_match_process_clip0": (
+                "BOOLEAN",
+                {"default": False, "tooltip": "Also color match the Clip 0 continuation source. Only applies while a Clip 0 video is attached."},
+            ),
         }
 
         # Audio and video references remain external sockets. Image refs continue
@@ -5183,6 +5270,16 @@ class MiniMaxH3Extender:
                     "tooltip": "Optional existing source video to continue as locked Clip 0. Use a native file-backed Load Video output; choose the working resize on the Clip 0 card.",
                 },
             ),
+            # Appended last so every previously saved socket index is unchanged.
+            # A connected IMAGE enables the Image Color Match widgets; the
+            # matched frames are baked into each clip's final encode only.
+            "color_match_image": (
+                "IMAGE",
+                {
+                    "forceInput": True,
+                    "tooltip": "Optional reference image for Image Color Match. When connected, the final encode of every clip is colour matched to this image.",
+                },
+            ),
         }
 
         return {
@@ -5262,6 +5359,7 @@ class MiniMaxH3Extender:
         refine_scale=1.5,
         refine_steps=4,
         refine_denoise=0.30,
+        color_match=None,
     ):
         if fl2va_model is None:
             raise ValueError(
@@ -5269,6 +5367,7 @@ class MiniMaxH3Extender:
             )
 
         sample_sigmas = _resolve_sample_sigmas(sigmas, denoise)
+        color_match_spec = _normalize_color_match(color_match)
 
         clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
@@ -5363,6 +5462,7 @@ class MiniMaxH3Extender:
         manifest = dict(manifest)
         manifest["refine_mode"] = dict(refine_payload)
         manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
+        manifest["color_match"] = dict(color_match_spec)
         manifest["updated_at"] = time.time()
         _write_json_atomic(manifest_path, manifest)
         manifest, active_export_profile = _pin_full_batch_export_profile(
@@ -5512,6 +5612,7 @@ class MiniMaxH3Extender:
                     owner, float(FPS), clip_ids, clip_id, vae, audio_vae=audio_vae,
                     export_profile=active_export_profile,
                     color_adjustment=cfg.get("color_adjustment"),
+                    color_match=color_match_spec,
                     handoff_enabled=(
                         i + 1 < len(clips)
                         and str(clips[i + 1].get("first_source") or "manual") == "previous_clip"
@@ -5692,6 +5793,7 @@ class MiniMaxH3Extender:
                     owner, float(FPS), clip_ids, clip_id, vae, audio_vae=audio_vae,
                     export_profile=active_export_profile,
                     color_adjustment=cfg.get("color_adjustment"),
+                    color_match=color_match_spec,
                     handoff_enabled=(
                         i + 1 < len(clips)
                         and str(clips[i + 1].get("first_source") or "manual") == "previous_clip"
@@ -5759,6 +5861,12 @@ class MiniMaxH3Extender:
             wanted = _normalize_color_adjustment(cfg.get("color_adjustment"))
             if desc.get("color_adjustment") != wanted:
                 desc["color_adjustment"] = wanted
+                desc["final_video_dirty"] = True
+                color_segments[idx] = desc
+                color_changed = True
+            wanted_match = _normalize_color_match(color_match_spec)
+            if _normalize_color_match(desc.get("color_match")) != wanted_match:
+                desc["color_match"] = dict(wanted_match)
                 desc["final_video_dirty"] = True
                 color_segments[idx] = desc
                 color_changed = True
@@ -5861,6 +5969,7 @@ class MiniMaxH3Extender:
             "prompt_pack_count": int(len(external_prompt_pack.get("prompts") or [])) if external_prompt_pack is not None else 0,
             "prompt_pack_signature": str(active_prompt_pack_signature or ""),
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
+            "color_match": dict(color_match_spec),
             "build": BUILD,
         }
         return {
@@ -5901,6 +6010,9 @@ class MiniMaxH3Extender:
         refine_scale=1.5,
         refine_steps=4,
         refine_denoise=0.30,
+        color_match_space="LAB",
+        color_match_factor=1.0,
+        color_match_process_clip0=False,
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -5922,6 +6034,18 @@ class MiniMaxH3Extender:
             else _continue_video_from_state(clips_json)
         )
         continue_video_resize = _continue_resize_from_state(clips_json)
+        # Image Color Match is inert until an IMAGE is wired into the
+        # color_match_image pin. The reference statistics are always computed on
+        # the CPU so the cached signature never depends on the active
+        # accelerator. process_clip0 only means anything with a Clip 0 video.
+        color_match_spec = _build_color_match(
+            kwargs.get("color_match_image"),
+            space=color_match_space,
+            factor=color_match_factor,
+            process_clip0=bool(
+                color_match_process_clip0 and continue_existing_video is not None
+            ),
+        )
         if refine_enabled and continue_existing_video is not None:
             raise ValueError(
                 "MiniMax H3 Extender 3.0: Latent Refine is not yet available with Clip 0 / continue_existing_video, "
@@ -5972,6 +6096,7 @@ class MiniMaxH3Extender:
                 sigmas=external_sigmas,
                 refine_enabled=refine_enabled, refine_scale=refine_scale,
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
+                color_match=color_match_spec,
             )
 
         if not motion_context:
@@ -5994,6 +6119,7 @@ class MiniMaxH3Extender:
                 sigmas=external_sigmas,
                 refine_enabled=refine_enabled, refine_scale=refine_scale,
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
+                color_match=color_match_spec,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -6204,6 +6330,7 @@ class MiniMaxH3Extender:
         ]
         manifest["refine_mode"] = dict(refine_payload)
         manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
+        manifest["color_match"] = dict(color_match_spec)
         manifest["updated_at"] = time.time()
         _write_json_atomic(manifest_path, manifest)
 
@@ -6346,6 +6473,7 @@ class MiniMaxH3Extender:
                     data_path, manifest_path, i, vae, audio_vae, float(FPS),
                     export_profile=active_export_profile,
                     color_adjustment=cfg.get("color_adjustment"),
+                    color_match=color_match_spec,
                 )
                 _cleanup_full_batch_aimdo_between_clips("Ref2VA Motion ON", i)
                 continue
@@ -6675,6 +6803,7 @@ class MiniMaxH3Extender:
                     data_path, manifest_path, i, vae, audio_vae, float(FPS),
                     export_profile=active_export_profile,
                     color_adjustment=cfg.get("color_adjustment"),
+                    color_match=color_match_spec,
                 )
                 _cleanup_full_batch_aimdo_between_clips("Ref2VA Motion ON", i)
 
@@ -6745,6 +6874,12 @@ class MiniMaxH3Extender:
                 wanted = _normalize_color_adjustment(clips[color_i].get("color_adjustment"))
                 if desc.get("color_adjustment") != wanted:
                     desc["color_adjustment"] = wanted
+                    desc["final_video_dirty"] = True
+                    color_segments[color_i] = desc
+                    color_changed = True
+                wanted_match = _normalize_color_match(color_match_spec)
+                if _normalize_color_match(desc.get("color_match")) != wanted_match:
+                    desc["color_match"] = dict(wanted_match)
                     desc["final_video_dirty"] = True
                     color_segments[color_i] = desc
                     color_changed = True
@@ -6884,6 +7019,7 @@ class MiniMaxH3Extender:
             "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
             "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
+            "color_match": dict(color_match_spec),
             "build": BUILD,
         }
 

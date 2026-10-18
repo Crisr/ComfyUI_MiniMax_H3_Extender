@@ -386,6 +386,7 @@ def cache_full_batch_plan(
     audio_vae=None,
     export_profile=None,
     color_adjustment=None,
+    color_match=None,
 ):
     """Secure one completed independent Ref2VA clip as preview/final caches."""
     from . import motion_context_disk as d
@@ -403,9 +404,13 @@ def cache_full_batch_plan(
     adjustment = d._normalize_color_adjustment(
         color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
     )
+    match_spec = d._normalize_color_match(
+        color_match if color_match is not None else desc.get("color_match")
+    )
     profile = d.normalize_full_batch_export_profile(export_profile) if export_profile is not None else None
     cache_desc = dict(desc)
     cache_desc["color_adjustment"] = adjustment
+    cache_desc["color_match"] = match_spec
 
     ffmpeg = d._find_ffmpeg()
     video_path, decoded_now = f._ensure_plan_video_cache(
@@ -418,6 +423,7 @@ def cache_full_batch_plan(
         encode_preset=d.FULL_BATCH_H264_CACHE_PRESET,
         final_export_profile=profile,
         final_color_adjustment=adjustment,
+        final_color_match=match_spec,
         final_handoff_enabled=False,
         require_continuity=False,
     )
@@ -428,6 +434,7 @@ def cache_full_batch_plan(
         if str(item.get("clip_id") or "") == wanted_id:
             item["decoded_video_profile"] = d.FULL_BATCH_H264_CACHE_PROFILE
             item["color_adjustment"] = adjustment
+            item["color_match"] = match_spec
             break
     manifest = dict(manifest)
     manifest["segments"] = tagged_segments
@@ -445,7 +452,8 @@ def cache_full_batch_plan(
         final_path = f._plan_final_video_cache_path(data_path, wanted_id, profile)
         if final_path.exists() and final_path.stat().st_size > 0:
             manifest = f._tag_fl2va_final_segment_cache(
-                manifest_path, manifest, wanted_id, profile, adjustment, visible_frames
+                manifest_path, manifest, wanted_id, profile, adjustment, visible_frames,
+                color_match=match_spec,
             )
             final_cached = True
 
@@ -619,12 +627,14 @@ def run(
     refine_scale=1.5,
     refine_steps=8,
     refine_denoise=0.30,
+    color_match=None,
 ):
     """Execute Ref2VA with no Motion Context and random-access clip caches."""
     from . import extender as e
     from . import motion_context_disk as d
 
     sample_sigmas = e._resolve_sample_sigmas(sigmas, denoise)
+    color_match_spec = d._normalize_color_match(color_match)
 
     clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
     data_path, manifest_path, manifest = sync_manifest(owner, e.FPS, clip_ids)
@@ -824,6 +834,7 @@ def run(
                 audio_vae=audio_vae,
                 export_profile=active_export_profile,
                 color_adjustment=cfg.get("color_adjustment"),
+                color_match=color_match_spec,
             )
             statuses.append(f"Ref2VA independent clip {i + 1} resumed from checkpoint")
             e._cleanup_full_batch_aimdo_between_clips("Ref2VA Motion OFF", i)
@@ -1090,6 +1101,7 @@ def run(
                 audio_vae=audio_vae,
                 export_profile=active_export_profile,
                 color_adjustment=cfg.get("color_adjustment"),
+                color_match=color_match_spec,
             )
             e._cleanup_full_batch_aimdo_between_clips("Ref2VA Motion OFF", i)
 
@@ -1134,6 +1146,7 @@ def run(
     color_segments = [dict(x) for x in final_manifest.get("segments", [])]
     clip_by_id = {clip_ids[i]: clips[i] for i in range(len(clips))}
     color_changed = False
+    match_changed = False
     for idx, desc in enumerate(color_segments):
         cfg = clip_by_id.get(str(desc.get("clip_id") or ""))
         if cfg is None:
@@ -1144,7 +1157,14 @@ def run(
             desc["final_video_dirty"] = True
             color_segments[idx] = desc
             color_changed = True
-    if color_changed:
+        wanted_match = d._normalize_color_match(color_match_spec)
+        desc_match = d._normalize_color_match(desc.get("color_match"))
+        if desc_match != wanted_match:
+            desc["color_match"] = dict(wanted_match)
+            desc["final_video_dirty"] = True
+            color_segments[idx] = desc
+            match_changed = True
+    if color_changed or match_changed:
         final_manifest = dict(final_manifest)
         final_manifest["segments"] = color_segments
         final_manifest["updated_at"] = time.time()

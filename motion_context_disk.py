@@ -2063,6 +2063,454 @@ def _color_is_neutral(value):
     return all(abs(float(c[k]) - 100.0) < 1e-6 for k in ("saturation", "contrast", "brightness"))
 
 
+# -----------------------------------------------------------------------------
+# Image Color Match (comfyui_essentials compatible)
+# -----------------------------------------------------------------------------
+# The Extender re-implements the essentials ImageColorMatch mean/std transfer
+# instead of importing that custom node package, so this node keeps working
+# without it. The maths, the colour spaces and the defaults are identical. Two
+# essentials widgets are intentionally fixed here:
+#   * ``device`` is always the default accelerator, which mirrors essentials
+#     ``device='gpu'`` with the default GPU selected.
+#   * ``batch_size`` cannot change the result, because the statistics are
+#     computed per frame, so the clip is simply streamed in fixed chunks.
+
+COLOR_MATCH_SPACES = ("LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ")
+COLOR_MATCH_STD_FLOOR = 1e-5
+COLOR_MATCH_CHUNK_FRAMES = 32
+_COLOR_MATCH_TO_SPACE = {
+    "LAB": "rgb_to_lab",
+    "YCbCr": "rgb_to_ycbcr",
+    "LUV": "rgb_to_luv",
+    "YUV": "rgb_to_yuv",
+    "XYZ": "rgb_to_xyz",
+}
+_COLOR_MATCH_FROM_SPACE = {
+    "LAB": "lab_to_rgb",
+    "YCbCr": "ycbcr_to_rgb",
+    "LUV": "luv_to_rgb",
+    "YUV": "yuv_to_rgb",
+    "XYZ": "xyz_to_rgb",
+}
+
+
+def _normalize_color_match(value=None):
+    """Normalize the Extender Image Color Match settings.
+
+    ``enabled`` mirrors the ``color_match_image`` socket state. The reference
+    profile (per-channel mean/std already expressed in ``space``) travels inside
+    the spec, because Final Decode rebuilds final clips later and the reference
+    image only exists while the Extender runs.
+    """
+    raw = value if isinstance(value, dict) else {}
+    space = str(raw.get("space") or COLOR_MATCH_SPACES[0])
+    if space not in COLOR_MATCH_SPACES:
+        space = COLOR_MATCH_SPACES[0]
+    try:
+        factor = float(raw.get("factor", 1.0))
+    except Exception:
+        factor = 1.0
+
+    def _stats(name):
+        values = raw.get(name)
+        if not isinstance(values, (list, tuple)) or len(values) != 3:
+            return []
+        out = []
+        for item in values:
+            try:
+                out.append(float(item))
+            except Exception:
+                return []
+        return out
+
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "space": space,
+        "factor": max(0.0, min(1.0, factor)),
+        "process_clip0": bool(raw.get("process_clip0", False)),
+        "reference_signature": str(raw.get("reference_signature") or ""),
+        "reference_mean": _stats("reference_mean"),
+        "reference_std": _stats("reference_std"),
+    }
+
+
+def _color_match_is_active(value=None):
+    spec = _normalize_color_match(value)
+    return (
+        bool(spec["enabled"])
+        and len(spec["reference_mean"]) == 3
+        and len(spec["reference_std"]) == 3
+    )
+
+
+def _color_match_signature(value=None):
+    """Clip-level fingerprint of the match; empty string when it cannot run.
+
+    ``process_clip0`` is deliberately excluded. Toggling Clip 0 must re-encode
+    the Clip 0 source file only, never every generated clip.
+    """
+    spec = _normalize_color_match(value)
+    if not _color_match_is_active(spec):
+        return ""
+    payload = {
+        key: spec[key]
+        for key in ("space", "factor", "reference_signature", "reference_mean", "reference_std")
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _color_match_source_signature(value=None):
+    """Clip 0 fingerprint: the clip signature plus the Clip 0 toggle."""
+    signature = _color_match_signature(value)
+    if not signature:
+        return ""
+    return signature + ("p1" if _normalize_color_match(value)["process_clip0"] else "p0")
+
+
+# Resolved once per process: the accelerator the Image Color Match runs on.
+_COLOR_MATCH_DEVICE = None
+
+
+def _color_match_device():
+    """The match always runs on the default accelerator (essentials 'gpu').
+
+    The node exposes no device option, so the default GPU (device 0) is used.
+    ComfyUI's accelerator wins whenever it is not a CPU device; a CPU report is
+    only accepted when no CUDA device exists. This keeps a CPU-only install
+    working while a GPU install can never silently take the CPU path, which is
+    an order of magnitude slower than the GPU one.
+    """
+    global _COLOR_MATCH_DEVICE
+    if _COLOR_MATCH_DEVICE is not None:
+        return _COLOR_MATCH_DEVICE
+    device = None
+    try:
+        import comfy.model_management
+
+        device = torch.device(comfy.model_management.get_torch_device())
+    except Exception:  # static tests outside ComfyUI
+        device = None
+    if device is None or device.type == "cpu":
+        try:
+            if torch.cuda.is_available():
+                device = torch.device("cuda:0")
+        except Exception:
+            pass
+    if device is None:
+        device = torch.device("cpu")
+    _COLOR_MATCH_DEVICE = device
+    return device
+
+
+def _color_space_convert(tensor, space, *, inverse=False):
+    """Convert a BCHW RGB float tensor with the kornia calls essentials uses."""
+    name = (_COLOR_MATCH_FROM_SPACE if inverse else _COLOR_MATCH_TO_SPACE).get(str(space or ""))
+    if name is None:
+        return tensor
+    try:
+        import kornia.color as kornia_color
+    except Exception as exc:
+        raise RuntimeError(
+            "MiniMax H3 Extender: Image Color Match needs the 'kornia' package for the "
+            f"'{space}' color space. Install kornia, or select the RGB color space."
+        ) from exc
+    return getattr(kornia_color, name)(tensor)
+
+
+def _color_match_reference_stats(reference, space="LAB", device="cpu"):
+    """Reduce an IMAGE reference to one per-channel profile shaped (1, C, 1, 1).
+
+    essentials keeps one profile per reference image and relies on broadcasting,
+    which only works for a single-image reference. Averaging the per-image
+    profiles here keeps a multi-image reference usable with any clip length. A
+    single-image reference is unchanged. The profile is computed on the CPU by
+    default so the cache signature stays stable across accelerators.
+    """
+    if reference is None or int(getattr(reference, "ndim", 0)) != 4:
+        return None, None
+    if int(reference.shape[-1]) != 3:
+        raise ValueError(
+            "MiniMax H3 Extender: color_match_image must be an RGB IMAGE with 3 channels."
+        )
+    tensor = torch.as_tensor(reference).detach().to(device=torch.device(device), dtype=torch.float32)
+    tensor = tensor.permute(0, 3, 1, 2)
+    tensor = _color_space_convert(tensor, space)
+    per_image_mean = torch.nan_to_num(tensor.mean(dim=[2, 3], keepdim=True))
+    per_image_std = torch.nan_to_num(tensor.std(dim=[2, 3], keepdim=True))
+    return (
+        per_image_mean.mean(dim=0, keepdim=True).reshape(1, 3, 1, 1),
+        per_image_std.mean(dim=0, keepdim=True).reshape(1, 3, 1, 1),
+    )
+
+
+def _color_match_console(message):
+    """Report an Image Color Match processing step on the ComfyUI console."""
+    print(f"[H3 Extender] Image Color Match: {message}", flush=True)
+
+
+def _matched_preview_clip_dir(data_path):
+    """Directory that holds the per-clip matched preview clips."""
+    target = Path(data_path).with_suffix(".preview.match")
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _matched_preview_clip_path(data_path, index, color_match=None):
+    """Path of the matched preview clip for one generated clip, or None.
+
+    The clip signature is part of the name, so a change of space, factor or
+    reference image yields a new file instead of a stale one.
+    """
+    tag = _color_match_signature(color_match)
+    if not tag:
+        return None
+    return _matched_preview_clip_dir(data_path) / f"preview_{int(index):04d}_{tag}.mp4"
+
+
+def _matched_source_preview_video_path(data_path, color_match=None):
+    """Path of the matched Clip 0 preview, or None when Clip 0 is not matched."""
+    spec = _normalize_color_match(color_match)
+    if not _color_match_is_active(spec) or not bool(spec.get("process_clip0")):
+        return None
+    tag = _color_match_source_signature(spec)
+    if not tag:
+        return None
+    return Path(data_path).with_suffix(f".source.preview.match.{tag}.mp4")
+
+
+def _matched_preview_profile():
+    """H.264 profile used by the rolling browser preview."""
+    return normalize_full_batch_export_profile(
+        {
+            "codec": "H.264",
+            "crf": int(FULL_BATCH_H264_CACHE_CRF),
+            "preset": str(FULL_BATCH_H264_CACHE_PRESET),
+        }
+    )
+
+
+def _encode_matched_preview_clip_video(
+    ffmpeg,
+    video,
+    fps,
+    target_path,
+    token,
+    color_match=None,
+    *,
+    crf=17,
+    preset="ultrafast",
+):
+    """Encode one clip tensor as a matched H.264 preview clip.
+
+    The match runs one chunk at a time, so a second full-clip tensor is never
+    materialized (a 374 frame 864x480 clip tensor is about 1.8 GB).
+    """
+    root = _ensure_cache_root()
+    video_log = root / f"_{token}_video_match.log"
+    proc = None
+    log_f = None
+    try:
+        h, w = int(video.shape[1]), int(video.shape[2])
+        proc, log_f = _start_video_encoder(
+            ffmpeg,
+            target_path,
+            w,
+            h,
+            fps,
+            "H.264",
+            int(crf),
+            str(preset),
+            video_log,
+        )
+        total = int(video.shape[0])
+        for start in range(0, total, COLOR_MATCH_CHUNK_FRAMES):
+            chunk = video[start : start + COLOR_MATCH_CHUNK_FRAMES]
+            frames = _apply_color_match_frames(chunk, color_match)
+            _write_image_frames(proc, frames)
+            del chunk
+            del frames
+        _finish_process(proc, log_f, video_log, "H3 preview color-match encoder")
+        proc = None
+        log_f = None
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if log_f is not None:
+            try:
+                log_f.close()
+            except Exception:
+                pass
+        try:
+            if video_log.exists():
+                video_log.unlink()
+        except OSError:
+            pass
+
+
+def _ensure_matched_source_preview_video(
+    data_path,
+    manifest,
+    ffmpeg,
+    token,
+    color_match=None,
+    *,
+    label="Clip 0 preview match",
+):
+    """Return the matched Clip 0 preview, building it when it is missing.
+
+    Returns None when the match is inactive, when Clip 0 is not matched, or when
+    the normalized Clip 0 source is not available.
+    """
+    spec = _normalize_color_match(color_match)
+    target = _matched_source_preview_video_path(data_path, spec)
+    if target is None:
+        return None
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    meta = _source_meta(manifest)
+    if meta is None:
+        return None
+    source = _source_working_path(data_path)
+    if not source.exists():
+        return None
+    width = int(meta.get("width") or 0)
+    height = int(meta.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return None
+    temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp.mp4")
+    try:
+        _encode_matched_source_video(
+            ffmpeg,
+            source,
+            temp,
+            width,
+            height,
+            float(meta.get("fps") or FPS),
+            _matched_preview_profile(),
+            token,
+            spec,
+            label=label,
+        )
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
+    return target
+
+
+def _ensure_matched_preview_clip(
+    data_path,
+    segments,
+    index,
+    manifest,
+    ffmpeg,
+    fps,
+    token,
+    color_match=None,
+):
+    """Return the matched preview clip for one generated clip, building it.
+
+    The neutral preview fixture in the append-only cache body is never rewritten,
+    so the matched variant is a separate file named after the match signature. It
+    is rebuilt from the neutral preview clip when missing: no VAE work and no
+    change to the cache body.
+
+    Returns None when the match is inactive, when the neutral fixture is missing,
+    or when the manifest holds no usable resolution. The caller then keeps its
+    neutral path.
+    """
+    spec = _normalize_color_match(color_match)
+    target = _matched_preview_clip_path(data_path, index, spec)
+    if target is None:
+        return None
+    if target.exists() and target.stat().st_size > 0:
+        return target
+    desc = segments[int(index)] if 0 <= int(index) < len(segments) else {}
+    blob = desc.get("decoded_mp4_blob")
+    if blob is None:
+        return None
+    resolution = manifest.get("base_resolution") or {}
+    width = int(resolution.get("width") or 0)
+    height = int(resolution.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return None
+    source = _ensure_cache_root() / f"_{token}_match_{int(index):04d}.mp4"
+    temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp.mp4")
+    try:
+        _copy_blob_to_file(data_path, blob, source)
+        _encode_matched_source_video(
+            ffmpeg,
+            source,
+            temp,
+            width,
+            height,
+            float(fps),
+            _matched_preview_profile(),
+            token,
+            spec,
+            label=f"preview clip {int(index) + 1}",
+        )
+        os.replace(temp, target)
+    finally:
+        source.unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
+    return target
+
+
+def _apply_color_match_frames(frames, value=None, device=None):
+    """Match a decoded IMAGE batch to the reference profile.
+
+    Identical to essentials ImageColorMatch with the reference profile above.
+    Statistics are per frame, so the internal chunk size cannot change the
+    result and the clip is streamed in bounded chunks.
+    """
+    spec = _normalize_color_match(value)
+    if not _color_match_is_active(spec):
+        return frames
+    if frames is None or int(getattr(frames, "ndim", 0)) != 4:
+        raise ValueError("MiniMax H3 Extender: Image Color Match expects an IMAGE batch.")
+    if int(frames.shape[-1]) != 3:
+        raise ValueError(
+            "MiniMax H3 Extender: Image Color Match expects RGB frames with 3 channels."
+        )
+
+    target = _color_match_device() if device is None else torch.device(device)
+    ref_mean = torch.tensor(spec["reference_mean"], dtype=torch.float32, device=target).reshape(1, 3, 1, 1)
+    ref_std = torch.tensor(spec["reference_std"], dtype=torch.float32, device=target).reshape(1, 3, 1, 1)
+    factor = float(spec["factor"])
+    space = spec["space"]
+
+    output = []
+    for start in range(0, int(frames.shape[0]), COLOR_MATCH_CHUNK_FRAMES):
+        block = frames[start:start + COLOR_MATCH_CHUNK_FRAMES].detach()
+        if not block.is_floating_point():
+            block = block.float().div_(255.0)
+        block = block.to(device=target, dtype=torch.float32).permute(0, 3, 1, 2)
+        converted = _color_space_convert(block, space)
+        mean = converted.mean(dim=[2, 3], keepdim=True)
+        std = torch.nan_to_num(converted.std(dim=[2, 3], keepdim=True)).clamp_min(
+            COLOR_MATCH_STD_FLOOR
+        )
+        matched = (converted - mean) / std * ref_std + ref_mean
+        if factor != 1.0:
+            matched = factor * matched + (1.0 - factor) * converted
+        matched = _color_space_convert(matched, space, inverse=True)
+        output.append(matched.permute(0, 2, 3, 1).clamp(0.0, 1.0).to("cpu"))
+    if not output:
+        return frames
+    return output[0] if len(output) == 1 else torch.cat(output, dim=0)
+
+
 def _color_timeline(segments, fps, source_frames=0):
     fps = float(fps or FPS)
     cursor = max(0, int(source_frames or 0))
@@ -2459,16 +2907,167 @@ def _ensure_source_preview_video(data_path, manifest, ffmpeg, token):
         log_path.unlink(missing_ok=True)
 
 
-def _source_final_video_path(data_path, export_profile):
+def _raw_bytes_to_frames(raw, width, height):
+    """Turn raw ffmpeg rgb24 bytes into a (B, H, W, 3) float tensor in [0, 1]."""
+    arr = np.frombuffer(bytes(raw), dtype=np.uint8).reshape(-1, int(height), int(width), 3)
+    return torch.from_numpy(arr.copy()).float().div_(255.0)
+
+
+def _iter_raw_frame_batches(stream, width, height, chunk_frames=COLOR_MATCH_CHUNK_FRAMES):
+    """Yield bounded (B, H, W, 3) tensors from an rgb24 byte stream.
+
+    Clip 0 can be far longer than a generated clip, so the decoder is drained in
+    fixed-size batches instead of materialising the whole source at once. A torn
+    trailing frame (the decoder died mid-frame) is dropped rather than reshaped.
+    """
+    frame_bytes = int(width) * int(height) * 3
+    if frame_bytes <= 0:
+        return
+    batch_bytes = max(1, int(chunk_frames)) * frame_bytes
+    buffer = bytearray()
+    while True:
+        chunk = stream.read(batch_bytes)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while len(buffer) >= batch_bytes:
+            yield _raw_bytes_to_frames(buffer[:batch_bytes], width, height)
+            del buffer[:batch_bytes]
+    usable = len(buffer) - (len(buffer) % frame_bytes)
+    if usable > 0:
+        yield _raw_bytes_to_frames(buffer[:usable], width, height)
+
+
+def _encode_matched_source_video(
+    ffmpeg, source_path, target_path, width, height, fps, profile, token, color_match,
+    label="Clip 0 source match",
+):
+    """Re-encode the normalized Clip 0 cache with the Image Color Match baked in.
+
+    The source is drained frame-by-frame into the final-profile encoder. Clip 0
+    can be much longer than a generated clip, so no full-resolution tensor for the
+    whole clip is ever held in memory.
+    """
+    root = _ensure_cache_root()
+    video_log = root / f"_{token}_source_match.log"
+    decode_log = root / f"_{token}_source_decode.log"
+    encoder = None
+    enc_log_f = None
+    decoder = None
+    written = 0
+    spec = _normalize_color_match(color_match)
+    match_active = _color_match_is_active(spec)
+    try:
+        encoder, enc_log_f = _start_video_encoder(
+            ffmpeg,
+            target_path,
+            int(width),
+            int(height),
+            float(fps),
+            profile["codec"],
+            int(profile["crf"]),
+            str(profile["preset"]),
+            video_log,
+        )
+        if match_active:
+            _color_match_console(
+                f"start ({label} "
+                f"source={Path(source_path).name} space={spec['space']} "
+                f"factor={spec['factor']:.2f})"
+            )
+        with open(decode_log, "wb") as decode_log_f:
+            decoder = subprocess.Popen(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error",
+                    "-i", str(source_path), "-map", "0:v:0", "-an",
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=decode_log_f,
+                bufsize=0,
+            )
+            try:
+                for frames in _iter_raw_frame_batches(decoder.stdout, width, height):
+                    matched = _apply_color_match_frames(frames, color_match)
+                    written += int(matched.shape[0])
+                    _write_image_frames(encoder, matched)
+            finally:
+                try:
+                    decoder.stdout.close()
+                except Exception:
+                    pass
+            code = decoder.wait()
+            decoder = None
+            if code != 0:
+                detail = ""
+                try:
+                    detail = decode_log.read_bytes()[-12000:].decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"H3 Final Decode: {label} decode for the color match failed with code {code}.\n{detail}"
+                )
+        _finish_process(encoder, enc_log_f, video_log, "H3 Clip 0 color-match encoder")
+        encoder = None
+        enc_log_f = None
+        if match_active:
+            _color_match_console(f"stop ({label} frames={written})")
+    finally:
+        if decoder is not None:
+            try:
+                if decoder.stdout is not None:
+                    decoder.stdout.close()
+            except Exception:
+                pass
+            try:
+                decoder.kill()
+            except Exception:
+                pass
+        if encoder is not None:
+            try:
+                if encoder.stdin is not None:
+                    encoder.stdin.close()
+            except Exception:
+                pass
+            try:
+                encoder.kill()
+            except Exception:
+                pass
+        if enc_log_f is not None:
+            try:
+                enc_log_f.close()
+            except Exception:
+                pass
+        for log_path in (video_log, decode_log):
+            try:
+                log_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _source_final_video_path(data_path, export_profile, color_match=None):
     profile = normalize_full_batch_export_profile(export_profile)
     signature = _full_batch_export_profile_signature(profile)[:16]
+    spec = _normalize_color_match(color_match)
+    match_tag = ""
+    if bool(spec.get("process_clip0")):
+        # Clip 0 is a user-supplied source, not a sampled latent, so the match
+        # spec itself (not just its on/off state) has to key the cached file.
+        match_tag = _color_match_source_signature(spec)
+    stem = f"source_{signature}" + (f"_{match_tag}" if match_tag else "")
     ext = _full_batch_export_profile_extension(profile)
     root = _final_segment_cache_dir(data_path)
-    return root / f"source_{signature}.{ext}"
+    return root / f"{stem}.{ext}"
 
 
-def _ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token):
-    """Encode Clip 0 once into the exact final video profile; generated clips remain stream-copy."""
+def _ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token, color_match=None):
+    """Encode Clip 0 once into the exact final video profile; generated clips remain stream-copy.
+
+    Clip 0 is normally only re-containerised. When the Image Color Match is
+    enabled and its Clip 0 switch is on, the source is decoded, matched and
+    re-encoded instead, because a pixel transfer cannot be expressed as a stream
+    copy. Otherwise Clip 0 is left exactly as the user supplied it.
+    """
     meta = _source_meta(manifest)
     if meta is None:
         return None
@@ -2476,45 +3075,61 @@ def _ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, toke
     if not source.exists():
         raise FileNotFoundError("H3 Final Decode: normalized Clip 0 cache is missing.")
     profile = normalize_full_batch_export_profile(export_profile)
-    target = _source_final_video_path(data_path, profile)
+    spec = _normalize_color_match(color_match)
+    target = _source_final_video_path(data_path, profile, spec)
     if target.exists() and target.stat().st_size > 0:
         return target
 
     temp = target.with_name(target.name + f".{uuid.uuid4().hex}.tmp.{target.suffix.lstrip('.')}")
-    log_path = _ensure_cache_root() / f"_{token}_source_final.log"
-    codec = profile["codec"]
-    chosen_ffmpeg = ffmpeg
-    if codec == "H.265 / HEVC":
-        enc = ["-c:v", "libx265", "-preset", profile["preset"], "-crf", str(profile["crf"]), "-pix_fmt", "yuv420p"]
-    elif codec == "FFV1 lossless":
-        enc = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
-    else:
-        force_cpu = codec == "H.264 CPU (libx264)"
-        if not force_cpu:
-            chosen_ffmpeg = _preferred_h264_ffmpeg(ffmpeg)
-        enc = _h264_encode_args(chosen_ffmpeg, profile["crf"], profile["preset"], force_cpu=force_cpu)
-    cmd = [
-        chosen_ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(source), "-map", "0:v:0", "-an", *enc,
-    ]
-    if target.suffix.lower() == ".mp4":
-        cmd += ["-movflags", "+faststart"]
-    cmd.append(str(temp))
     try:
-        with open(log_path, "wb") as log_f:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
-        if proc.returncode != 0 or not temp.exists() or temp.stat().st_size <= 0:
-            detail = ""
+        if _color_match_is_active(spec) and bool(spec.get("process_clip0")):
+            _encode_matched_source_video(
+                ffmpeg,
+                source,
+                temp,
+                int(meta.get("width") or 0),
+                int(meta.get("height") or 0),
+                float(meta.get("fps") or FPS),
+                profile,
+                token,
+                spec,
+            )
+        else:
+            log_path = _ensure_cache_root() / f"_{token}_source_final.log"
+            codec = profile["codec"]
+            chosen_ffmpeg = ffmpeg
+            if codec == "H.265 / HEVC":
+                enc = ["-c:v", "libx265", "-preset", profile["preset"], "-crf", str(profile["crf"]), "-pix_fmt", "yuv420p"]
+            elif codec == "FFV1 lossless":
+                enc = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
+            else:
+                force_cpu = codec == "H.264 CPU (libx264)"
+                if not force_cpu:
+                    chosen_ffmpeg = _preferred_h264_ffmpeg(ffmpeg)
+                enc = _h264_encode_args(chosen_ffmpeg, profile["crf"], profile["preset"], force_cpu=force_cpu)
+            cmd = [
+                chosen_ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(source), "-map", "0:v:0", "-an", *enc,
+            ]
+            if target.suffix.lower() == ".mp4":
+                cmd += ["-movflags", "+faststart"]
+            cmd.append(str(temp))
             try:
-                detail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise RuntimeError(f"H3 Final Decode: Clip 0 final-profile encode failed.\n{detail}")
+                with open(log_path, "wb") as log_f:
+                    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
+                if proc.returncode != 0 or not temp.exists() or temp.stat().st_size <= 0:
+                    detail = ""
+                    try:
+                        detail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"H3 Final Decode: Clip 0 final-profile encode failed.\n{detail}")
+            finally:
+                log_path.unlink(missing_ok=True)
         os.replace(temp, target)
         return target
     finally:
         temp.unlink(missing_ok=True)
-        log_path.unlink(missing_ok=True)
 
 
 def _source_frame_count(meta):
@@ -2803,12 +3418,16 @@ def _encode_final_segment_video(
     token,
     export_profile,
     color_adjustment=None,
+    color_match=None,
 ):
     """Encode one decoded clip directly to its immutable Full-Batch final profile.
 
     This is the only lossy video encode for that clip. Final assembly later uses
     concat demuxer + ``-c:v copy`` and therefore cannot introduce another video
-    generation. Color is baked here from the same decoded RGB tensor.
+    generation. Color is baked here from the same decoded RGB tensor: the optional
+    Image Color Match transfer is applied to the tensor first, then the per-clip
+    saturation/contrast/brightness ffmpeg filter runs on top of it. The rolling
+    preview cache stays neutral, so it never pays for the match.
     """
     profile = normalize_full_batch_export_profile(export_profile)
     root = _ensure_cache_root()
@@ -2816,6 +3435,20 @@ def _encode_final_segment_video(
     proc = None
     log_f = None
     try:
+        match_spec = _normalize_color_match(color_match)
+        match_active = _color_match_is_active(match_spec)
+        if match_active:
+            _color_match_console(
+                "start (clip final encode "
+                f"target={Path(target_path).name} space={match_spec['space']} "
+                f"factor={match_spec['factor']:.2f} frames={int(video.shape[0])} "
+                f"device={_color_match_device()})"
+            )
+        video = _apply_color_match_frames(video, color_match)
+        if match_active:
+            _color_match_console(
+                f"stop (clip final encode target={Path(target_path).name})"
+            )
         h, w = int(video.shape[1]), int(video.shape[2])
         adjustment = _normalize_color_adjustment(color_adjustment)
         video_filter = None
@@ -2866,9 +3499,12 @@ def _encode_final_segment_video(
             pass
 
 
-def _final_segment_cache_meta_matches(desc, export_profile, color_adjustment, path, *, visible_frames=None):
+def _final_segment_cache_meta_matches(
+    desc, export_profile, color_adjustment, path, *, visible_frames=None, color_match=None
+):
     profile_sig = _full_batch_export_profile_signature(export_profile)
     color_sig = _color_adjustment_signature(color_adjustment)
+    match_sig = _color_match_signature(color_match)
     if not Path(path).exists() or Path(path).stat().st_size <= 0:
         return False
     if bool(desc.get("final_video_dirty", False)):
@@ -2879,13 +3515,22 @@ def _final_segment_cache_meta_matches(desc, export_profile, color_adjustment, pa
         return False
     if str(desc.get("final_video_color_signature") or "") != color_sig:
         return False
+    if str(desc.get("final_video_match_signature") or "") != match_sig:
+        return False
     if visible_frames is not None and int(desc.get("final_video_visible_frames", -1)) != int(visible_frames):
         return False
     return True
 
 
 def _tag_ref2va_final_segment_cache(
-    manifest_path, manifest, index, export_profile, color_adjustment, *, visible_frames=None
+    manifest_path,
+    manifest,
+    index,
+    export_profile,
+    color_adjustment,
+    *,
+    visible_frames=None,
+    color_match=None,
 ):
     segments = [dict(x) for x in manifest.get("segments", [])]
     idx = int(index)
@@ -2895,8 +3540,10 @@ def _tag_ref2va_final_segment_cache(
     desc["final_video_cache_version"] = int(FULL_BATCH_FINAL_CACHE_VERSION)
     desc["final_video_profile_signature"] = _full_batch_export_profile_signature(export_profile)
     desc["final_video_color_signature"] = _color_adjustment_signature(color_adjustment)
+    desc["final_video_match_signature"] = _color_match_signature(color_match)
     desc["final_video_codec"] = normalize_full_batch_export_profile(export_profile)["codec"]
     desc["color_adjustment"] = _normalize_color_adjustment(color_adjustment)
+    desc["color_match"] = _normalize_color_match(color_match)
     if visible_frames is not None:
         desc["final_video_visible_frames"] = int(visible_frames)
     desc.pop("final_video_dirty", None)
@@ -2921,11 +3568,14 @@ def _ensure_ref2va_final_segment_cache(
     progress=None,
     decoded_video=None,
     color_adjustment=None,
+    color_match=None,
 ):
     """Ensure exactly one Ref2VA clip has a final-profile sidecar.
 
     Existing matching sidecars are never decoded or re-encoded. A missing/dirty
-    sidecar causes VideoVAE work for this clip only.
+    sidecar causes VideoVAE work for this clip only. The Image Color Match spec
+    participates in the cache key, so switching the reference or its stats just
+    re-encodes the sidecar from the cached latents.
     """
     profile = normalize_full_batch_export_profile(export_profile)
     segments = [dict(x) for x in manifest.get("segments", [])]
@@ -2936,8 +3586,13 @@ def _ensure_ref2va_final_segment_cache(
     adjustment = _normalize_color_adjustment(
         color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
     )
+    match_spec = _normalize_color_match(
+        color_match if color_match is not None else desc.get("color_match")
+    )
     path = _ref2va_final_segment_cache_path(data_path, idx, profile)
-    if _final_segment_cache_meta_matches(desc, profile, adjustment, path):
+    if _final_segment_cache_meta_matches(
+        desc, profile, adjustment, path, color_match=match_spec
+    ):
         return manifest, path, False
 
     own_decode = decoded_video is None
@@ -2964,10 +3619,11 @@ def _ensure_ref2va_final_segment_cache(
             f"ref2va_final_{idx}_{uuid.uuid4().hex[:6]}",
             profile,
             adjustment,
+            match_spec,
         )
         os.replace(temp, path)
         manifest, _ = _tag_ref2va_final_segment_cache(
-            manifest_path, manifest, idx, profile, adjustment
+            manifest_path, manifest, idx, profile, adjustment, color_match=match_spec
         )
         return manifest, path, bool(own_decode)
     finally:
@@ -4088,13 +4744,15 @@ def cache_full_batch_ref2va_segment(
     fps,
     export_profile=None,
     color_adjustment=None,
+    color_match=None,
 ):
     """Decode/cache one Ref2VA Full-Batch clip exactly once.
 
     The decoded RGB result feeds two independent caches while it is still in
     memory: a neutral H.264 browser-preview checkpoint and, when a Full-Batch
     export profile is available, the exact final-profile sidecar. The latter is
-    what Final Decode concatenates with ``-c:v copy``.
+    what Final Decode concatenates with ``-c:v copy``. The Image Color Match spec
+    is baked only into the final sidecar, never into the neutral checkpoint.
     """
     data_path = Path(data_path)
     manifest_path = Path(manifest_path)
@@ -4110,6 +4768,9 @@ def cache_full_batch_ref2va_segment(
     desc = dict(segments[idx])
     adjustment = _normalize_color_adjustment(
         color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
+    )
+    match_spec = _normalize_color_match(
+        color_match if color_match is not None else desc.get("color_match")
     )
     profile = (
         normalize_full_batch_export_profile(export_profile)
@@ -4132,7 +4793,7 @@ def cache_full_batch_ref2va_segment(
             ffmpeg = _find_ffmpeg()
             manifest, _, _ = _ensure_ref2va_final_segment_cache(
                 data_path, manifest_path, manifest, idx, vae, float(fps), ffmpeg,
-                profile, color_adjustment=adjustment,
+                profile, color_adjustment=adjustment, color_match=match_spec,
             )
         return manifest, {
             "video_cached": bool(video_ready),
@@ -4204,6 +4865,7 @@ def cache_full_batch_ref2va_segment(
                 profile,
                 decoded_video=rendered_video,
                 color_adjustment=adjustment,
+                color_match=match_spec,
             )
             segments = [dict(x) for x in manifest.get("segments", [])]
             desc = dict(segments[idx])
@@ -4247,7 +4909,7 @@ def cache_full_batch_ref2va_segment(
             latest_desc = latest_segments[idx]
             final_path = _ref2va_final_segment_cache_path(data_path, idx, profile)
             final_ready = _final_segment_cache_meta_matches(
-                latest_desc, profile, adjustment, final_path
+                latest_desc, profile, adjustment, final_path, color_match=match_spec
             )
 
         return manifest, {
@@ -4363,7 +5025,10 @@ def _sync_committed_preview(
     fps,
     ffmpeg,
     token,
+    color_match=None,
 ):
+    match_spec = _normalize_color_match(color_match)
+    match_signature = _color_match_source_signature(match_spec)
     target = max(0, int(target_count))
     segments = [dict(x) for x in manifest.get("segments", [])]
     committed_path = _decoded_preview_cache_path(data_path)
@@ -4392,6 +5057,7 @@ def _sync_committed_preview(
     if (
         current_count == target
         and current_audio_mode == PREVIEW_AUDIO_MODE
+        and str(manifest.get("preview_match_signature") or "") == match_signature
         and committed_path.exists()
         and committed_video_path.exists()
     ):
@@ -4402,13 +5068,20 @@ def _sync_committed_preview(
         or current_count <= 0
         or current_count > target
         or not committed_video_path.exists()
+        or str(manifest.get("preview_match_signature") or "") != match_signature
     )
     source_meta = _source_meta(manifest)
-    source_preview_path = (
-        _ensure_source_preview_video(data_path, manifest, ffmpeg, token)
-        if source_meta is not None
-        else None
-    )
+    source_preview_path = None
+    if source_meta is not None:
+        # The Clip 0 prefix is part of the video join, so it has to carry the
+        # same match as the generated clips.
+        source_preview_path = _ensure_matched_source_preview_video(
+            data_path, manifest, ffmpeg, token, match_spec
+        )
+        if source_preview_path is None:
+            source_preview_path = _ensure_source_preview_video(
+                data_path, manifest, ffmpeg, token
+            )
     start_i = 0 if rebuild else current_count
     if rebuild:
         video_inputs = [source_preview_path] if source_preview_path is not None else []
@@ -4430,37 +5103,53 @@ def _sync_committed_preview(
         for i in range(start_i, target):
             desc = segments[i]
             segment_tmp = root / f"_{token}_commit_{i:04d}.mp4"
-            blob = desc.get("decoded_mp4_blob")
-            if blob is not None:
-                _copy_blob_to_file(data_path, blob, segment_tmp)
+            matched_clip = _ensure_matched_preview_clip(
+                data_path,
+                segments,
+                i,
+                manifest,
+                ffmpeg,
+                fps,
+                token,
+                match_spec,
+            )
+            if matched_clip is not None:
+                # The matched preview replaces the neutral fixture, so the
+                # assembled preview, and the clip-by-clip autosave that copies
+                # it, show the Image Color Match.
+                shutil.copy2(matched_clip, segment_tmp)
             else:
-                # Full Batch does not need to keep duplicate per-clip decoded
-                # video files. When entering Clip by Clip, bootstrap only the
-                # required video prefix from latent cache. Decoded audio is
-                # already present in the primary per-clip audio cache and is
-                # never decoded again here.
-                if _load_cached_decoded_audio(data_path, desc) is None:
-                    raise RuntimeError(
-                        "H3 progressive preview: decoded audio cache is missing."
+                blob = desc.get("decoded_mp4_blob")
+                if blob is not None:
+                    _copy_blob_to_file(data_path, blob, segment_tmp)
+                else:
+                    # Full Batch does not need to keep duplicate per-clip decoded
+                    # video files. When entering Clip by Clip, bootstrap only the
+                    # required video prefix from latent cache. Decoded audio is
+                    # already present in the primary per-clip audio cache and is
+                    # never decoded again here.
+                    if _load_cached_decoded_audio(data_path, desc) is None:
+                        raise RuntimeError(
+                            "H3 progressive preview: decoded audio cache is missing."
+                        )
+                    _LOG.info(
+                        "H3 incremental cache repair: decoding missing Ref2VA clip %d only",
+                        i + 1,
                     )
-                _LOG.info(
-                    "H3 incremental cache repair: decoding missing Ref2VA clip %d only",
-                    i + 1,
-                )
-                video, _ = _render_one_final_video_segment(
-                    data_path,
-                    segments,
-                    i,
-                    vae,
-                )
-                _encode_corrected_segment_video_mp4(
-                    ffmpeg,
-                    video,
-                    fps,
-                    segment_tmp,
-                    f"{token}_bootstrap_{i}",
-                )
-                del video
+                    video, _ = _render_one_final_video_segment(
+                        data_path,
+                        segments,
+                        i,
+                        vae,
+                    )
+                    _encode_corrected_segment_video_mp4(
+                        ffmpeg,
+                        video,
+                        fps,
+                        segment_tmp,
+                        f"{token}_bootstrap_{i}",
+                    )
+                    del video
 
             video_inputs.append(segment_tmp)
             temp_segments.append(segment_tmp)
@@ -4513,6 +5202,7 @@ def _sync_committed_preview(
     updated = dict(manifest)
     updated["preview_committed_count"] = target
     updated["preview_audio_mode"] = PREVIEW_AUDIO_MODE
+    updated["preview_match_signature"] = match_signature
     updated["build"] = BUILD
     updated["updated_at"] = time.time()
     _write_json_atomic(manifest_path, updated)
@@ -4560,6 +5250,7 @@ def _export_live_candidate_preview(
         fps,
         ffmpeg,
         token,
+        color_match=manifest.get("color_match"),
     )
     segments = [dict(x) for x in manifest.get("segments", [])]
 
@@ -4619,6 +5310,34 @@ def _export_live_candidate_preview(
             token,
         )
 
+        # The assembled preview drives the clip-by-clip autosave in the output
+        # directory, so the candidate has to carry the same Image Color Match as
+        # the final sidecar. The neutral candidate_mp4 stays the source of the
+        # append-only cache body. Encode while the RGB tensor is still resident,
+        # in chunks, so a second full-clip tensor is never materialized.
+        match_spec = _normalize_color_match(manifest.get("color_match"))
+        matched_candidate_path = None
+        if _color_match_is_active(match_spec):
+            matched_target = _matched_preview_clip_path(
+                data_path, candidate_index, match_spec
+            )
+            try:
+                _encode_matched_preview_clip_video(
+                    ffmpeg,
+                    current_video,
+                    fps,
+                    matched_target,
+                    f"{token}_match",
+                    match_spec,
+                )
+                matched_candidate_path = matched_target
+            except Exception:
+                _LOG.warning(
+                    "H3 preview color match: candidate preview encode failed",
+                    exc_info=True,
+                )
+                matched_candidate_path = None
+
         # Clip-by-Clip must leave behind the same exact-final sidecar that a
         # Full Batch would create. Encode it NOW from the already resident RGB
         # tensor, before releasing VideoVAE output. Switching a validated prefix
@@ -4639,6 +5358,7 @@ def _export_live_candidate_preview(
                 progress=None,
                 decoded_video=current_video,
                 color_adjustment=adjustment,
+                color_match=manifest.get("color_match"),
             )
             segments = [dict(x) for x in manifest.get("segments", [])]
 
@@ -4671,15 +5391,24 @@ def _export_live_candidate_preview(
         # rebuilt from lossless per-clip PCM and encoded ONCE for the complete
         # preview, so AAC priming/padding can never sit on an internal seam.
         source_meta = _source_meta(manifest)
+        candidate_input = (
+            matched_candidate_path if matched_candidate_path is not None else candidate_mp4
+        )
         if committed_video_path.exists() and validated_count > 0:
-            video_inputs = [committed_video_path, candidate_mp4]
+            video_inputs = [committed_video_path, candidate_input]
         else:
-            source_preview_path = (
-                _ensure_source_preview_video(data_path, manifest, ffmpeg, token)
-                if source_meta is not None
-                else None
-            )
-            video_inputs = ([source_preview_path] if source_preview_path is not None else []) + [candidate_mp4]
+            source_preview_path = None
+            if source_meta is not None:
+                # The Clip 0 prefix is part of the video join, so it carries the
+                # same match as the generated clips.
+                source_preview_path = _ensure_matched_source_preview_video(
+                    data_path, manifest, ffmpeg, token, match_spec
+                )
+                if source_preview_path is None:
+                    source_preview_path = _ensure_source_preview_video(
+                        data_path, manifest, ffmpeg, token
+                    )
+            video_inputs = ([source_preview_path] if source_preview_path is not None else []) + [candidate_input]
         segments = [dict(x) for x in manifest.get("segments", [])]
         _assemble_progressive_preview(
             ffmpeg,
@@ -4779,6 +5508,8 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     committed_video_path = _decoded_preview_video_cache_path(data_path)
     committed_count = int(manifest.get("preview_committed_count", 0))
     source_meta = _source_meta(manifest)
+    match_spec = _normalize_color_match(manifest.get("color_match"))
+    match_signature = _color_match_source_signature(match_spec)
 
     # Fastest path: the persistent committed preview already contains every
     # cached clip. Just republish it to ComfyUI temp for /view.
@@ -4786,6 +5517,7 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         committed_count >= len(segments)
         and committed_path.exists()
         and str(manifest.get("preview_audio_mode", "")) == PREVIEW_AUDIO_MODE
+        and str(manifest.get("preview_match_signature") or "") == match_signature
     ):
         preview_path = _reserve_preview_temp_path(final_id)
         try:
@@ -4814,23 +5546,51 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     temp_preview = root / f"_{token}.mp4"
 
     try:
+        ffmpeg = _find_ffmpeg()
         video_inputs = []
         start_i = 0
         if (
             committed_count > 0
             and committed_count < len(segments)
             and committed_video_path.exists()
+            and str(manifest.get("preview_match_signature") or "") == match_signature
         ):
             video_inputs.append(committed_video_path)
             start_i = committed_count
         elif source_meta is not None:
-            source_preview_path = _ensure_source_preview_video(
-                data_path, manifest, _find_ffmpeg(), token
+            # The Clip 0 prefix is part of the video join, so a restored preview
+            # carries the same Image Color Match as the autosave.
+            source_preview_path = _ensure_matched_source_preview_video(
+                data_path, manifest, ffmpeg, token, match_spec
             )
-            video_inputs.append(source_preview_path)
+            if source_preview_path is None:
+                source_preview_path = _ensure_source_preview_video(
+                    data_path, manifest, ffmpeg, token
+                )
+            if source_preview_path is not None:
+                video_inputs.append(source_preview_path)
 
         for i in range(start_i, len(segments)):
             desc = segments[i]
+            segment_path = root / f"_{token}_{i:04d}.mp4"
+            matched_clip = _ensure_matched_preview_clip(
+                data_path,
+                segments,
+                i,
+                manifest,
+                ffmpeg,
+                float(manifest.get("fps", FPS)),
+                token,
+                match_spec,
+            )
+            if matched_clip is not None:
+                # The matched preview replaces the neutral fixture, so a preview
+                # restored from cache shows the Image Color Match.
+                shutil.copy2(matched_clip, segment_path)
+                segment_files.append(segment_path)
+                video_inputs.append(segment_path)
+                continue
+
             blob = desc.get("decoded_mp4_blob")
             if blob is None:
                 # Old cache created before decoded candidate blobs existed:
@@ -4838,7 +5598,6 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
                 # happen automatically just by opening ComfyUI.
                 return None
 
-            segment_path = root / f"_{token}_{i:04d}.mp4"
             _copy_blob_to_file(data_path, blob, segment_path)
             segment_files.append(segment_path)
             video_inputs.append(segment_path)
@@ -5783,6 +6542,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         live_manifest, final_segment_path, _ = _ensure_ref2va_final_segment_cache(
                             data_path, manifest_path, live_manifest, i, vae, float(fps), ffmpeg,
                             clip_by_clip_export_profile, progress=None, color_adjustment=adjustment,
+                            color_match=live_manifest.get("color_match"),
                         )
                         editor_segment_paths.append(final_segment_path)
                         live_segments = [dict(x) for x in live_manifest.get("segments", [])]
@@ -5902,6 +6662,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 ffmpeg,
                 export_profile,
                 progress=progress,
+                color_match=manifest.get("color_match"),
             )
             exact_segment_paths.append(final_segment_path)
         all_manifest_segments = [dict(x) for x in manifest.get("segments", [])]
@@ -5920,6 +6681,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             float(fps),
             ffmpeg,
             token,
+            color_match=manifest.get("color_match"),
         )
         progress.advance()
         preview_path = _publish_full_preview(committed_path, unique_id)
@@ -5928,7 +6690,10 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         extension = _full_batch_export_profile_extension(export_profile)
         output_path = _next_output_path(out_dir, filename_prefix, extension)
         source_final_segment = (
-            _ensure_source_final_video(data_path, manifest, ffmpeg, export_profile, token)
+            _ensure_source_final_video(
+                data_path, manifest, ffmpeg, export_profile, token,
+                manifest.get("color_match"),
+            )
             if source_meta is not None
             else None
         )

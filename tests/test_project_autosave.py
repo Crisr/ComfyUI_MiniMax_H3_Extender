@@ -150,7 +150,8 @@ class Autosave(unittest.TestCase):
         ns = {'CACHE_TYPE': 'CACHE'}
         exec(compile(ast.Module(body=[method], type_ignores=[]), 'schema', 'exec'), ns)
         required = ns['INPUT_TYPES'](None)['required']
-        self.assertEqual(list(required)[-1], 'auto_save_project')
+        self.assertEqual(list(required)[-1], 'save_individual_clips')
+        self.assertIs(required['save_individual_clips'][1]['default'], False)
         self.assertIs(required['auto_save_project'][1]['default'], False)
         for filename, function in [('motion_context_disk.py', 'export'), ('fl2va_engine.py', 'export_fl2va_final')]:
             module = ast.parse((ROOT/filename).read_text())
