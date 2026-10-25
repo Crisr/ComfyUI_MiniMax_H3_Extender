@@ -1104,6 +1104,7 @@ class MiniMaxH3MotionContextDiskJoin:
         generation_seed=None,
         generation_clip_id=None,
         first_visible_offset=0,
+        segment_meta=None,
     ):
         data_path, manifest_path, manifest, mode, stop, index = _effective_state(
             previous_cache, run_mode, fps, unique_id
@@ -1201,6 +1202,9 @@ class MiniMaxH3MotionContextDiskJoin:
                 desc["clip_id"] = str(generation_clip_id)
             if bool(computed) and not bool(validated):
                 desc["computed"] = True
+            if isinstance(segment_meta, dict):
+                for meta_key, meta_value in segment_meta.items():
+                    desc[str(meta_key)] = meta_value
             segments = [dict(x) for x in manifest.get("segments", [])] + [desc]
             manifest = dict(manifest)
             manifest["geometry"] = geom if manifest.get("geometry") is None else manifest["geometry"]
@@ -3949,6 +3953,39 @@ def _assemble_progressive_preview(
                 pass
 
 
+# H3 ref2va always packs the reference image on the timeline immediately before
+# the target's frame 0, so a clip that receives no Motion Context opens by
+# holding the reference picture and then hard-cuts into the real shot. Measured
+# on real output at 24 fps: 4 frames on one clip, 7 on the next. The length is
+# prompt dependent, so measure it instead of hardcoding it.
+REF_ECHO_SCAN_FRAMES = 24
+REF_ECHO_CUT_DELTA = 0.12
+REF_ECHO_HOLD_DELTA = 0.05
+
+
+def _detect_ref_echo_head(video):
+    """Count leading frames that hold the reference picture.
+
+    Walks consecutive frames from the head. A held frame pair is nearly
+    identical, and the cut that ends the prologue is a large jump. Returns 0
+    when the head already moves, or when the hold runs past the scan window.
+    """
+    total = int(video.shape[0])
+    if total < 4:
+        return 0
+    limit = min(total - 1, REF_ECHO_SCAN_FRAMES)
+    previous = video[0, ::4, ::4, :3].detach().float()
+    for step in range(1, limit + 1):
+        probe = video[step, ::4, ::4, :3].detach().float()
+        delta = float((probe - previous).abs().mean())
+        if delta > REF_ECHO_CUT_DELTA:
+            return step
+        if delta > REF_ECHO_HOLD_DELTA:
+            return 0
+        previous = probe
+    return 0
+
+
 def _render_one_final_video_segment(
     data_path,
     segments,
@@ -3959,7 +3996,11 @@ def _render_one_final_video_segment(
     i = int(index)
     curr = segments[i]
 
-    if i == 0:
+    # A trim-0 seam is a per-clip Motion Context OFF shot: nothing is duplicated
+    # between the two clips, so it is a hard cut. The pair decoder cannot encode
+    # that, because it requires ``(prev_T - decode_start_t) % 5 == 0`` and H3
+    # video latents always have ``prev_T % 5 == 2``. Decode such a segment alone.
+    if i == 0 or int(curr.get("trim_frames", 0) or 0) == 0:
         v = _load_segment_video(data_path, curr)
         video = vae.decode(v)
         if progress is not None:
@@ -3973,12 +4014,13 @@ def _render_one_final_video_segment(
         visible_offset = int(curr.get("visible_offset", 0) or 0)
         if int(video.shape[0]) != source_frames:
             raise RuntimeError(
-                f"H3 progressive preview: clip 1 decoded {video.shape[0]}, "
+                f"H3 final decode: clip {i + 1} decoded {video.shape[0]}, "
                 f"expected source frames {source_frames}."
             )
         if visible_offset < 0 or visible_offset + visible_frames > source_frames:
             raise RuntimeError(
-                "H3 progressive preview: Clip 1 visible window lies outside its source latent."
+                f"H3 final decode: clip {i + 1} visible window lies outside "
+                "its source latent."
             )
         if visible_offset or visible_frames != source_frames:
             video = video[visible_offset:visible_offset + visible_frames]
@@ -4013,7 +4055,11 @@ def _render_one_final_audio_segment(
     i = int(index)
     curr = segments[i]
 
-    if i == 0:
+    if i == 0 or int(curr.get("trim_frames", 0) or 0) == 0:
+        # Trim-0 seam (per-clip Motion Context OFF): no audio overlap exists, so
+        # decode this clip alone. The pair decoder would also require the two
+        # audio token counts to sum to at least the joined target, which is not
+        # guaranteed at 40 Hz rounding.
         audio = _decode_single_audio(data_path, curr, audio_vae, fps)
         if progress is not None:
             progress.advance()
@@ -4816,6 +4862,39 @@ def cache_full_batch_ref2va_segment(
             rendered_video, seam_shift = _render_one_final_video_segment(
                 data_path, segments, idx, vae
             )
+            # Motion Context OFF: the clip opens on a held copy of the reference
+            # picture. Remove it once, here, and record the visible window so the
+            # audio decode, the preview blob and the final sidecar all agree.
+            if (
+                idx > 0
+                and not bool(desc.get("motion_context", True))
+                and int(desc.get("trim_frames", 0) or 0) == 0
+                and int(desc.get("visible_offset", 0) or 0) == 0
+            ):
+                drop = _detect_ref_echo_head(rendered_video)
+                if drop > 0:
+                    source_total = int(rendered_video.shape[0])
+                    rendered_video = rendered_video[int(drop):]
+                    desc["source_frames"] = source_total
+                    desc["visible_offset"] = int(drop)
+                    desc["frames"] = source_total - int(drop)
+                    desc["final_video_dirty"] = True
+                    desc.pop("decoded_audio", None)
+                    audio_ready = False
+                    # The cached preview blob still holds the echo, so it must be
+                    # rewritten even when only the seam shift was missing.
+                    video_ready = False
+                    segments[idx] = dict(desc)
+                    patched_segments = [dict(x) for x in manifest.get("segments", [])]
+                    patched_segments[idx] = dict(desc)
+                    manifest["segments"] = patched_segments
+                    _LOG.info(
+                        "H3 clip %d Motion Context OFF: dropped %d leading "
+                        "reference-echo frames (%.2fs).",
+                        idx + 1,
+                        int(drop),
+                        float(drop) / float(fps) if fps else 0.0,
+                    )
             rendered_mp4 = None
             video_profile = None
             if not video_ready:

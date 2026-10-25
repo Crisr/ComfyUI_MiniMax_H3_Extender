@@ -3028,6 +3028,9 @@ def _default_clip(index: int = 0):
         "last_frame": None,
         "guides": [],
         "first_source": "manual",
+        # Per-clip Motion Context (Ref2VA causal chain only). Clip 1 has no
+        # previous clip, so it can never receive Motion Context.
+        "motion_context": bool(index > 0),
     }
 
 
@@ -3120,6 +3123,11 @@ def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True)
                     if str(raw.get("first_source") or "manual").lower().strip() == "previous_clip" and i > 0
                     else "manual"
                 ),
+                # Motion Context OFF keeps the timeline in the same causal chain
+                # but injects nothing from the previous clip: no latent tail, no
+                # keyframe anchors, no audio tail. Clip 1 is always OFF because
+                # there is no previous clip to continue.
+                "motion_context": bool(raw.get("motion_context", True)) and i > 0,
             }
         )
 
@@ -3135,6 +3143,18 @@ def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True)
                 found_open = True
 
     return out
+
+
+def _segment_motion_mismatch(desc, clip_index, clip_motion):
+    """True when a cached segment was built with a different Motion Context.
+
+    Legacy segments were always rendered with Motion Context ON, so a missing
+    field must read as True. Otherwise an upgraded project would rerender once
+    for no reason.
+    """
+    if not isinstance(desc, dict) or int(clip_index) <= 0:
+        return False
+    return bool(desc.get("motion_context", True)) != bool(clip_motion)
 
 
 def _prompt_pack_signature_from_state(value):
@@ -6405,6 +6425,11 @@ class MiniMaxH3Extender:
                 interrupted_after = i
                 break
 
+            # Per-clip Motion Context. Clip 0 never has a previous clip to
+            # continue, and an OFF card must not receive the previous latent
+            # tail, keyframe anchors or audio tail.
+            clip_motion = i > 0 and bool(cfg.get("motion_context", True))
+
             # Refresh manifest state every iteration because Disk Join can
             # truncate or append the physical chain.
             current_manifest = _load_manifest_from_paths(data_path, manifest_path)
@@ -6427,6 +6452,12 @@ class MiniMaxH3Extender:
                     "H3 validated hard-skip: Ref2VA clip %d exists on disk; sampler forbidden",
                     i + 1,
                 )
+                if _segment_motion_mismatch(current_desc, i, clip_motion):
+                    _LOG.warning(
+                        "H3 clip %d is Validated; its per-clip Motion Context change "
+                        "is not applied until Validated is unchecked",
+                        i + 1,
+                    )
                 result = disk_join.join(
                     samples=None,
                     trim_frames=None,
@@ -6442,11 +6473,25 @@ class MiniMaxH3Extender:
                 continue
 
             if (
+                current_desc is not None
+                and not bool(current_desc.get("validated", False))
+                and _segment_motion_mismatch(current_desc, i, clip_motion)
+            ):
+                _LOG.info(
+                    "H3 clip %d Motion Context changed (stored=%s requested=%s); "
+                    "checkpoint not reusable, chain truncated from this clip",
+                    i + 1,
+                    bool(current_desc.get("motion_context", True)),
+                    clip_motion,
+                )
+
+            if (
                 str(run_mode) == "full_batch"
                 and existing
                 and current_desc is not None
                 and bool(current_desc.get("computed", False))
                 and not bool(current_desc.get("validated", False))
+                and not _segment_motion_mismatch(current_desc, i, clip_motion)
             ):
                 _LOG.info(
                     "H3 COMPUTED hard-reuse: Ref2VA clip %d exists on disk; sampler forbidden",
@@ -6681,23 +6726,30 @@ class MiniMaxH3Extender:
             trim_frames = None
             first_visible_offset = 0
             if i > 0:
-                if previous_proxy is None:
-                    raise RuntimeError(
-                        "MiniMax H3 Extender: previous cached latent is unavailable."
+                if clip_motion:
+                    if previous_proxy is None:
+                        raise RuntimeError(
+                            "MiniMax H3 Extender: previous cached latent is unavailable."
+                        )
+                    base_context_proxy = (
+                        _resize_context_latent_spatial(previous_proxy, resolved_width, resolved_height)
+                        if refine_enabled else previous_proxy
                     )
-                base_context_proxy = (
-                    _resize_context_latent_spatial(previous_proxy, resolved_width, resolved_height)
-                    if refine_enabled else previous_proxy
-                )
-                positive, trim_frames, _, _, _ = motion.apply(
-                    positive,
-                    latent,
-                    base_context_proxy,
-                    str(context_length),
-                    int(audio_context_length),
-                )
-                if base_context_proxy is not previous_proxy:
-                    del base_context_proxy
+                    positive, trim_frames, _, _, _ = motion.apply(
+                        positive,
+                        latent,
+                        base_context_proxy,
+                        str(context_length),
+                        int(audio_context_length),
+                    )
+                    if base_context_proxy is not previous_proxy:
+                        del base_context_proxy
+                else:
+                    # Motion Context OFF: independent shot. Nothing from the
+                    # previous clip reaches the sampler. trim_frames must be an
+                    # explicit 0 because Disk Join reads None as its default
+                    # 22-frame overlap and would silently crop this clip.
+                    trim_frames = 0
             elif source_meta is not None:
                 _send_extender_progress(
                     owner, i, len(clips), "preparing", "Encoding Clip 0 head guide",
@@ -6761,8 +6813,8 @@ class MiniMaxH3Extender:
                     selected_audio_slots=selected_audio_slots, audio_native_offset=audio_native_offset,
                     seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                     refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
-                    external_sigmas=external_sigmas, motion=motion,
-                    previous_refined_proxy=(previous_proxy if i > 0 else None),
+                    external_sigmas=external_sigmas, motion=(motion if clip_motion else None),
+                    previous_refined_proxy=(previous_proxy if clip_motion else None),
                     context_length=context_length, audio_context_length=audio_context_length,
                 )
                 del first_pass
@@ -6781,6 +6833,7 @@ class MiniMaxH3Extender:
                 computed=(str(run_mode) == "full_batch"),
                 generation_seed=cfg["seed"],
                 first_visible_offset=int(first_visible_offset),
+                segment_meta={"motion_context": bool(clip_motion)},
             )
             previous_handle = result[0]
             previous_proxy = result[1]

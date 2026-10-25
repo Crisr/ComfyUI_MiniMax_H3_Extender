@@ -98,6 +98,26 @@ Use **Motion Context ON** when you want continuous multi-clip motion and seamles
 
 ---
 
+### 🆕 Per-Clip Motion Context
+
+Inside a **Motion Context ON** timeline, every card now has its own **MOTION: ON / MOTION: OFF** button in the card footer.
+
+- **MOTION: ON** means the clip continues the previous clip. The previous tail supplies the keyframe and audio context, and the overlap frames are trimmed.
+- **MOTION: OFF** means the clip is an independent shot. Nothing from the previous clip reaches the sampler: no latent tail, no keyframe anchors and no audio tail. The clip starts fully fresh.
+- Card 1 has no previous clip, so its button stays disabled.
+- After a **MOTION: OFF** clip, the next **MOTION: ON** clip continues from that clip.
+- The flag is saved in the workflow and in the `.ext` project file.
+
+The global **MOTION: ON/OFF** toolbar button still selects the engine. Per-clip Motion requires the global button to be **ON**.
+
+An OFF clip stays in the same causal chain. It does not get random-access editing. Changing the flag does not change any Validated checkbox. A Validated clip keeps its disk cache until you uncheck Validated.
+
+The seam before an OFF clip is a real cut. The node decodes that clip on its own, so the pair decoder does not blend exposure or colour across the boundary. This is expected: the shot is independent.
+
+H3 ref2va always places the reference picture on the timeline just before frame 0 of the target. An OFF clip therefore opens on a short hold of the reference image, then hard-cuts into the real shot. The node measures that hold on the decoded clip and removes it. The measured length varies per clip, so it is detected rather than fixed. The removed frames are dropped from the video and the audio together, so A/V stay aligned, and the clip stays a hard cut from its neighbour.
+
+---
+
 ### 🆕 Per-Clip Local References
 
 Ref2VA clips can now use their own **local Picture, Video and Audio references** in addition to the existing global references.

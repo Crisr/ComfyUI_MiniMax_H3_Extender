@@ -1098,6 +1098,7 @@ function newClip(index) {
         last_frame: null,
         guides: [],
         first_source: "manual",
+        motion_context: index > 0,
     };
 }
 
@@ -1122,6 +1123,9 @@ function normalizeClipList(rawClips) {
         first_source: (i > 0 && String(c?.first_source || "manual") === "previous_clip")
             ? "previous_clip"
             : "manual",
+        // Clip 1 has no previous clip, so it can never receive Motion Context.
+        // Missing values read as ON to keep pre-existing workflows unchanged.
+        motion_context: i > 0 && c?.motion_context !== false,
     }));
 }
 
@@ -6862,6 +6866,53 @@ function render(node, runtime) {
         });
         validateLabel.append(validated, document.createTextNode("Validated"));
 
+        // Per-clip Motion Context (Ref2VA causal chain only). An OFF card stays
+        // in the same disk chain, but it injects nothing from the previous clip:
+        // no latent tail, no keyframe anchors and no audio tail.
+        const clipMotionOn = clip.motion_context !== false;
+        const globalMotionOn = state.motion_context !== false;
+        const motionButton = document.createElement("button");
+        motionButton.type = "button";
+        motionButton.textContent = clipMotionOn ? "MOTION: ON" : "MOTION: OFF";
+        motionButton.title = fl2vaMode
+            ? "Per-clip Motion Context is Ref2VA only"
+            : index === 0
+                ? "Clip 1 has no previous clip, so it never receives Motion Context"
+                : !globalMotionOn
+                    ? "Enable MOTION: ON in the Extender toolbar to use per-clip Motion Context"
+                    : (clipMotionOn
+                        ? `Clip ${index + 1} continues Clip ${index}: its tail becomes keyframe and audio context`
+                        : `Clip ${index + 1} is an independent shot with no influence from Clip ${index}`);
+        motionButton.style.display = fl2vaMode ? "none" : "inline-block";
+        motionButton.style.height = "22px";
+        motionButton.style.padding = "0 6px";
+        motionButton.style.fontSize = "9px";
+        motionButton.style.whiteSpace = "nowrap";
+        motionButton.style.fontWeight = clipMotionOn ? "700" : "400";
+        motionButton.style.background = clipMotionOn ? "rgba(70,150,230,.34)" : "";
+        motionButton.style.opacity = (index === 0 || !globalMotionOn) ? ".4" : ".95";
+        motionButton.disabled = fl2vaMode
+            || index === 0
+            || !globalMotionOn
+            || Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+        motionButton.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (motionButton.disabled) return;
+            clip.motion_context = !clipMotionOn;
+            // Validation stays untouched on purpose. The matching disk
+            // checkpoint is no longer valid for this clip, so drop only the
+            // COMPUTED marker to keep the badge honest.
+            runtime.computedIndices?.delete(index);
+            runtime.computedClipIds?.delete(String(clip.id || ""));
+            runtime.statusText = clip.motion_context
+                ? `Clip ${index + 1} Motion Context → ON (continues Clip ${index})`
+                : `Clip ${index + 1} Motion Context → OFF (independent shot)`;
+            updateHidden(node, runtime);
+            captureNativeWorkflowState(node, runtime);
+            render(node, runtime);
+        });
+
         const infoWrap = document.createElement("div");
         infoWrap.style.display = "flex";
         infoWrap.style.alignItems = "center";
@@ -6895,7 +6946,7 @@ function render(node, runtime) {
         info.style.opacity = ".65";
         infoWrap.appendChild(info);
 
-        foot.append(validateLabel, infoWrap);
+        foot.append(validateLabel, motionButton, infoWrap);
         card.appendChild(foot);
         cards.appendChild(card);
         restorePromptUiState(prompt, runtime, clip.id);
