@@ -268,3 +268,9 @@ class IntegrationContractTests(unittest.TestCase):
         text = Path("extender.py").read_text(encoding="utf-8")
         self.assertIn('"protection_source"', text)
         self.assertIn('"protection_signature"', text)
+
+    def test_refine_accepts_protection_context(self):
+        text = Path("extender.py").read_text(encoding="utf-8")
+        self.assertIn("protection_source_latent", text)
+        self.assertIn("make_protection_plan", text)
+        self.assertIn("_resize_context_latent_spatial(protection_source_latent", text)

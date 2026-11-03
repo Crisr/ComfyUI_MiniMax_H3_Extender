@@ -2782,6 +2782,8 @@ def _refine_ref2va_sample(
     sampler_name, scheduler, refine_scale, refine_steps, refine_denoise,
     external_sigmas, motion=None, previous_refined_proxy=None,
     context_length="22", audio_context_length=0,
+    protection_source_latent=None, protection_settings=None,
+    protection_source_id=None, protection_source_index=None,
 ):
     """Direct upscale+refine; returns the sole final sample and refine trim."""
     _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
@@ -2797,17 +2799,65 @@ def _refine_ref2va_sample(
         audio_native_offset=audio_native_offset,
     )
     refine_trim = None
-    if motion is not None and previous_refined_proxy is not None:
+    protection_active = bool(
+        protection_settings is not None
+        and protection_settings.enabled
+        and protection_source_latent is not None
+        and protection_source_id is not None
+        and protection_source_index is not None
+    )
+    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
+    protection_plan = None
+    if protection_active:
+        refine_sigmas = _effective_sample_sigmas(
+            clip_model, external_sigmas, refine_denoise, scheduler, refine_steps
+        )
+        validate_late_step(protection_settings, refine_sigmas)
+        if motion is None:
+            raise RuntimeError(
+                "MiniMax H3 Extender: Context Protection refine requires Motion Context."
+            )
+        if previous_refined_proxy is None:
+            raise RuntimeError(
+                "MiniMax H3 Extender: previous refined latent is unavailable for "
+                "Context Protection."
+            )
+        refined_source = _resize_context_latent_spatial(protection_source_latent, out_w, out_h)
+        source_video = _streams_from_latent(
+            refined_source, "protection source"
+        )[0]
+        masked, refine_trim = motion.apply_masked(
+            up_latent,
+            previous_refined_proxy,
+            str(context_length),
+            int(audio_context_length),
+            protection_settings.noise_strength,
+            protection_settings.noise_ease,
+        )
+        protection_plan = make_protection_plan(
+            masked,
+            source_video,
+            protection_source_id,
+            protection_source_index,
+            protection_settings,
+            refine_sigmas,
+            str(context_length),
+            int(audio_context_length),
+            refine_scale,
+        )
+        clip_model = install_protection_wrapper(clip_model, protection_plan)
+        del refined_source
+    elif motion is not None and previous_refined_proxy is not None:
         refine_positive, refine_trim, _, _, _ = motion.apply(
             refine_positive, up_latent, previous_refined_proxy,
             str(context_length), int(audio_context_length),
         )
     _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
-    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
     _release_models_before_refine(clip_model)
     refined = _sample_h3(
         clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
         int(refine_steps), float(refine_denoise), sigmas=refine_sigmas,
+        protection=protection_plan,
     )
     refined = preserve_first_pass_audio(refined, first_audio)
     return refined, refine_trim, out_w, out_h
@@ -6868,6 +6918,8 @@ class MiniMaxH3Extender:
             trim_frames = None
             first_visible_offset = 0
             protection_plan = None
+            protection_source_latent = None
+            base_sample_model = clip_model
             if i > 0:
                 if clip_motion:
                     if previous_proxy is None:
@@ -6910,9 +6962,11 @@ class MiniMaxH3Extender:
                             int(audio_context_length),
                             refine_scale,
                         )
-                        clip_model = install_protection_wrapper(
+                        base_sample_model = install_protection_wrapper(
                             clip_model, protection_plan
                         )
+                        if refine_enabled:
+                            protection_source_latent = source_latent
                         if base_source is not source_latent:
                             del base_source
                         del source_latent
@@ -6974,7 +7028,7 @@ class MiniMaxH3Extender:
             )
 
             sampled = _sample_h3(
-                clip_model,
+                base_sample_model,
                 positive,
                 latent,
                 cfg["seed"],
@@ -6985,6 +7039,8 @@ class MiniMaxH3Extender:
                 sigmas=sample_sigmas,
                 protection=protection_plan,
             )
+            if base_sample_model is not clip_model:
+                del base_sample_model
             if refine_enabled:
                 first_pass = sampled
                 sampled, refine_trim, _refine_w, _refine_h = _refine_ref2va_sample(
@@ -6999,8 +7055,21 @@ class MiniMaxH3Extender:
                     external_sigmas=external_sigmas, motion=(motion if clip_motion else None),
                     previous_refined_proxy=(previous_proxy if clip_motion else None),
                     context_length=context_length, audio_context_length=audio_context_length,
+                    protection_source_latent=(
+                        protection_source_latent if protection_active else None
+                    ),
+                    protection_settings=(
+                        protection_settings if protection_active else None
+                    ),
+                    protection_source_id=(
+                        protection_source if protection_active else None
+                    ),
+                    protection_source_index=(
+                        source_index if protection_active else None
+                    ),
                 )
                 del first_pass
+                del protection_source_latent
                 if refine_trim is not None:
                     trim_frames = refine_trim
 
