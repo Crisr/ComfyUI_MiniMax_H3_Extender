@@ -99,6 +99,12 @@ const PROJECT_WIDGETS = [
     "refine_scale",
     "refine_steps",
     "refine_denoise",
+    "context_protection",
+    "protection_keystone",
+    "protection_capstone",
+    "protection_late_step",
+    "protection_noise_strength",
+    "protection_noise_ease",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -1099,11 +1105,13 @@ function newClip(index) {
         guides: [],
         first_source: "manual",
         motion_context: index > 0,
+        protection_source: null,
     };
 }
 
 function normalizeClipList(rawClips) {
     const clips = Array.isArray(rawClips) && rawClips.length ? rawClips : [newClip(0)];
+    const firstId = String(clips[0]?.id || "clip_1");
     return clips.map((c, i) => ({
         id: String(c?.id || `clip_${i + 1}`),
         name: String(c?.name || ""),
@@ -1126,7 +1134,29 @@ function normalizeClipList(rawClips) {
         // Clip 1 has no previous clip, so it can never receive Motion Context.
         // Missing values read as ON to keep pre-existing workflows unchanged.
         motion_context: i > 0 && c?.motion_context !== false,
+        // Clip 1 has no earlier source. Later clips default to the first clip,
+        // while an explicit null disables protection for that card.
+        protection_source: i === 0
+            ? null
+            : (Object.prototype.hasOwnProperty.call(c || {}, "protection_source")
+                && c.protection_source === null
+                ? null
+                : (String(c?.protection_source || "").trim() || firstId)),
     }));
+}
+
+function protectionSourceOptions(clips, index) {
+    const options = [{ value: "", label: "None" }];
+    const current = Math.max(0, Number(index) || 0);
+    (Array.isArray(clips) ? clips : []).slice(0, current).forEach((clip, clipIndex) => {
+        const id = String(clip?.id || "");
+        if (!id) return;
+        options.push({
+            value: id,
+            label: String(clip?.name || `Clip ${clipIndex + 1}`),
+        });
+    });
+    return options;
 }
 
 function blankModeClips() {
@@ -1836,6 +1866,22 @@ function syncResolutionMirror(node, runtime) {
     node.graph?.setDirtyCanvas(true, true);
 }
 
+function wrapProtectionWidgetCallbacks(node, runtime) {
+    if (!node || !runtime || runtime.protectionCallbacksInstalled) return;
+    runtime.protectionCallbacksInstalled = true;
+    const widget = getWidget(node, "context_protection");
+    if (!widget) return;
+    const previous = widget.callback;
+    widget.callback = function (value) {
+        const result = previous ? previous.apply(this, arguments) : undefined;
+        runtime.statusText = value
+            ? "Context Protection ON - choose an earlier source on each clip"
+            : "Context Protection OFF";
+        render(node, runtime);
+        return result;
+    };
+}
+
 function wrapResolutionWidgetCallbacks(node, runtime) {
     if (!node || !runtime || runtime.resolutionCallbacksInstalled) return;
     runtime.resolutionCallbacksInstalled = true;
@@ -2192,6 +2238,14 @@ function syncModeSpecificNativeWidgets(node, runtime) {
 // Image Color Match options. The list order is the visual order, and it must
 // match the widget order appended in the Python INPUT_TYPES.
 const COLOR_MATCH_WIDGET_NAMES = ["color_match_space", "color_match_factor", "color_match_process_clip0"];
+const PROTECTION_WIDGET_DEFAULTS = {
+    context_protection: false,
+    protection_keystone: true,
+    protection_capstone: true,
+    protection_late_step: 1,
+    protection_noise_strength: 0.5,
+    protection_noise_ease: true,
+};
 const COLOR_MATCH_SPACE_VALUES = ["LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ"];
 const COLOR_MATCH_FALLBACK_FACTOR = 1.0;
 
@@ -2221,6 +2275,15 @@ function seedColorMatchWidgets(node) {
         const value = colorMatchWidgetValue(node, name);
         if (value === undefined) continue;
         if (getWidget(node, name)?.value === value) continue;
+        setWidgetValue(node, name, value);
+    }
+}
+
+function seedProtectionWidgets(node) {
+    // Older positional workflow arrays predate these appended widgets.
+    for (const [name, value] of Object.entries(PROTECTION_WIDGET_DEFAULTS)) {
+        const widget = getWidget(node, name);
+        if (!widget || widget.value !== undefined) continue;
         setWidgetValue(node, name, value);
     }
 }
@@ -6172,7 +6235,9 @@ function render(node, runtime) {
             insertButton.style.padding = "0";
             insertButton.addEventListener("click", (e) => {
                 e.preventDefault();
-                state.clips.splice(index + 1, 0, newClip(index + 1));
+                const insertedClip = newClip(index + 1);
+                insertedClip.protection_source = String(state.clips[0]?.id || "") || null;
+                state.clips.splice(index + 1, 0, insertedClip);
                 // Only FL2VA has an explicit Previous dependency. Independent
                 // Ref2VA clips are stable-ID random-access and stay untouched.
                 if (fl2vaMode && String(state.clips[index + 2]?.first_source || "manual") === "previous_clip") {
@@ -6913,6 +6978,45 @@ function render(node, runtime) {
             render(node, runtime);
         });
 
+        const globalProtectionOn = Boolean(getWidget(node, "context_protection")?.value);
+        const protectionSelect = document.createElement("select");
+        protectionSelect.title = "Earlier clip whose latents protect this clip from color drift";
+        protectionSelect.style.display = fl2vaMode ? "none" : "inline-block";
+        protectionSelect.style.height = "22px";
+        protectionSelect.style.maxWidth = "112px";
+        protectionSelect.style.padding = "0 3px";
+        protectionSelect.style.fontSize = "9px";
+        protectionSelect.style.background = "rgba(20,24,30,.92)";
+        for (const option of protectionSourceOptions(state.clips, index)) {
+            const element = document.createElement("option");
+            element.value = option.value;
+            element.textContent = option.label;
+            protectionSelect.appendChild(element);
+        }
+        protectionSelect.value = String(clip.protection_source || "");
+        protectionSelect.disabled = fl2vaMode
+            || index === 0
+            || !globalMotionOn
+            || !clipMotionOn
+            || !globalProtectionOn
+            || Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+        protectionSelect.style.opacity = protectionSelect.disabled ? ".4" : ".95";
+        protectionSelect.addEventListener("change", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (protectionSelect.disabled) return;
+            const selected = String(protectionSelect.value || "");
+            clip.protection_source = selected || null;
+            runtime.computedIndices?.delete(index);
+            runtime.computedClipIds?.delete(String(clip.id || ""));
+            runtime.statusText = selected
+                ? `Clip ${index + 1} protection source: ${protectionSelect.selectedOptions?.[0]?.textContent || selected}`
+                : `Clip ${index + 1} Context Protection disabled for this clip`;
+            updateHidden(node, runtime);
+            captureNativeWorkflowState(node, runtime);
+            render(node, runtime);
+        });
+
         const infoWrap = document.createElement("div");
         infoWrap.style.display = "flex";
         infoWrap.style.alignItems = "center";
@@ -6946,7 +7050,7 @@ function render(node, runtime) {
         info.style.opacity = ".65";
         infoWrap.appendChild(info);
 
-        foot.append(validateLabel, motionButton, infoWrap);
+        foot.append(validateLabel, motionButton, protectionSelect, infoWrap);
         card.appendChild(foot);
         cards.appendChild(card);
         restorePromptUiState(prompt, runtime, clip.id);
@@ -7313,6 +7417,7 @@ function buildUi(node) {
     // the space row would render empty instead of LAB. Seed the defaults here,
     // at node construction; the mode sync then pushes them into the Vue store.
     seedColorMatchWidgets(node);
+    seedProtectionWidgets(node);
 
     const state = parseState(jsonWidget.value);
     state.refine_enabled = boolValue(refineEnabledWidget.value, false);
@@ -7597,7 +7702,9 @@ function buildUi(node) {
     add.textContent = "+ Add Clip";
     add.addEventListener("click", (e) => {
         e.preventDefault();
-        runtime.state.clips.push(newClip(runtime.state.clips.length));
+        const appendedClip = newClip(runtime.state.clips.length);
+        appendedClip.protection_source = String(runtime.state.clips[0]?.id || "") || null;
+        runtime.state.clips.push(appendedClip);
         updateHidden(node, runtime);
         render(node, runtime);
         requestAnimationFrame(() => {
@@ -7987,6 +8094,7 @@ function buildUi(node) {
 
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
+    wrapProtectionWidgetCallbacks(node, runtime);
     render(node, runtime);
     refreshLoraNames(node, runtime);
 
