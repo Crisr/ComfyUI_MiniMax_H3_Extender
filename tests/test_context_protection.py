@@ -11,8 +11,11 @@ from context_protection import (
     make_protection_plan,
     make_protection_wrapper,
     normalize_protection_settings,
+    normalize_protection_source,
+    protection_cache_mismatch,
     protection_signature,
     resolve_sampler_step,
+    resolve_source_index,
     restore_samples,
 )
 
@@ -227,3 +230,25 @@ class ProtectionPlanTests(unittest.TestCase):
         self.assertTrue(torch.equal(restored[0][:, :, :3], plan.masked.held_video))
         self.assertTrue(torch.equal(restored[0][:, :, 3:], video[:, :, 3:]))
         self.assertEqual(float(restored[0][:, :, :3].min()), 1.0)
+
+
+class SourceResolutionTests(unittest.TestCase):
+    def test_source_resolution_rejects_missing_current_and_future(self):
+        clips = [{"id": "clip_a"}, {"id": "clip_b"}, {"id": "clip_c"}]
+        self.assertEqual(resolve_source_index(clips, 2, "clip_a"), 0)
+        for bad in ("missing", "clip_b", "clip_c"):
+            with self.assertRaises(ValueError):
+                resolve_source_index(clips, 1, bad)
+
+    def test_missing_source_defaults_to_first_clip_but_explicit_null_stays_null(self):
+        self.assertEqual(normalize_protection_source({}, 2, "clip_a"), "clip_a")
+        self.assertEqual(normalize_protection_source({"protection_source": ""}, 2, "clip_a"), "clip_a")
+        self.assertEqual(normalize_protection_source({"protection_source": "clip_b"}, 2, "clip_a"), "clip_b")
+        self.assertIsNone(normalize_protection_source({"protection_source": None}, 2, "clip_a"))
+        self.assertIsNone(normalize_protection_source({}, 0, "clip_a"))
+
+    def test_cache_mismatch_treats_missing_signature_as_off(self):
+        self.assertFalse(protection_cache_mismatch({}, "off"))
+        self.assertTrue(protection_cache_mismatch({}, "abc"))
+        self.assertFalse(protection_cache_mismatch({"protection_signature": "abc"}, "abc"))
+        self.assertTrue(protection_cache_mismatch({"protection_signature": "abc"}, "off"))

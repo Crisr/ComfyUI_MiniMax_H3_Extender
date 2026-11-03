@@ -404,6 +404,43 @@ def restore_samples(samples, plan):
     raise ValueError("Context protection: unsupported sample container.")
 
 
+def normalize_protection_source(raw_clip, clip_index, first_clip_id):
+    if int(clip_index) <= 0:
+        return None
+    raw = raw_clip if isinstance(raw_clip, dict) else {}
+    if "protection_source" in raw and raw.get("protection_source") is None:
+        return None
+    source = str(raw.get("protection_source") or "").strip()
+    if source:
+        return source
+    first = str(first_clip_id or "").strip()
+    return first or None
+
+
+def resolve_source_index(clips, clip_index, source_clip_id):
+    wanted = str(source_clip_id or "")
+    for index, clip in enumerate(clips):
+        if str((clip or {}).get("id") or "") != wanted:
+            continue
+        if index >= int(clip_index):
+            raise ValueError(
+                f"Context protection: clip {int(clip_index) + 1} source "
+                f"{wanted!r} must be an earlier clip."
+            )
+        return index
+    raise ValueError(
+        f"Context protection: clip {int(clip_index) + 1} source "
+        f"{wanted!r} was not found in the clip list."
+    )
+
+
+def protection_cache_mismatch(segment_meta, expected_signature) -> bool:
+    meta = segment_meta if isinstance(segment_meta, dict) else {}
+    previous = str(meta.get("protection_signature", "off") or "off")
+    expected = str(expected_signature or "off")
+    return previous != expected
+
+
 def resolve_sampler_step(sigma, sigmas) -> int:
     """Return the sigma index nearest to the current sampler sigma."""
     if not torch.is_tensor(sigmas) or int(sigmas.numel()) == 0:
