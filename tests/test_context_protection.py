@@ -6,6 +6,7 @@ import torch
 
 from context_protection import (
     ProtectionSettings,
+    apply_masked_samples,
     build_context_noise_mask,
     build_masked_context,
     capstone_index,
@@ -19,6 +20,13 @@ from context_protection import (
     resolve_source_index,
     restore_samples,
 )
+
+
+class FakeNested:
+    is_nested = True
+
+    def __init__(self, tensors):
+        self.tensors = tuple(tensors)
 
 
 class ContextProtectionCoreTests(unittest.TestCase):
@@ -174,8 +182,8 @@ class ProtectionPlanTests(unittest.TestCase):
                 {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])},
                 denoise_mask=mask, audio_denoise_mask=audio_mask)
         self.assertEqual(seen["t"], 22)
-        self.assertEqual(seen["front"], [1.0, 1.0, 1.0])
-        self.assertEqual(seen["audio_front"], [1.0, 1.0, 1.0])
+        self.assertEqual(seen["front"], [1.0, 0.5, 0.5])
+        self.assertEqual(seen["audio_front"], [0.0, 0.0, 0.0])
 
     def test_protection_wrapper_appends_then_trims_after_late_step(self):
         settings = ProtectionSettings(True, True, True, 1, 0.5, True)
@@ -193,12 +201,12 @@ class ProtectionPlanTests(unittest.TestCase):
             return [torch.zeros_like(x[0]), torch.zeros_like(x[1])]
 
         x = [torch.zeros(1, 2, 22, 4, 4), torch.zeros(1, 2, 2, 100)]
-        mask = torch.ones(1, 1, 22, 4, 4)
+        mask = torch.zeros(1, 1, 22, 4, 4)
         out = wrapper(executor, x, torch.tensor(500.0), None, {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])},
                       denoise_mask=mask, audio_denoise_mask=torch.ones(1, 1, 1, 100))
         self.assertEqual(seen["t"], 27)
         self.assertEqual(seen["mask_t"], 27)
-        self.assertEqual(seen["front"], [0.5, 0.25, 0.0])
+        self.assertEqual(seen["front"], [0.0, 0.25, 0.0])
         self.assertEqual(out[0].shape[2], 22)
 
     def test_capstone_wrapper_cleans_up_when_executor_raises(self):
@@ -222,6 +230,43 @@ class ProtectionPlanTests(unittest.TestCase):
 
         self.assertEqual(x[0].shape[2], 22)
         self.assertEqual(mask.shape[2], 22)
+
+    def test_capstone_preserves_a_nested_audio_stream(self):
+        settings = ProtectionSettings(True, True, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        wrapper = make_protection_wrapper(plan)
+        seen = {}
+
+        def executor(x, timestep, context, transformer_options, **kwargs):
+            self.assertIsInstance(x, FakeNested)
+            seen["audio_shape"] = tuple(x.tensors[1].shape)
+            return FakeNested([
+                torch.zeros_like(x.tensors[0]),
+                torch.zeros_like(x.tensors[1]),
+            ])
+
+        x = FakeNested([torch.zeros(1, 2, 22, 4, 4), torch.zeros(1, 2, 2, 100)])
+        out = wrapper(executor, x, torch.tensor(500.0), None,
+                      {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])},
+                      denoise_mask=torch.zeros(1, 1, 22, 4, 4),
+                      audio_denoise_mask=torch.zeros(1, 1, 1, 100))
+        self.assertIsInstance(out, FakeNested)
+        self.assertEqual(out.tensors[0].shape[2], 22)
+        self.assertEqual(seen["audio_shape"], (1, 2, 2, 100))
+
+    def test_apply_masked_samples_installs_both_streams(self):
+        masked = self._fake_masked()
+        samples = FakeNested([
+            torch.zeros(1, 2, 6, 4, 4),
+            torch.zeros(1, 2, 2, 30),
+        ])
+        installed = apply_masked_samples(samples, masked)
+        self.assertIsInstance(installed, FakeNested)
+        self.assertTrue(torch.equal(installed.tensors[0], masked.video))
+        self.assertTrue(torch.equal(installed.tensors[1], masked.audio))
 
     def test_restore_samples_replaces_the_held_prefix(self):
         plan = self._plan_with_held_values()

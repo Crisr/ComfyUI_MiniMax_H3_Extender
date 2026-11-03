@@ -263,6 +263,23 @@ def _stream_pair(value):
     raise ValueError("Context protection: unsupported sample container.")
 
 
+def apply_masked_samples(samples, masked):
+    """Return samples with the masked video and audio streams installed."""
+    video, audio = _stream_pair(samples)
+    masked_video = masked.video.to(device=video.device, dtype=video.dtype)
+    masked_audio = masked.audio.to(device=audio.device, dtype=audio.dtype)
+    if isinstance(samples, tuple):
+        return (masked_video, masked_audio, *samples[2:])
+    if isinstance(samples, list):
+        return [masked_video, masked_audio, *samples[2:]]
+    if bool(getattr(samples, "is_nested", False)):
+        tensors = list(samples.tensors)
+        tensors[0] = masked_video
+        tensors[1] = masked_audio
+        return type(samples)(tensors)
+    raise ValueError("Context protection: unsupported sample container.")
+
+
 def _replace_video(value, video):
     if isinstance(value, tuple):
         return (video, *value[1:])
@@ -307,21 +324,28 @@ def make_protection_wrapper(plan: ProtectionPlan):
         original_video_steps = int(video.shape[2])
 
         video_dtype = denoise_mask.dtype if torch.is_tensor(denoise_mask) else video.dtype
-        audio_dtype = audio_denoise_mask.dtype if torch.is_tensor(audio_denoise_mask) else audio.dtype
         plan_video_mask = plan.masked.video_mask.to(device=video.device, dtype=video_dtype)
-        plan_audio_mask = plan.masked.audio_mask.to(device=audio.device, dtype=audio_dtype)
+
+        if torch.is_tensor(denoise_mask):
+            active_video_mask = _fit_mask_length(
+                denoise_mask, int(video.shape[2]), 2
+            ).clone()
+        else:
+            active_video_mask = torch.zeros_like(video[:, :1])
+        held = min(int(plan.masked.video_steps), int(active_video_mask.shape[2]))
+        if held > 0:
+            plan_prefix = _fit_mask_length(
+                plan_video_mask, int(video.shape[2]), 2
+            )[:, :, :held]
+            active_video_mask[:, :, :held] = torch.maximum(
+                active_video_mask[:, :, :held], plan_prefix
+            )
+            # Late Lock owns the keystone slot: locked before the step, free at
+            # and after it. Existing caller masks remain chained elsewhere.
+            active_video_mask[:, :, 0] = 1.0 if step < int(plan.late_step) else 0.0
+        active_audio_mask = audio_denoise_mask
 
         if step < int(plan.late_step):
-            if torch.is_tensor(denoise_mask):
-                active_video_mask = denoise_mask.clone()
-            else:
-                active_video_mask = torch.ones_like(video[:, :1])
-            if torch.is_tensor(audio_denoise_mask):
-                active_audio_mask = audio_denoise_mask.clone()
-            else:
-                active_audio_mask = torch.ones_like(audio[:, :1, :1])
-            active_video_mask[:, :, :plan.masked.video_steps] = 1.0
-            active_audio_mask[..., :plan.masked.audio_steps] = 1.0
             return executor(
                 x, timestep, context, transformer_options,
                 minimax_payload=minimax_payload,
@@ -330,12 +354,6 @@ def make_protection_wrapper(plan: ProtectionPlan):
                 **kwargs,
             )
 
-        active_video_mask = _fit_mask_length(
-            plan_video_mask, int(video.shape[2]), 2
-        ).clone()
-        active_audio_mask = _fit_mask_length(
-            plan_audio_mask, int(audio.shape[-1]), 3
-        ).clone()
         model_x = x
         if plan.capstone is not None:
             capstone = plan.capstone.to(device=video.device, dtype=video.dtype)
@@ -346,12 +364,7 @@ def make_protection_wrapper(plan: ProtectionPlan):
                 dtype=active_video_mask.dtype,
             )
             active_video_mask = torch.cat((active_video_mask, mask_tail), dim=2)
-            if isinstance(x, tuple):
-                model_x = (model_video, *x[1:])
-            elif isinstance(x, list):
-                model_x = [model_video, *x[1:]]
-            else:
-                model_x = model_video
+            model_x = _replace_video(x, model_video)
 
         out = executor(
             model_x, timestep, context, transformer_options,

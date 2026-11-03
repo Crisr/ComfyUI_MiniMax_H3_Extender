@@ -50,6 +50,7 @@ from PIL import Image, ImageEnhance, ImageOps
 from server import PromptServer
 
 from .context_protection import (
+    apply_masked_samples,
     install_protection_wrapper,
     make_protection_plan,
     normalize_protection_settings,
@@ -2599,6 +2600,8 @@ def _sample_h3(
         latent.get("downscale_ratio_spacial", None),
         latent.get("downscale_ratio_temporal", None),
     )
+    if protection is not None:
+        latent_image = apply_masked_samples(latent_image, protection.masked)
     latent_out["samples"] = latent_image
 
     batch_inds = latent_out.get("batch_index", None)
