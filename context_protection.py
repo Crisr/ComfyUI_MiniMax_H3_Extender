@@ -164,6 +164,246 @@ def build_masked_context(
     )
 
 
+@dataclass
+class ProtectionPlan:
+    masked: MaskedContext
+    keystone: torch.Tensor | None
+    capstone: torch.Tensor | None
+    late_step: int
+    source_clip_id: str
+    source_index: int
+    signature: str
+
+
+def validate_late_step(settings: ProtectionSettings, sigmas) -> None:
+    count = int(len(sigmas)) if sigmas is not None else 0
+    if int(settings.late_step) < 0 or int(settings.late_step) >= count - 1:
+        raise ValueError(
+            "Context protection: Late Lock step "
+            f"{int(settings.late_step)} is outside the active sigma schedule "
+            f"({count} values)."
+        )
+
+
+def extract_capstone(source_video, block_steps=5):
+    if not torch.is_tensor(source_video) or source_video.ndim != 5:
+        raise ValueError("Context protection: capstone source must be a 5D video latent.")
+    length = int(source_video.shape[2])
+    start = capstone_index(length)
+    if start <= 0 or start >= length:
+        return None
+    capstone = source_video[:, :, start:start + int(block_steps)].clone()
+    if int(capstone.shape[2]) == 0:
+        return None
+    return capstone
+
+
+def make_protection_plan(
+    masked: MaskedContext,
+    source_video,
+    source_clip_id,
+    source_index,
+    settings: ProtectionSettings,
+    sigmas,
+    context_length,
+    audio_context_length,
+    refine_scale=1.0,
+) -> ProtectionPlan:
+    validate_late_step(settings, sigmas)
+    if not torch.is_tensor(source_video) or source_video.ndim != 5:
+        raise ValueError("Context protection: source must be a 5D video latent.")
+    if int(source_video.shape[2]) < 1:
+        raise ValueError("Context protection: source video latent is empty.")
+    if masked.video.shape[:2] != source_video.shape[:2] or masked.video.shape[3:] != source_video.shape[3:]:
+        raise ValueError("Context protection: source and target latent geometry differ.")
+
+    held_video = masked.held_video.clone()
+    keystone = None
+    if settings.keystone:
+        keystone = source_video[:, :, :1].clone()
+        held_video[:, :, :1] = keystone
+
+    capstone = extract_capstone(source_video) if settings.capstone else None
+    updated = MaskedContext(
+        video=masked.video,
+        audio=masked.audio,
+        video_mask=masked.video_mask,
+        audio_mask=masked.audio_mask,
+        held_video=held_video,
+        held_audio=masked.held_audio,
+        video_steps=masked.video_steps,
+        audio_steps=masked.audio_steps,
+        trim_frames=masked.trim_frames,
+    )
+    signature = protection_signature(
+        source_clip_id, settings, sigmas, context_length,
+        audio_context_length, refine_scale,
+    )
+    return ProtectionPlan(
+        masked=updated,
+        keystone=keystone,
+        capstone=capstone,
+        late_step=int(settings.late_step),
+        source_clip_id=str(source_clip_id),
+        source_index=int(source_index),
+        signature=signature,
+    )
+
+
+def _stream_pair(value):
+    if isinstance(value, (tuple, list)):
+        if len(value) < 2:
+            raise ValueError("Context protection: expected video and audio streams.")
+        return value[0], value[1]
+    if bool(getattr(value, "is_nested", False)):
+        tensors = list(getattr(value, "tensors", ()))
+        if len(tensors) < 2:
+            raise ValueError("Context protection: expected video and audio streams.")
+        return tensors[0], tensors[1]
+    raise ValueError("Context protection: unsupported sample container.")
+
+
+def _replace_video(value, video):
+    if isinstance(value, tuple):
+        return (video, *value[1:])
+    if isinstance(value, list):
+        return [video, *value[1:]]
+    if bool(getattr(value, "is_nested", False)):
+        tensors = list(value.tensors)
+        tensors[0] = video
+        return type(value)(tensors)
+    return video
+
+
+def _fit_mask_length(mask, length, dim):
+    current = int(mask.shape[dim])
+    wanted = int(length)
+    if current == wanted:
+        return mask
+    if current > wanted:
+        return mask.narrow(dim, 0, wanted)
+    shape = list(mask.shape)
+    shape[dim] = wanted - current
+    tail = torch.zeros(shape, device=mask.device, dtype=mask.dtype)
+    return torch.cat((mask, tail), dim=dim)
+
+
+def make_protection_wrapper(plan: ProtectionPlan):
+    def wrapper(
+        executor,
+        x,
+        timestep,
+        context,
+        transformer_options,
+        minimax_payload=None,
+        denoise_mask=None,
+        audio_denoise_mask=None,
+        **kwargs,
+    ):
+        video, audio = _stream_pair(x)
+        sigma = float(torch.as_tensor(timestep).detach().flatten()[0].item()) / 1000.0
+        sigmas = transformer_options["sample_sigmas"]
+        step = resolve_sampler_step(sigma, sigmas)
+        original_video_steps = int(video.shape[2])
+
+        video_dtype = denoise_mask.dtype if torch.is_tensor(denoise_mask) else video.dtype
+        audio_dtype = audio_denoise_mask.dtype if torch.is_tensor(audio_denoise_mask) else audio.dtype
+        plan_video_mask = plan.masked.video_mask.to(device=video.device, dtype=video_dtype)
+        plan_audio_mask = plan.masked.audio_mask.to(device=audio.device, dtype=audio_dtype)
+
+        if step < int(plan.late_step):
+            if torch.is_tensor(denoise_mask):
+                active_video_mask = denoise_mask.clone()
+            else:
+                active_video_mask = torch.ones_like(video[:, :1])
+            if torch.is_tensor(audio_denoise_mask):
+                active_audio_mask = audio_denoise_mask.clone()
+            else:
+                active_audio_mask = torch.ones_like(audio[:, :1, :1])
+            active_video_mask[:, :, :plan.masked.video_steps] = 1.0
+            active_audio_mask[..., :plan.masked.audio_steps] = 1.0
+            return executor(
+                x, timestep, context, transformer_options,
+                minimax_payload=minimax_payload,
+                denoise_mask=active_video_mask,
+                audio_denoise_mask=active_audio_mask,
+                **kwargs,
+            )
+
+        active_video_mask = _fit_mask_length(
+            plan_video_mask, int(video.shape[2]), 2
+        ).clone()
+        active_audio_mask = _fit_mask_length(
+            plan_audio_mask, int(audio.shape[-1]), 3
+        ).clone()
+        model_x = x
+        if plan.capstone is not None:
+            capstone = plan.capstone.to(device=video.device, dtype=video.dtype)
+            model_video = torch.cat((video, capstone), dim=2)
+            mask_tail = torch.zeros(
+                (1, 1, int(capstone.shape[2]), int(video.shape[3]), int(video.shape[4])),
+                device=active_video_mask.device,
+                dtype=active_video_mask.dtype,
+            )
+            active_video_mask = torch.cat((active_video_mask, mask_tail), dim=2)
+            if isinstance(x, tuple):
+                model_x = (model_video, *x[1:])
+            elif isinstance(x, list):
+                model_x = [model_video, *x[1:]]
+            else:
+                model_x = model_video
+
+        out = executor(
+            model_x, timestep, context, transformer_options,
+            minimax_payload=minimax_payload,
+            denoise_mask=active_video_mask,
+            audio_denoise_mask=active_audio_mask,
+            **kwargs,
+        )
+        if plan.capstone is not None:
+            out_video, _ = _stream_pair(out)
+            out = _replace_video(
+                out, out_video[:, :, :original_video_steps].contiguous()
+            )
+        return out
+
+    return wrapper
+
+
+def install_protection_wrapper(model, plan):
+    if plan is None or plan.signature == "off":
+        return model
+    from comfy.patcher_extension import WrappersMP
+
+    patched = model.clone()
+    patched.add_wrapper_with_key(
+        WrappersMP.DIFFUSION_MODEL,
+        "h3_context_protection",
+        make_protection_wrapper(plan),
+    )
+    return patched
+
+
+def restore_samples(samples, plan):
+    if plan is None:
+        return samples
+    video, audio = _stream_pair(samples)
+    restored_video = video.clone()
+    restored_audio = audio.clone()
+    restored_video[:, :, :plan.masked.video_steps] = plan.masked.held_video
+    restored_audio[..., :plan.masked.audio_steps] = plan.masked.held_audio
+    if isinstance(samples, tuple):
+        return (restored_video, *samples[1:])
+    if isinstance(samples, list):
+        return [restored_video, *samples[1:]]
+    if bool(getattr(samples, "is_nested", False)):
+        tensors = list(samples.tensors)
+        tensors[0] = restored_video
+        tensors[1] = restored_audio
+        return type(samples)(tensors)
+    raise ValueError("Context protection: unsupported sample container.")
+
+
 def resolve_sampler_step(sigma, sigmas) -> int:
     """Return the sigma index nearest to the current sampler sigma."""
     if not torch.is_tensor(sigmas) or int(sigmas.numel()) == 0:

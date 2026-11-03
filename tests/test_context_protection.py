@@ -8,9 +8,12 @@ from context_protection import (
     build_context_noise_mask,
     build_masked_context,
     capstone_index,
+    make_protection_plan,
+    make_protection_wrapper,
     normalize_protection_settings,
     protection_signature,
     resolve_sampler_step,
+    restore_samples,
 )
 
 
@@ -106,3 +109,121 @@ class MaskedContextTests(unittest.TestCase):
                 torch.zeros(1, 2, 6, 4, 4), torch.zeros(1, 2, 2, 30),
                 torch.zeros(1, 2, 0, 4, 4), torch.zeros(1, 2, 2, 0),
             )
+
+
+class ProtectionPlanTests(unittest.TestCase):
+    @staticmethod
+    def _fake_masked():
+        target_video = torch.zeros(1, 2, 6, 4, 4)
+        held_video = torch.ones(1, 2, 3, 4, 4)
+        return build_masked_context(
+            target_video, torch.zeros(1, 2, 2, 30),
+            held_video, torch.ones(1, 2, 2, 15),
+            noise_strength=0.5, noise_ease=False, trim_frames=9,
+        )
+
+    @staticmethod
+    def _plan_with_held_values():
+        settings = ProtectionSettings(True, False, True, 1, 0.5, True)
+        return make_protection_plan(
+            ProtectionPlanTests._fake_masked(),
+            torch.zeros(1, 2, 22, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+
+    def test_plan_rejects_late_step_outside_schedule(self):
+        settings = ProtectionSettings(True, True, True, 3, 0.5, True)
+        masked = self._fake_masked()
+        with self.assertRaises(ValueError):
+            make_protection_plan(
+                masked, torch.zeros(1, 2, 22, 4, 4), "clip_1", 0, settings,
+                torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+            )
+
+    def test_plan_skips_capstone_for_short_source(self):
+        settings = ProtectionSettings(True, True, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 5, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        self.assertIsNone(plan.capstone)
+
+    def test_protection_wrapper_delays_front_mask_before_late_step(self):
+        settings = ProtectionSettings(True, True, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        wrapper = make_protection_wrapper(plan)
+        seen = {}
+
+        def executor(x, timestep, context, transformer_options, **kwargs):
+            seen["t"] = x[0].shape[2]
+            seen["front"] = kwargs["denoise_mask"][0, 0, :3, 0, 0].tolist()
+            seen["audio_front"] = kwargs["audio_denoise_mask"][0, 0, 0, :3].tolist()
+            return [torch.zeros_like(x[0]), torch.zeros_like(x[1])]
+
+        x = [torch.zeros(1, 2, 22, 4, 4), torch.zeros(1, 2, 2, 100)]
+        mask = torch.empty(1, 1, 22, 4, 4).fill_(0.5)
+        audio_mask = torch.zeros(1, 1, 1, 100)
+        wrapper(executor, x, torch.tensor(1000.0), None,
+                {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])},
+                denoise_mask=mask, audio_denoise_mask=audio_mask)
+        self.assertEqual(seen["t"], 22)
+        self.assertEqual(seen["front"], [1.0, 1.0, 1.0])
+        self.assertEqual(seen["audio_front"], [1.0, 1.0, 1.0])
+
+    def test_protection_wrapper_appends_then_trims_after_late_step(self):
+        settings = ProtectionSettings(True, True, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        wrapper = make_protection_wrapper(plan)
+        seen = {}
+
+        def executor(x, timestep, context, transformer_options, **kwargs):
+            seen["t"] = x[0].shape[2]
+            seen["mask_t"] = kwargs["denoise_mask"].shape[2]
+            seen["front"] = kwargs["denoise_mask"][0, 0, :3, 0, 0].tolist()
+            return [torch.zeros_like(x[0]), torch.zeros_like(x[1])]
+
+        x = [torch.zeros(1, 2, 22, 4, 4), torch.zeros(1, 2, 2, 100)]
+        mask = torch.ones(1, 1, 22, 4, 4)
+        out = wrapper(executor, x, torch.tensor(500.0), None, {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])},
+                      denoise_mask=mask, audio_denoise_mask=torch.ones(1, 1, 1, 100))
+        self.assertEqual(seen["t"], 27)
+        self.assertEqual(seen["mask_t"], 27)
+        self.assertEqual(seen["front"], [0.5, 0.25, 0.0])
+        self.assertEqual(out[0].shape[2], 22)
+
+    def test_capstone_wrapper_cleans_up_when_executor_raises(self):
+        settings = ProtectionSettings(True, True, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        wrapper = make_protection_wrapper(plan)
+        x = [torch.zeros(1, 2, 22, 4, 4), torch.zeros(1, 2, 2, 100)]
+        mask = torch.ones(1, 1, 22, 4, 4)
+
+        def executor(*args, **kwargs):
+            raise RuntimeError("sampler failed")
+
+        with self.assertRaises(RuntimeError):
+            wrapper(executor, x, torch.tensor(500.0), None,
+                    {"sample_sigmas": torch.tensor([1.0, 0.5, 0.0])},
+                    denoise_mask=mask,
+                    audio_denoise_mask=torch.ones(1, 1, 1, 100))
+
+        self.assertEqual(x[0].shape[2], 22)
+        self.assertEqual(mask.shape[2], 22)
+
+    def test_restore_samples_replaces_the_held_prefix(self):
+        plan = self._plan_with_held_values()
+        video = torch.full((1, 2, 6, 4, 4), 9.0)
+        audio = torch.full((1, 2, 2, 30), 9.0)
+        restored = restore_samples((video, audio), plan)
+        self.assertTrue(torch.equal(restored[0][:, :, :3], plan.masked.held_video))
+        self.assertTrue(torch.equal(restored[0][:, :, 3:], video[:, :, 3:]))
+        self.assertEqual(float(restored[0][:, :, :3].min()), 1.0)
