@@ -6,6 +6,7 @@ import torch
 from context_protection import (
     ProtectionSettings,
     build_context_noise_mask,
+    build_masked_context,
     capstone_index,
     normalize_protection_settings,
     protection_signature,
@@ -68,3 +69,40 @@ class ContextProtectionCoreTests(unittest.TestCase):
         self.assertEqual(resolve_sampler_step(1.0, sigmas), 0)
         self.assertEqual(resolve_sampler_step(0.49, sigmas), 1)
         self.assertEqual(resolve_sampler_step(0.0, sigmas), 2)
+
+
+class MaskedContextTests(unittest.TestCase):
+    def test_masked_context_replaces_only_the_held_prefix(self):
+        target_video = torch.arange(1 * 2 * 6 * 4 * 4).reshape(1, 2, 6, 4, 4).float()
+        target_audio = torch.zeros(1, 2, 2, 30)
+        held_video = target_video[:, :, :3].clone() + 100
+        held_audio = torch.ones(1, 2, 2, 15)
+
+        ctx = build_masked_context(
+            target_video, target_audio, held_video, held_audio,
+            noise_strength=0.5, noise_ease=False, trim_frames=9,
+        )
+
+        self.assertTrue(torch.equal(ctx.video[:, :, :3], held_video))
+        self.assertTrue(torch.equal(ctx.video[:, :, 3:], target_video[:, :, 3:]))
+        self.assertTrue(torch.equal(ctx.audio[..., :15], held_audio))
+        self.assertTrue(torch.equal(ctx.audio[..., 15:], target_audio[..., 15:]))
+        self.assertEqual(ctx.video_mask.shape, (1, 1, 6, 4, 4))
+        self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(ctx.audio_mask.shape, (1, 1, 1, 30))
+        self.assertEqual(float(ctx.audio_mask.abs().sum()), 0.0)
+        self.assertEqual(ctx.trim_frames, 9)
+
+    def test_masked_context_rejects_geometry_mismatch(self):
+        with self.assertRaises(ValueError):
+            build_masked_context(
+                torch.zeros(1, 2, 6, 4, 4), torch.zeros(1, 2, 2, 30),
+                torch.zeros(1, 2, 3, 8, 8), torch.zeros(1, 2, 2, 15),
+            )
+
+    def test_masked_context_rejects_an_empty_held_context(self):
+        with self.assertRaises(ValueError):
+            build_masked_context(
+                torch.zeros(1, 2, 6, 4, 4), torch.zeros(1, 2, 2, 30),
+                torch.zeros(1, 2, 0, 4, 4), torch.zeros(1, 2, 2, 0),
+            )

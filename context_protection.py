@@ -15,6 +15,19 @@ from typing import Any
 import torch
 
 
+@dataclass
+class MaskedContext:
+    video: torch.Tensor
+    audio: torch.Tensor
+    video_mask: torch.Tensor
+    audio_mask: torch.Tensor
+    held_video: torch.Tensor
+    held_audio: torch.Tensor
+    video_steps: int
+    audio_steps: int
+    trim_frames: int
+
+
 @dataclass(frozen=True)
 class ProtectionSettings:
     enabled: bool
@@ -87,6 +100,68 @@ def build_context_noise_mask(
         weight = remaining * remaining if ease else remaining
         values.append(peak * weight)
     return torch.tensor(values, device=device, dtype=dtype).reshape(1, 1, steps, 1, 1)
+
+
+def build_masked_context(
+    target_video,
+    target_audio,
+    held_video,
+    held_audio,
+    noise_strength=0.5,
+    noise_ease=True,
+    trim_frames=0,
+) -> MaskedContext:
+    """Overlay exact held latent values and their sampling masks."""
+    if target_video.ndim != 5 or held_video.ndim != 5:
+        raise ValueError("Context protection: video latents must be 5D.")
+    if target_audio.ndim != 4 or held_audio.ndim != 4:
+        raise ValueError("Context protection: audio latents must be 4D.")
+    if target_video.shape[:2] != held_video.shape[:2] or target_video.shape[3:] != held_video.shape[3:]:
+        raise ValueError("Context protection: held video latent geometry differs from the target.")
+    if target_audio.shape[:3] != held_audio.shape[:3]:
+        raise ValueError("Context protection: held audio latent geometry differs from the target.")
+    held_steps = int(held_video.shape[2])
+    held_audio_steps = int(held_audio.shape[-1])
+    if held_steps < 1 or held_audio_steps < 1:
+        raise ValueError("Context protection: held context is empty.")
+    if held_steps > int(target_video.shape[2]) or held_audio_steps > int(target_audio.shape[-1]):
+        raise ValueError("Context protection: held context is longer than the target.")
+
+    video = target_video.clone()
+    audio = target_audio.clone()
+    video[:, :, :held_steps] = held_video
+    audio[..., :held_audio_steps] = held_audio
+
+    video_mask = torch.zeros(
+        (1, 1, int(target_video.shape[2]), int(target_video.shape[3]), int(target_video.shape[4])),
+        device=target_video.device,
+        dtype=target_video.dtype,
+    )
+    ramp = build_context_noise_mask(
+        held_steps,
+        noise_strength,
+        noise_ease,
+        device=target_video.device,
+        dtype=target_video.dtype,
+    )
+    video_mask[:, :, :held_steps] = ramp
+
+    audio_mask = torch.zeros(
+        (1, 1, 1, int(target_audio.shape[-1])),
+        device=target_audio.device,
+        dtype=target_audio.dtype,
+    )
+    return MaskedContext(
+        video=video,
+        audio=audio,
+        video_mask=video_mask,
+        audio_mask=audio_mask,
+        held_video=held_video.clone(),
+        held_audio=held_audio.clone(),
+        video_steps=held_steps,
+        audio_steps=held_audio_steps,
+        trim_frames=int(trim_frames),
+    )
 
 
 def resolve_sampler_step(sigma, sigmas) -> int:
