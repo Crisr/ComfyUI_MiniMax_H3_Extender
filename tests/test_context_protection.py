@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 import unittest
 
 import torch
@@ -252,3 +253,18 @@ class SourceResolutionTests(unittest.TestCase):
         self.assertTrue(protection_cache_mismatch({}, "abc"))
         self.assertFalse(protection_cache_mismatch({"protection_signature": "abc"}, "abc"))
         self.assertTrue(protection_cache_mismatch({"protection_signature": "abc"}, "off"))
+
+
+class IntegrationContractTests(unittest.TestCase):
+    def test_extender_widget_contract(self):
+        text = Path("extender.py").read_text(encoding="utf-8")
+        for name in (
+            "context_protection", "protection_keystone", "protection_capstone",
+            "protection_late_step", "protection_noise_strength", "protection_noise_ease",
+        ):
+            self.assertIn(f'"{name}"', text)
+
+    def test_parser_exposes_protection_source(self):
+        text = Path("extender.py").read_text(encoding="utf-8")
+        self.assertIn('"protection_source"', text)
+        self.assertIn('"protection_signature"', text)

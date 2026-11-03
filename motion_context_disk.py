@@ -960,6 +960,11 @@ def _proxy_at(data_path, manifest, index):
     return _LazyDiskLatent(data_path, segments[index])
 
 
+def latent_at(data_path, manifest, index):
+    """Return the lazy cached latent for one segment, or raise KeyError."""
+    return _proxy_at(data_path, manifest, index)
+
+
 def _last_proxy(data_path, manifest):
     segments = manifest.get("segments", [])
     if not segments:

@@ -4,6 +4,8 @@ import json
 import unittest
 from pathlib import Path
 
+from context_protection import normalize_protection_source
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -22,6 +24,7 @@ def _load():
         "_normalize_ref_descriptor": lambda value: None,
         "_normalize_fl2va_guides": lambda value, legacy_frame=None, legacy_idx=0: [],
         "_normalize_generation_mode": lambda value: "fl2va" if str(value) == "fl2va" else "ref2va",
+        "normalize_protection_source": normalize_protection_source,
     }
     exec(
         compile(
