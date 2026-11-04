@@ -830,3 +830,96 @@ Run a three-clip Ref2VA project with Motion Context ON and protection ON:
 git add README.md THIRD_PARTY_NOTICES.md
 git commit -m "docs: document context protection and attribution"
 ```
+
+---
+
+## Implementation Record
+
+**Status:** Implemented, merged, and pushed. Manual video acceptance is pending.
+
+**Merge commit:** `440cd61` (`main`).
+
+**Feature commits:**
+
+- `e09c97f` — settings, masks, step lookup, and protection signature
+- `366676b` — masked context builder and `apply_masked`
+- `24cb648` — Keystone, Capstone, Late Lock, wrapper, and restoration
+- `a5910f2` — source resolution and cache signature checks
+- `f04456e` — Ref2VA base-pass integration
+- `3b14d78` — Ref2VA Refine-pass integration
+- `7451836` — per-clip source selector and project settings
+- `542ef6d` — README and third-party notices
+- `31080cf` — final review fixes for masked samples, nested audio, and mask chaining
+
+### Files added
+
+- `context_protection.py` — settings, masks, plans, wrapper, source resolution, signature, masked-sample installation, and restoration.
+- `tests/test_context_protection.py` — CPU-only unit and contract tests.
+- `tests/context-protection.test.mjs` — frontend source and serialization tests.
+- `THIRD_PARTY_NOTICES.md` — independent-implementation attribution.
+
+### Files changed
+
+- `extender.py` — widgets, parser fields, project settings, base and Refine integration, cache invalidation, segment metadata, and masked-sample sampling.
+- `motion_context_ram.py` — masked target-latent context path.
+- `motion_context_disk.py` — public `latent_at()` source accessor.
+- `web/extender.js` — clip source field, source options, card selector, widget defaults, and master-switch refresh.
+- `tests/test_clip_motion_context.py` — parser-test namespace update.
+- `README.md` — Context Protection usage, behavior, and manual acceptance steps.
+
+### Implemented behavior
+
+- Protection is active only for Ref2VA with Motion Context ON.
+- Protection is off by default.
+- The source is a stable earlier clip ID. Missing, current, and future sources fail before sampling.
+- Clip 1, Motion Context OFF clips, and explicit `null` sources do not use protection.
+- Keystone replaces the oldest held video slot with the source's first video latent.
+- Capstone appends the end-aligned source latent block only at and after Late Lock.
+- Late Lock locks the Keystone slot before the configured step and frees it at and after that step.
+- Context Noise uses a linear or eased ramp and reaches zero at the newest held slot.
+- Held audio masks stay unchanged. Held audio latents are restored after sampling.
+- Masked video and audio streams are installed into the sampler input.
+- Capstone handling preserves tuple, list, and nested audio containers.
+- Base and Refine passes use separate protection plans and separate resized source latents.
+- Held latents are restored whenever an output exists. Temporary capstones are removed on success and failure.
+- Segment metadata stores `motion_context`, `protection_source`, and `protection_signature`.
+- A missing signature reads as `off`.
+- A non-validated signature mismatch truncates the causal chain from that clip.
+- A validated mismatch logs a warning and keeps the validated result immutable.
+- COMPUTED reuse requires both Motion Context and protection signatures to match.
+- Changing the master switch refreshes the per-clip selector state.
+
+### Implementation rulings
+
+- The effective sigma schedule is derived when the optional `SIGMAS` input is disconnected. This lets signature checks and Late Lock validation use the schedule the sampler will actually run.
+- Base sampling installs its protection wrapper on a temporary model clone. The Refine pass therefore cannot inherit the base-resolution plan or stack a second wrapper.
+- The empty source option is labelled `None`, because `null` disables protection.
+- The six protection widgets remain visible as native rows. No custom settings panel exists.
+- Clips added through either Add button default to the first clip ID.
+- Manual video acceptance is deferred to the human partner.
+- The source selector does not visibly mark an invalid stored source. The backend still fails before sampling.
+
+### Verification
+
+Run on merged `main`:
+
+```text
+python -m unittest discover -s tests -p "test_*.py"
+→ 102 tests, OK
+
+node --test tests/context-protection.test.mjs
+→ 4 pass, 0 fail
+
+node --test tests/clip-motion-context.test.mjs
+→ 3 pass, 0 fail
+```
+
+Manual acceptance remains open:
+
+1. Generate three Ref2VA Motion Context ON clips with protection ON.
+2. Set Clip 2 and Clip 3 to use Clip 1.
+3. Compare the boundaries with protection off and on.
+4. Confirm Clip 1 and Motion OFF runs are unchanged.
+5. Confirm a current-clip or reordered invalid source fails before sampling.
+6. Confirm a changed signature rerenders from the first affected clip.
+7. Confirm Refine output uses the same protection and restores the held prefix.
