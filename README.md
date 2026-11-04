@@ -388,6 +388,37 @@ Tests:
 
 `tests/test_color_match.py`, `tests/test_color_match_preview.py` and `tests/test_color_match_device.py` cover the match, the matched preview files and the device selection. Run a file with `python tests/<file>.py`. These modules cannot be imported outside ComfyUI, so each test loads only the functions that it exercises.
 
+### Context Protection
+
+Context Protection reduces color drift at clip boundaries. It is available only for **Ref2VA with Motion Context ON**. It is latent-only. It does not correct LAB or RGB color.
+
+The feature is off by default. Enable `context_protection`, then choose an earlier clip in each card's source menu. The default source for clip 2 and later is the first clip. Clip 1 and Motion Context OFF clips do not use protection.
+
+The six controls map to these operations:
+
+1. `protection_keystone` copies the source clip's first video latent into the oldest held slot.
+2. `protection_capstone` adds the source clip's end-aligned latent block during late sampling.
+3. `protection_late_step` sets the zero-based sampler step for Late Lock and Capstone.
+4. `protection_noise_strength` sets the maximum Context Noise mask weight.
+5. `protection_noise_ease` uses quadratic decay toward the newest held slot.
+6. `context_protection` is the master switch.
+
+`protection_source` stores a stable earlier clip ID. Reordering a clip never remaps that ID. An invalid, current, or future source fails before sampling.
+
+Changing a protection setting invalidates cache from the first affected clip. Validated clips stay immutable. When a validated clip does not match the current protection settings, reuse stops at that clip and the node logs a warning. Uncheck Validated to apply the change.
+
+Protection applies to the base pass and to the Refine pass. Each segment stores `protection_source` and `protection_signature`.
+
+Manual acceptance:
+
+1. Use a three-clip Ref2VA project with Motion Context ON and Context Protection ON.
+2. Set Clip 2 and Clip 3 to use Clip 1.
+3. Compare the boundaries with protection off and on.
+4. Confirm Clip 1 and Motion OFF output does not change.
+5. Confirm a current-clip or reordered invalid source fails before sampling.
+6. Confirm a changed signature rerenders from the first affected clip.
+7. Confirm Refine output keeps the same protection and restores the held prefix.
+
 ### ⚡ Full Batch Integration
 
 Full Batch correctly preserves and applies all previously configured clip corrections during final assembly.

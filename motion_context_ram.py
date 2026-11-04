@@ -31,6 +31,7 @@ from .patch_motion_payload import (
     ensure_patch as _ensure_payload_patch,
     is_applied as _payload_patch_applied,
 )
+from .context_protection import build_masked_context
 
 FPS = 24
 AUDIO_HZ = 40.0
@@ -564,6 +565,70 @@ class MiniMaxH3MotionContextRAM:
             int(audio_t),
             BUILD,
         )
+
+    def apply_masked(
+        self,
+        latent,
+        context_latent,
+        context_length,
+        audio_context_length,
+        noise_strength=0.5,
+        noise_ease=True,
+    ):
+        """Copy held AV context into the target latent; no conditioning change."""
+        target_video, target_audio = _streams_from_latent(latent, "latent")
+        source_video, _ = _streams_from_latent(context_latent, "context_latent")
+
+        if target_video.shape[0] != source_video.shape[0]:
+            raise ValueError(
+                "MiniMax H3 Motion Context RAM: batch size differs between "
+                "previous and next clip."
+            )
+        if target_video.shape[1] != source_video.shape[1]:
+            raise ValueError(
+                "MiniMax H3 Motion Context RAM: video latent channels differ."
+            )
+        if target_video.shape[3:] != source_video.shape[3:]:
+            sw = int(source_video.shape[4]) * 16
+            sh = int(source_video.shape[3]) * 16
+            tw = int(target_video.shape[4]) * 16
+            th = int(target_video.shape[3]) * 16
+            raise ValueError(
+                "MiniMax H3 Motion Context RAM: resolution mismatch "
+                f"{sw}x{sh} -> {tw}x{th}. Latent motion context cannot resize."
+            )
+
+        context_frames = int(context_length)
+        target_frame_count = _pixel_frames(int(target_video.shape[2]))
+        if context_frames >= target_frame_count:
+            raise ValueError(
+                "MiniMax H3 Motion Context RAM: context window must be "
+                "shorter than the next clip."
+            )
+
+        blocks, _, span = _video_tail_from_latent(
+            context_latent, context_frames
+        )
+        held_video = torch.cat(blocks, dim=2)
+        a_frames = int(audio_context_length) or span
+        held_audio, audio_t, _ = _audio_tail_from_latent(
+            context_latent, a_frames
+        )
+        masked = build_masked_context(
+            target_video,
+            target_audio,
+            held_video,
+            held_audio,
+            noise_strength=noise_strength,
+            noise_ease=noise_ease,
+            trim_frames=span,
+        )
+        _LOG.info(
+            "MiniMax H3 Motion Context RAM: masked %d video and %d audio "
+            "latent steps, trim=%d",
+            masked.video_steps, masked.audio_steps, int(span),
+        )
+        return masked, int(span)
 
 
 def _temporal_gray(frame, out_h=96):

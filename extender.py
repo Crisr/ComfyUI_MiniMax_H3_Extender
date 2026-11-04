@@ -49,6 +49,18 @@ from aiohttp import web
 from PIL import Image, ImageEnhance, ImageOps
 from server import PromptServer
 
+from .context_protection import (
+    apply_masked_samples,
+    install_protection_wrapper,
+    make_protection_plan,
+    normalize_protection_settings,
+    normalize_protection_source,
+    protection_cache_mismatch,
+    protection_signature,
+    resolve_source_index,
+    restore_samples,
+    validate_late_step,
+)
 from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
 from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
 from .latent_upscaler import target_dimensions
@@ -71,6 +83,7 @@ from .motion_context_disk import (
     MiniMaxH3MotionContextDiskJoin,
     _cache_size_mb,
     _load_manifest_from_paths,
+    latent_at,
     _manifest_for_first,
     _truncate_chain,
     _final_frame_count,
@@ -2551,6 +2564,14 @@ def _resolve_sample_sigmas(external_sigmas, denoise: float):
     return _trim_sigmas_by_denoise(coerced, denoise)
 
 
+def _effective_sample_sigmas(model, external_sigmas, denoise, scheduler, steps):
+    """Return the exact schedule the sampler will use, even without SIGMAS."""
+    resolved = _resolve_sample_sigmas(external_sigmas, denoise)
+    if resolved is None:
+        resolved = _sigmas(model, str(scheduler), int(steps), float(denoise))
+    return resolved
+
+
 def _sample_h3(
     model,
     conditioning,
@@ -2561,6 +2582,7 @@ def _sample_h3(
     steps: int,
     denoise: float,
     sigmas=None,
+    protection=None,
 ):
     guider = _BasicGuider(model)
     guider.set_conds(conditioning)
@@ -2578,6 +2600,8 @@ def _sample_h3(
         latent.get("downscale_ratio_spacial", None),
         latent.get("downscale_ratio_temporal", None),
     )
+    if protection is not None:
+        latent_image = apply_masked_samples(latent_image, protection.masked)
     latent_out["samples"] = latent_image
 
     batch_inds = latent_out.get("batch_index", None)
@@ -2599,6 +2623,8 @@ def _sample_h3(
         disable_pbar=disable_pbar,
         seed=int(seed),
     )
+    if protection is not None:
+        samples = restore_samples(samples, protection)
     samples = samples.to(comfy.model_management.intermediate_device())
 
     out = latent_out.copy()
@@ -2759,6 +2785,8 @@ def _refine_ref2va_sample(
     sampler_name, scheduler, refine_scale, refine_steps, refine_denoise,
     external_sigmas, motion=None, previous_refined_proxy=None,
     context_length="22", audio_context_length=0,
+    protection_source_latent=None, protection_settings=None,
+    protection_source_id=None, protection_source_index=None,
 ):
     """Direct upscale+refine; returns the sole final sample and refine trim."""
     _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
@@ -2774,17 +2802,65 @@ def _refine_ref2va_sample(
         audio_native_offset=audio_native_offset,
     )
     refine_trim = None
-    if motion is not None and previous_refined_proxy is not None:
+    protection_active = bool(
+        protection_settings is not None
+        and protection_settings.enabled
+        and protection_source_latent is not None
+        and protection_source_id is not None
+        and protection_source_index is not None
+    )
+    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
+    protection_plan = None
+    if protection_active:
+        refine_sigmas = _effective_sample_sigmas(
+            clip_model, external_sigmas, refine_denoise, scheduler, refine_steps
+        )
+        validate_late_step(protection_settings, refine_sigmas)
+        if motion is None:
+            raise RuntimeError(
+                "MiniMax H3 Extender: Context Protection refine requires Motion Context."
+            )
+        if previous_refined_proxy is None:
+            raise RuntimeError(
+                "MiniMax H3 Extender: previous refined latent is unavailable for "
+                "Context Protection."
+            )
+        refined_source = _resize_context_latent_spatial(protection_source_latent, out_w, out_h)
+        source_video = _streams_from_latent(
+            refined_source, "protection source"
+        )[0]
+        masked, refine_trim = motion.apply_masked(
+            up_latent,
+            previous_refined_proxy,
+            str(context_length),
+            int(audio_context_length),
+            protection_settings.noise_strength,
+            protection_settings.noise_ease,
+        )
+        protection_plan = make_protection_plan(
+            masked,
+            source_video,
+            protection_source_id,
+            protection_source_index,
+            protection_settings,
+            refine_sigmas,
+            str(context_length),
+            int(audio_context_length),
+            refine_scale,
+        )
+        clip_model = install_protection_wrapper(clip_model, protection_plan)
+        del refined_source
+    elif motion is not None and previous_refined_proxy is not None:
         refine_positive, refine_trim, _, _, _ = motion.apply(
             refine_positive, up_latent, previous_refined_proxy,
             str(context_length), int(audio_context_length),
         )
     _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
-    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
     _release_models_before_refine(clip_model)
     refined = _sample_h3(
         clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
         int(refine_steps), float(refine_denoise), sigmas=refine_sigmas,
+        protection=protection_plan,
     )
     refined = preserve_first_pass_audio(refined, first_audio)
     return refined, refine_trim, out_w, out_h
@@ -3122,6 +3198,9 @@ def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True)
                     "previous_clip"
                     if str(raw.get("first_source") or "manual").lower().strip() == "previous_clip" and i > 0
                     else "manual"
+                ),
+                "protection_source": normalize_protection_source(
+                    raw, i, out[0]["id"] if out else None
                 ),
                 # Motion Context OFF keeps the timeline in the same causal chain
                 # but injects nothing from the previous clip: no latent tail, no
@@ -4937,6 +5016,8 @@ PROJECT_SETTING_NAMES = (
     "scheduler", "denoise", "refine_enabled", "refine_scale", "refine_steps", "refine_denoise",
     "context_length", "audio_context_length", "clips_json",
     "resolution_mode", "megapixels", "refs_json", "generation_mode", "motion_context",
+    "context_protection", "protection_keystone", "protection_capstone",
+    "protection_late_step", "protection_noise_strength", "protection_noise_ease",
 )
 
 
@@ -5154,6 +5235,32 @@ class MiniMaxH3Extender:
             "color_match_process_clip0": (
                 "BOOLEAN",
                 {"default": False, "tooltip": "Also color match the Clip 0 continuation source. Only applies while a Clip 0 video is attached."},
+            ),
+            # Appended after every legacy widget. Latent-only context protection
+            # is available only for Ref2VA Motion Context ON clips.
+            "context_protection": (
+                "BOOLEAN",
+                {"default": False, "tooltip": "Ref2VA Motion Context ON only: protect held context latents from color drift. Changing this invalidates generated protected clips."},
+            ),
+            "protection_keystone": (
+                "BOOLEAN",
+                {"default": True, "tooltip": "Replace the oldest held video slot with the source clip's first video latent."},
+            ),
+            "protection_capstone": (
+                "BOOLEAN",
+                {"default": True, "tooltip": "Append the source clip's end-aligned latent block during late sampling steps."},
+            ),
+            "protection_late_step": (
+                "INT",
+                {"default": 1, "min": 0, "max": 999, "step": 1, "tooltip": "Sampler step where protection masks and Capstone engage."},
+            ),
+            "protection_noise_strength": (
+                "FLOAT",
+                {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Maximum Context Noise mask weight on the oldest held slot."},
+            ),
+            "protection_noise_ease": (
+                "BOOLEAN",
+                {"default": True, "tooltip": "Ease Context Noise toward zero at the newest held slot."},
             ),
         }
 
@@ -6033,6 +6140,12 @@ class MiniMaxH3Extender:
         color_match_space="LAB",
         color_match_factor=1.0,
         color_match_process_clip0=False,
+        context_protection=False,
+        protection_keystone=True,
+        protection_capstone=True,
+        protection_late_step=1,
+        protection_noise_strength=0.5,
+        protection_noise_ease=True,
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -6047,6 +6160,33 @@ class MiniMaxH3Extender:
         refine_denoise = max(0.01, min(1.0, float(refine_denoise)))
         external_sigmas = kwargs.get("sigmas")
         sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
+        protection_settings = normalize_protection_settings(
+            enabled=context_protection,
+            keystone=protection_keystone,
+            capstone=protection_capstone,
+            late_step=protection_late_step,
+            noise_strength=protection_noise_strength,
+            noise_ease=protection_noise_ease,
+        )
+        protection_sigmas = sample_sigmas
+        if (
+            generation_mode == "ref2va"
+            and protection_settings.enabled
+            and motion_context
+        ):
+            protection_sigmas = _effective_sample_sigmas(
+                model, external_sigmas, denoise, scheduler, steps
+            )
+        refine_protection_sigmas = None
+        if (
+            generation_mode == "ref2va"
+            and protection_settings.enabled
+            and motion_context
+            and refine_enabled
+        ):
+            refine_protection_sigmas = _effective_sample_sigmas(
+                model, external_sigmas, refine_denoise, scheduler, refine_steps
+            )
         continue_video_input = kwargs.get("continue_existing_video")
         continue_existing_video = (
             _continue_video_from_native_input(continue_video_input)
@@ -6430,6 +6570,31 @@ class MiniMaxH3Extender:
             # tail, keyframe anchors or audio tail.
             clip_motion = i > 0 and bool(cfg.get("motion_context", True))
 
+            # Per-clip latent context protection. It is deliberately inert for
+            # Clip 0, Motion Context OFF, and a card whose source is null.
+            protection_source = cfg.get("protection_source")
+            protection_active = bool(
+                protection_settings.enabled
+                and clip_motion
+                and i > 0
+                and protection_source is not None
+            )
+            source_index = None
+            expected_signature = "off"
+            if protection_active:
+                source_index = resolve_source_index(clips, i, protection_source)
+                expected_signature = protection_signature(
+                    protection_source,
+                    protection_settings,
+                    protection_sigmas,
+                    str(context_length),
+                    int(audio_context_length),
+                    refine_scale,
+                )
+                validate_late_step(protection_settings, protection_sigmas)
+                if refine_enabled:
+                    validate_late_step(protection_settings, refine_protection_sigmas)
+
             # Refresh manifest state every iteration because Disk Join can
             # truncate or append the physical chain.
             current_manifest = _load_manifest_from_paths(data_path, manifest_path)
@@ -6439,6 +6604,14 @@ class MiniMaxH3Extender:
                 dict(current_manifest.get("segments", [])[i])
                 if current_manifest is not None and existing
                 else None
+            )
+            motion_mismatch = bool(
+                current_desc is not None
+                and _segment_motion_mismatch(current_desc, i, clip_motion)
+            )
+            protection_mismatch = bool(
+                current_desc is not None
+                and protection_cache_mismatch(current_desc, expected_signature)
             )
 
             if bool(cfg.get("validated", False)):
@@ -6452,10 +6625,16 @@ class MiniMaxH3Extender:
                     "H3 validated hard-skip: Ref2VA clip %d exists on disk; sampler forbidden",
                     i + 1,
                 )
-                if _segment_motion_mismatch(current_desc, i, clip_motion):
+                if motion_mismatch:
                     _LOG.warning(
                         "H3 clip %d is Validated; its per-clip Motion Context change "
                         "is not applied until Validated is unchecked",
+                        i + 1,
+                    )
+                if protection_mismatch:
+                    _LOG.warning(
+                        "H3 clip %d is Validated; its Context Protection settings "
+                        "changed but are not applied until Validated is unchecked",
                         i + 1,
                     )
                 result = disk_join.join(
@@ -6475,15 +6654,30 @@ class MiniMaxH3Extender:
             if (
                 current_desc is not None
                 and not bool(current_desc.get("validated", False))
-                and _segment_motion_mismatch(current_desc, i, clip_motion)
+                and (motion_mismatch or protection_mismatch)
             ):
-                _LOG.info(
-                    "H3 clip %d Motion Context changed (stored=%s requested=%s); "
-                    "checkpoint not reusable, chain truncated from this clip",
-                    i + 1,
-                    bool(current_desc.get("motion_context", True)),
-                    clip_motion,
+                if motion_mismatch:
+                    _LOG.info(
+                        "H3 clip %d Motion Context changed (stored=%s requested=%s); "
+                        "checkpoint not reusable, chain truncated from this clip",
+                        i + 1,
+                        bool(current_desc.get("motion_context", True)),
+                        clip_motion,
+                    )
+                if protection_mismatch:
+                    _LOG.info(
+                        "H3 clip %d Context Protection signature changed "
+                        "(stored=%s requested=%s); checkpoint not reusable, "
+                        "chain truncated from this clip",
+                        i + 1,
+                        str(current_desc.get("protection_signature", "off") or "off"),
+                        expected_signature,
+                    )
+                current_manifest = _truncate_chain(
+                    data_path, manifest_path, current_manifest, i
                 )
+                current_desc = None
+                existing = False
 
             if (
                 str(run_mode) == "full_batch"
@@ -6491,7 +6685,8 @@ class MiniMaxH3Extender:
                 and current_desc is not None
                 and bool(current_desc.get("computed", False))
                 and not bool(current_desc.get("validated", False))
-                and not _segment_motion_mismatch(current_desc, i, clip_motion)
+                and not motion_mismatch
+                and not protection_mismatch
             ):
                 _LOG.info(
                     "H3 COMPUTED hard-reuse: Ref2VA clip %d exists on disk; sampler forbidden",
@@ -6725,6 +6920,9 @@ class MiniMaxH3Extender:
 
             trim_frames = None
             first_visible_offset = 0
+            protection_plan = None
+            protection_source_latent = None
+            base_sample_model = clip_model
             if i > 0:
                 if clip_motion:
                     if previous_proxy is None:
@@ -6735,13 +6933,54 @@ class MiniMaxH3Extender:
                         _resize_context_latent_spatial(previous_proxy, resolved_width, resolved_height)
                         if refine_enabled else previous_proxy
                     )
-                    positive, trim_frames, _, _, _ = motion.apply(
-                        positive,
-                        latent,
-                        base_context_proxy,
-                        str(context_length),
-                        int(audio_context_length),
-                    )
+                    if protection_active:
+                        source_latent = latent_at(
+                            data_path, current_manifest, source_index
+                        )
+                        base_source = (
+                            _resize_context_latent_spatial(
+                                source_latent, resolved_width, resolved_height
+                            )
+                            if refine_enabled else source_latent
+                        )
+                        source_video = _streams_from_latent(
+                            base_source, "protection source"
+                        )[0]
+                        masked, trim_frames = motion.apply_masked(
+                            latent,
+                            base_context_proxy,
+                            str(context_length),
+                            int(audio_context_length),
+                            protection_settings.noise_strength,
+                            protection_settings.noise_ease,
+                        )
+                        protection_plan = make_protection_plan(
+                            masked,
+                            source_video,
+                            protection_source,
+                            source_index,
+                            protection_settings,
+                            protection_sigmas,
+                            str(context_length),
+                            int(audio_context_length),
+                            refine_scale,
+                        )
+                        base_sample_model = install_protection_wrapper(
+                            clip_model, protection_plan
+                        )
+                        if refine_enabled:
+                            protection_source_latent = source_latent
+                        if base_source is not source_latent:
+                            del base_source
+                        del source_latent
+                    else:
+                        positive, trim_frames, _, _, _ = motion.apply(
+                            positive,
+                            latent,
+                            base_context_proxy,
+                            str(context_length),
+                            int(audio_context_length),
+                        )
                     if base_context_proxy is not previous_proxy:
                         del base_context_proxy
                 else:
@@ -6792,7 +7031,7 @@ class MiniMaxH3Extender:
             )
 
             sampled = _sample_h3(
-                clip_model,
+                base_sample_model,
                 positive,
                 latent,
                 cfg["seed"],
@@ -6801,7 +7040,10 @@ class MiniMaxH3Extender:
                 int(steps),
                 float(denoise),
                 sigmas=sample_sigmas,
+                protection=protection_plan,
             )
+            if base_sample_model is not clip_model:
+                del base_sample_model
             if refine_enabled:
                 first_pass = sampled
                 sampled, refine_trim, _refine_w, _refine_h = _refine_ref2va_sample(
@@ -6816,8 +7058,21 @@ class MiniMaxH3Extender:
                     external_sigmas=external_sigmas, motion=(motion if clip_motion else None),
                     previous_refined_proxy=(previous_proxy if clip_motion else None),
                     context_length=context_length, audio_context_length=audio_context_length,
+                    protection_source_latent=(
+                        protection_source_latent if protection_active else None
+                    ),
+                    protection_settings=(
+                        protection_settings if protection_active else None
+                    ),
+                    protection_source_id=(
+                        protection_source if protection_active else None
+                    ),
+                    protection_source_index=(
+                        source_index if protection_active else None
+                    ),
                 )
                 del first_pass
+                del protection_source_latent
                 if refine_trim is not None:
                     trim_frames = refine_trim
 
@@ -6833,7 +7088,13 @@ class MiniMaxH3Extender:
                 computed=(str(run_mode) == "full_batch"),
                 generation_seed=cfg["seed"],
                 first_visible_offset=int(first_visible_offset),
-                segment_meta={"motion_context": bool(clip_motion)},
+                segment_meta={
+                    "motion_context": bool(clip_motion),
+                    "protection_source": (
+                        protection_source if protection_active else None
+                    ),
+                    "protection_signature": expected_signature,
+                },
             )
             previous_handle = result[0]
             previous_proxy = result[1]
