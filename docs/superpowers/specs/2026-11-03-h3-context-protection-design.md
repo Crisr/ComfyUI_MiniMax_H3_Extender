@@ -238,6 +238,10 @@ When only one held position exists, use the full configured strength.
 
 Keep held audio masks at `0`.
 
+H3 mask convention: `1` means generate and `0` means preserve the clean latent. The generated region therefore keeps mask `1`. Only the held prefix is lowered by the ramp.
+
+The sampler must receive this mask through `guider.sample(denoise_mask=...)`. `KSamplerX0Inpaint` uses it to mix the clean held latents into `x` at every step. A model-only mask cannot replace that mix.
+
 ### 8.5 Front mask during Late Lock
 
 - Before the Late Lock step, set the keystone slot mask to `1`.

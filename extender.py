@@ -55,6 +55,7 @@ from .context_protection import (
     make_protection_plan,
     normalize_protection_settings,
     normalize_protection_source,
+    protected_denoise_mask,
     protection_cache_mismatch,
     protection_signature,
     resolve_source_index,
@@ -2602,11 +2603,13 @@ def _sample_h3(
     )
     if protection is not None:
         latent_image = apply_masked_samples(latent_image, protection.masked)
+        noise_mask = protected_denoise_mask(latent_image, protection)
+    else:
+        noise_mask = latent_out.get("noise_mask", None)
     latent_out["samples"] = latent_image
 
     batch_inds = latent_out.get("batch_index", None)
     noise = comfy.sample.prepare_noise(latent_image, int(seed), batch_inds)
-    noise_mask = latent_out.get("noise_mask", None)
 
     x0_output = {}
     callback = latent_preview.prepare_callback(

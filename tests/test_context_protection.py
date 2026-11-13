@@ -10,10 +10,12 @@ from context_protection import (
     build_context_noise_mask,
     build_masked_context,
     capstone_index,
+    make_late_lock_mask_function,
     make_protection_plan,
     make_protection_wrapper,
     normalize_protection_settings,
     normalize_protection_source,
+    protected_denoise_mask,
     protection_cache_mismatch,
     protection_signature,
     resolve_sampler_step,
@@ -103,10 +105,21 @@ class MaskedContextTests(unittest.TestCase):
         self.assertTrue(torch.equal(ctx.audio[..., :15], held_audio))
         self.assertTrue(torch.equal(ctx.audio[..., 15:], target_audio[..., 15:]))
         self.assertEqual(ctx.video_mask.shape, (1, 1, 6, 4, 4))
-        self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 1.0, 1.0, 1.0, 1.0])
         self.assertEqual(ctx.audio_mask.shape, (1, 1, 1, 30))
-        self.assertEqual(float(ctx.audio_mask.abs().sum()), 0.0)
+        self.assertEqual(ctx.audio_mask[0, 0, 0, :16].tolist(), [0.0] * 15 + [1.0])
         self.assertEqual(ctx.trim_frames, 9)
+
+    def test_free_frames_are_generated_and_held_audio_is_locked(self):
+        ctx = build_masked_context(
+            torch.zeros(1, 2, 6, 4, 4), torch.zeros(1, 2, 2, 30),
+            torch.ones(1, 2, 3, 4, 4), torch.ones(1, 2, 2, 15),
+            noise_strength=0.0, noise_ease=True,
+        )
+        self.assertEqual(ctx.video_mask[:, :, 3:].min().item(), 1.0)
+        self.assertEqual(ctx.video_mask[:, :, :3].max().item(), 0.0)
+        self.assertEqual(ctx.audio_mask[:, :, :, 15:].min().item(), 1.0)
+        self.assertEqual(ctx.audio_mask[:, :, :, :15].max().item(), 0.0)
 
     def test_masked_context_rejects_geometry_mismatch(self):
         with self.assertRaises(ValueError):
@@ -268,6 +281,20 @@ class ProtectionPlanTests(unittest.TestCase):
         self.assertTrue(torch.equal(installed.tensors[0], masked.video))
         self.assertTrue(torch.equal(installed.tensors[1], masked.audio))
 
+    def test_protected_denoise_mask_covers_both_streams(self):
+        plan = self._plan_with_held_values()
+        samples = FakeNested([
+            torch.zeros(1, 2, 6, 4, 4),
+            torch.zeros(1, 2, 2, 30),
+        ])
+        mask = protected_denoise_mask(samples, plan)
+        self.assertIsInstance(mask, FakeNested)
+        self.assertEqual(tuple(mask.tensors[0].shape), (1, 1, 6, 4, 4))
+        self.assertEqual(tuple(mask.tensors[1].shape), (1, 1, 1, 30))
+        self.assertEqual(float(mask.tensors[0][0, 0, 0].max()), 0.0)
+        self.assertEqual(float(mask.tensors[0][0, 0, 3:].min()), 1.0)
+        self.assertIsNone(protected_denoise_mask(samples, None))
+
     def test_restore_samples_replaces_the_held_prefix(self):
         plan = self._plan_with_held_values()
         video = torch.full((1, 2, 6, 4, 4), 9.0)
@@ -276,6 +303,50 @@ class ProtectionPlanTests(unittest.TestCase):
         self.assertTrue(torch.equal(restored[0][:, :, :3], plan.masked.held_video))
         self.assertTrue(torch.equal(restored[0][:, :, 3:], video[:, :, 3:]))
         self.assertEqual(float(restored[0][:, :, :3].min()), 1.0)
+
+    def test_keystone_enters_the_sampling_latent_and_restore_keeps_the_real_frame(self):
+        masked = self._fake_masked()
+        real_frame = masked.held_video[:, :, :1].clone()
+        source = torch.full((1, 2, 25, 4, 4), 7.0)
+        settings = ProtectionSettings(True, True, False, 1, 0.5, True)
+        plan = make_protection_plan(
+            masked, source, "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        self.assertTrue(torch.equal(plan.masked.video[:, :, :1], source[:, :, :1]))
+        self.assertEqual(float(plan.masked.video_mask[:, :, 0].max()), 0.0)
+        restored = restore_samples((torch.full((1, 2, 6, 4, 4), 9.0), torch.zeros(1, 2, 2, 30)), plan)
+        self.assertTrue(torch.equal(restored[0][:, :, :1], real_frame))
+
+    def test_late_lock_opens_then_locks_the_keystone_slot(self):
+        settings = ProtectionSettings(True, True, False, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+        lock = make_late_lock_mask_function(plan)
+        sigmas = torch.tensor([1.0, 0.5, 0.0])
+        before = lock(torch.tensor(1.0), torch.zeros(1, 1, 6, 4, 4), {"sigmas": sigmas})
+        after = lock(torch.tensor(0.5), torch.zeros(1, 1, 6, 4, 4), {"sigmas": sigmas})
+        self.assertEqual(float(before[0, 0, 0].max()), 1.0)
+        self.assertEqual(float(after[0, 0, 0].max()), 0.0)
+
+    def test_late_lock_handles_a_packed_audio_video_mask(self):
+        settings = ProtectionSettings(True, True, False, 2, 0.5, True)
+        sigmas = torch.tensor([1.0, 0.66, 0.33, 0.0])
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            sigmas, "22", 0,
+        )
+        lock = make_late_lock_mask_function(plan)
+        packed = torch.ones(1, 1, 2 * 6 * 4 * 4 + 2 * 2 * 30)
+        before = lock(torch.tensor(1000.0), packed, {"sigmas": sigmas})
+        after = lock(torch.tensor(0.0), packed, {"sigmas": sigmas})
+        before_video = before[:, :, : 2 * 6 * 4 * 4].reshape(1, 2, 6, 4, 4)
+        after_video = after[:, :, : 2 * 6 * 4 * 4].reshape(1, 2, 6, 4, 4)
+        self.assertEqual(float(before_video[0, :, 0].max()), 1.0)
+        self.assertEqual(float(after_video[0, :, 0].max()), 0.0)
+        self.assertEqual(float(before[:, :, 2 * 6 * 4 * 4 :].min()), 1.0)
 
 
 class SourceResolutionTests(unittest.TestCase):

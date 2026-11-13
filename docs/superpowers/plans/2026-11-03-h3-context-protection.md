@@ -188,9 +188,9 @@ def test_masked_context_replaces_only_the_held_prefix(self):
     self.assertTrue(torch.equal(ctx.audio[..., :15], held_audio))
     self.assertTrue(torch.equal(ctx.audio[..., 15:], target_audio[..., 15:]))
     self.assertEqual(ctx.video_mask.shape, (1, 1, 6, 4, 4))
-    self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 0.0, 0.0, 0.0, 0.0])
+    self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 1.0, 1.0, 1.0, 1.0])
     self.assertEqual(ctx.audio_mask.shape, (1, 1, 1, 30))
-    self.assertEqual(float(ctx.audio_mask.abs().sum()), 0.0)
+    self.assertEqual(ctx.audio_mask[0, 0, 0, :16].tolist(), [0.0] * 15 + [1.0])
     self.assertEqual(ctx.trim_frames, 9)
 
 def test_masked_context_rejects_geometry_mismatch(self):
@@ -216,7 +216,7 @@ Expected: FAIL with `ImportError: cannot import name 'build_masked_context'`.
 
 - [ ] **Step 3: Implement the builder and RAM method**
 
-`build_masked_context` clones the target streams, validates channel/spatial equality and prefix length, writes held values into the prefix, builds the video ramp, and returns an all-zero audio mask.
+`build_masked_context` clones the target streams, validates channel/spatial equality and prefix length, writes held values into the prefix, builds the video ramp over an all-`1` mask, and returns an all-`1` audio mask with a locked held prefix.
 
 `apply_masked` must:
 

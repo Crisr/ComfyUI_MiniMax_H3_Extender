@@ -132,7 +132,10 @@ def build_masked_context(
     video[:, :, :held_steps] = held_video
     audio[..., :held_audio_steps] = held_audio
 
-    video_mask = torch.zeros(
+    # H3 mask convention: 1 = generate, 0 = preserve the clean latent. Every
+    # frame the shot has to make therefore starts at 1; only the held prefix is
+    # lowered, and its ramp reaches 0 at the newest join.
+    video_mask = torch.ones(
         (1, 1, int(target_video.shape[2]), int(target_video.shape[3]), int(target_video.shape[4])),
         device=target_video.device,
         dtype=target_video.dtype,
@@ -146,11 +149,12 @@ def build_masked_context(
     )
     video_mask[:, :, :held_steps] = ramp
 
-    audio_mask = torch.zeros(
+    audio_mask = torch.ones(
         (1, 1, 1, int(target_audio.shape[-1])),
         device=target_audio.device,
         dtype=target_audio.dtype,
     )
+    audio_mask[..., :held_audio_steps] = 0.0
     return MaskedContext(
         video=video,
         audio=audio,
@@ -217,17 +221,25 @@ def make_protection_plan(
     if masked.video.shape[:2] != source_video.shape[:2] or masked.video.shape[3:] != source_video.shape[3:]:
         raise ValueError("Context protection: source and target latent geometry differ.")
 
+    # held_video is the restore record: the chain's real previous-tail frames,
+    # put back after sampling so the saved clip keeps a clean join.
     held_video = masked.held_video.clone()
+    sampling_video = masked.video.clone()
+    video_mask = masked.video_mask.clone()
     keystone = None
     if settings.keystone:
         keystone = source_video[:, :, :1].clone()
-        held_video[:, :, :1] = keystone
+        sampling_video[:, :, :1] = keystone.to(device=sampling_video.device, dtype=sampling_video.dtype)
+    # Slot 0 is owned by Keystone / Late Lock: locked unless Late Lock opens it.
+    video_mask[:, :, 0] = 0.0
 
     capstone = extract_capstone(source_video) if settings.capstone else None
+    if capstone is not None:
+        capstone = capstone.to(device=sampling_video.device, dtype=sampling_video.dtype)
     updated = MaskedContext(
-        video=masked.video,
+        video=sampling_video,
         audio=masked.audio,
-        video_mask=masked.video_mask,
+        video_mask=video_mask,
         audio_mask=masked.audio_mask,
         held_video=held_video,
         held_audio=masked.held_audio,
@@ -278,6 +290,57 @@ def apply_masked_samples(samples, masked):
         tensors[1] = masked_audio
         return type(samples)(tensors)
     raise ValueError("Context protection: unsupported sample container.")
+
+
+def protected_denoise_mask(samples, plan):
+    """Return the sampler denoise mask for a protection plan.
+
+    The mask must reach ``guider.sample``: ``KSamplerX0Inpaint`` uses it to mix
+    the clean held latents into x every step, which is what keeps held rows
+    clean. Passing it only to the model is not enough.
+    """
+    if plan is None:
+        return None
+    video, audio = _stream_pair(samples)
+    video_mask = plan.masked.video_mask.to(device=video.device, dtype=torch.float32)
+    audio_mask = plan.masked.audio_mask.to(device=audio.device, dtype=torch.float32)
+    if bool(getattr(samples, "is_nested", False)):
+        return type(samples)((video_mask, audio_mask))
+    return video_mask
+
+
+def make_late_lock_mask_function(plan: ProtectionPlan):
+    """Build the per-step mask hook Late Lock needs.
+
+    ``KSamplerX0Inpaint`` is the only consumer of ``denoise_mask_function``
+    (comfy/samplers.py), so the keystone slot can only change per step there.
+    Values follow the mask convention: 1 before ``late_step`` (free), 0 at and
+    after it (locked to the keystone).
+    """
+
+    def lock(sigma, mask, extra_options=None):
+        if not torch.is_tensor(mask):
+            return mask
+        sigmas = (extra_options or {}).get("sigmas")
+        step = resolve_sampler_step(sigma, sigmas)
+        value = 1.0 if step < int(plan.late_step) else 0.0
+        video = plan.masked.video
+        channels, steps, height, width = (int(v) for v in video.shape[1:])
+        n_video = channels * steps * height * width
+        result = mask.contiguous().clone()
+        if result.ndim == 3 and int(result.shape[-1]) >= n_video:
+            # Packed AV mask [B, 1, N].
+            vm = result[:, :, :n_video].reshape(result.shape[0], channels, steps, height, width).clone()
+            vm[:, :, 0] = value
+            result = torch.cat(
+                (vm.reshape(result.shape[0], 1, n_video), result[:, :, n_video:]),
+                dim=-1,
+            )
+        elif result.ndim == 5 and int(result.shape[2]) == steps:
+            result[:, :, 0] = value
+        return result
+
+    return lock
 
 
 def _replace_video(value, video):
@@ -394,6 +457,15 @@ def install_protection_wrapper(model, plan):
         "h3_context_protection",
         make_protection_wrapper(plan),
     )
+    previous = patched.model_options.get("denoise_mask_function")
+    late_lock = make_late_lock_mask_function(plan)
+
+    def denoise_mask_function(sigma, mask, extra_options=None):
+        if previous is not None:
+            mask = previous(sigma, mask, extra_options)
+        return late_lock(sigma, mask, extra_options)
+
+    patched.set_model_denoise_mask_function(denoise_mask_function)
     return patched
 
 
