@@ -14,6 +14,19 @@ Apart from possible bug fixes or compatibility corrections, I do not currently p
 
 ---
 
+### 🚀 New: v3.1.0 — ReCaVSR final-video upscale
+
+An optional **RECAVSR** button now sits right after **REFINE** in the Extender toolbar.
+
+- **REFINE** upscales the H3 latent before sampling. It changes the cache geometry and invalidates generated clips.
+- **RECAVSR** upscales the finished final video with the separate **ComfyUI-ReCaVSR** custom node. It runs after Final Decode, never touches the cache, and keeps the original file on disk beside the upscaled one.
+
+The two modes are exclusive: turning one on turns the other off. RECAVSR settings are **Scale**, **Colour fix** and **Seed**, plus the resulting final-video resolution. When the ReCaVSR node is not installed, the button is disabled and its tooltip reads **Install ReCaVSR first.**
+
+Full explanation, requirements and limits: [docs/RECAVSR_UPSCALE.md](docs/RECAVSR_UPSCALE.md).
+
+---
+
 ### 🚀 New: v3.0.5 — Latent Refine / Upscale
 
 A new optional **Latent Refine / Upscale** mode is now available, inspired by the latent refine work introduced in **PR #83**.

@@ -628,6 +628,7 @@ def run(
     refine_steps=8,
     refine_denoise=0.30,
     color_match=None,
+    recavsr=None,
 ):
     """Execute Ref2VA with no Motion Context and random-access clip caches."""
     from . import extender as e
@@ -728,6 +729,7 @@ def run(
     manifest["extender_refs_signature"] = refs_signature
     manifest["extender_ref_ids"] = [ref.get("id") if isinstance(ref, dict) else None for ref in refs]
     manifest["refine_mode"] = dict(refine_payload)
+    manifest["recavsr_mode"] = e._normalize_recavsr_settings(recavsr)
     manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
     manifest["updated_at"] = time.time()
     d._write_json_atomic(manifest_path, manifest)
@@ -1284,6 +1286,7 @@ def run(
         "prompt_pack_count": int(len(external_prompt_pack.get("prompts") or [])) if external_prompt_pack is not None else 0,
         "prompt_pack_signature": str(active_prompt_pack_signature or ""),
         "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
+        **e._recavsr_ui_state(recavsr),
         "build": e.BUILD,
     }
     return {

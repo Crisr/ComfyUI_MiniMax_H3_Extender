@@ -70,7 +70,7 @@ function uiMinHeightForState(state) {
     // nine internal references, FL2VA shows each plan's First/Last frames.
     // Keeping one fixed strip height also prevents mode switches from pulling
     // the DOM widget upward into the native widgets in Nodes 2.0.
-    const refineExtra = state?.refine_enabled ? 66 : 0;
+    const refineExtra = upscalePanelExtra(state);
     return Math.max(UI_MIN_HEIGHT, 55 + refineExtra + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
 }
 
@@ -138,6 +138,51 @@ function persistRefineSettingsOpen(node, runtime, open) {
     node.properties.h3_refine_settings_open = next;
     notifyWorkflowChanged(node, runtime);
     captureNativeWorkflowState(node, runtime);
+}
+
+function recavsrSettingsOpenFromNode(node) {
+    return boolValue(node?.properties?.h3_recavsr_settings_open, false);
+}
+
+function persistRecavsrSettingsOpen(node, runtime, open) {
+    const next = Boolean(open);
+    if (runtime) runtime.recavsrSettingsOpen = next;
+    if (!node.properties || typeof node.properties !== "object") node.properties = {};
+    node.properties.h3_recavsr_settings_open = next;
+    notifyWorkflowChanged(node, runtime);
+    captureNativeWorkflowState(node, runtime);
+}
+
+// ReCaVSR lives in a separate optional custom node. ComfyUI publishes every
+// loaded node type on LiteGraph, so the button can be honest before the first
+// queue instead of failing deep inside the final decode.
+function recavsrNodeAvailable(registry) {
+    const types = registry
+        || globalThis?.LiteGraph?.registered_node_types
+        || globalThis?.LiteGraph?.registered_nodes;
+    return Boolean(types && types.ReCaVSRUpscale);
+}
+
+// RECAVSR and REFINE both open one settings panel of the same height, and they
+// are exclusive, so the layout cost is the same for either.
+function upscalePanelExtra(state) {
+    return (state?.refine_enabled || state?.recavsr_enabled) ? 66 : 0;
+}
+
+// The two upscalers are exclusive. RECAVSR is export-only and never invalidates
+// clips, but turning REFINE on still ends with the Refine invalidation rules.
+function toggleUpscaleMode(current, target) {
+    const refineOn = Boolean(current?.refine_enabled);
+    const recavsrOn = Boolean(current?.recavsr_enabled);
+    if (target === "recavsr") {
+        const next = !recavsrOn;
+        return { refine_enabled: next ? false : refineOn, recavsr_enabled: next };
+    }
+    if (target === "refine") {
+        const next = !refineOn;
+        return { refine_enabled: next, recavsr_enabled: next ? false : recavsrOn };
+    }
+    return { refine_enabled: refineOn, recavsr_enabled: recavsrOn };
 }
 
 function ref2vaIndependentMode(state) {
@@ -1679,6 +1724,20 @@ function currentRefineTargetResolution(node, runtime) {
     return refinedResolutionFromBase(width, height, Number(runtime?.refineScaleWidget?.value ?? 1.5));
 }
 
+function currentRecavsrTargetResolution(node, runtime) {
+    // ReCaVSR reads the finished video, so the resolved canvas is the better
+    // guess; the width/height widgets cover the state before a first run.
+    const width = Number(runtime?.resolvedWidth || getWidget(node, "width")?.value || 0);
+    const height = Number(runtime?.resolvedHeight || getWidget(node, "height")?.value || 0);
+    if (!(width > 0) || !(height > 0)) return null;
+    const scale = Number(runtime?.recavsrScaleWidget?.value ?? 2.0);
+    // ReCaVSR scales each dimension and rounds half up, as its reference does.
+    return {
+        width: Math.floor(width * scale + 0.5),
+        height: Math.floor(height * scale + 0.5),
+    };
+}
+
 function autoResolutionFromDimensions(srcWidth, srcHeight, megapixels) {
     const srcW = Number(srcWidth || 0);
     const srcH = Number(srcHeight || 0);
@@ -2002,7 +2061,15 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
         .lg-node-widget:has([aria-label="refine_steps"]),
         .lg-node-widget:has([name="refine_steps"]),
         .lg-node-widget:has([aria-label="refine_denoise"]),
-        .lg-node-widget:has([name="refine_denoise"]) {
+        .lg-node-widget:has([name="refine_denoise"]),
+        .lg-node-widget:has([aria-label="recavsr_enabled"]),
+        .lg-node-widget:has([name="recavsr_enabled"]),
+        .lg-node-widget:has([aria-label="recavsr_scale"]),
+        .lg-node-widget:has([name="recavsr_scale"]),
+        .lg-node-widget:has([aria-label="recavsr_color_fix"]),
+        .lg-node-widget:has([name="recavsr_color_fix"]),
+        .lg-node-widget:has([aria-label="recavsr_seed"]),
+        .lg-node-widget:has([name="recavsr_seed"]) {
             display: none !important;
         }
 
@@ -6055,6 +6122,72 @@ function render(node, runtime) {
             ? `Final video: ${target.width} × ${target.height}`
             : "Final video: —";
     }
+    // RECAVSR is export-only: its values never invalidate clips, and its button
+    // is honest about the optional ReCaVSR custom node.
+    const recavsrOn = boolValue(runtime.recavsrEnabledWidget?.value, false);
+    const recavsrUiBusy = projectBusy(runtime);
+    state.recavsr_enabled = recavsrOn;
+    const liveRegistry = globalThis?.LiteGraph?.registered_node_types || globalThis?.LiteGraph?.registered_nodes;
+    if (liveRegistry) runtime.recavsrNodeAvailable = recavsrNodeAvailable(liveRegistry);
+    const recavsrNodeOk = Boolean(runtime.recavsrNodeAvailable);
+    const recavsrWeightsMissing = Boolean(recavsrNodeOk && runtime.recavsrChecked && !runtime.recavsrTransformer);
+    const recavsrAvailable = recavsrNodeOk && !recavsrWeightsMissing;
+    if (recavsrOn && !recavsrAvailable) {
+        runtime.recavsrEnabledWidget.value = false;
+        state.recavsr_enabled = false;
+    }
+    if (runtime.recavsrButton) {
+        const recavsrActive = boolValue(runtime.state.recavsr_enabled, false);
+        runtime.recavsrButton.disabled = !recavsrAvailable || recavsrUiBusy;
+        runtime.recavsrButton.textContent = recavsrActive ? "RECAVSR: ON" : "RECAVSR: OFF";
+        const tip = !recavsrNodeOk
+            ? "Install ReCaVSR first."
+            : (recavsrWeightsMissing
+                ? "Add ReCaVSR weights to models/recavsr first."
+                : (recavsrActive
+                    ? "ReCaVSR upscales the finished final video; generated clips are kept"
+                    : "Upscale the finished final video with ReCaVSR (export only)"));
+        runtime.recavsrButton.title = tip;
+        if (runtime.recavsrSlot) {
+            runtime.recavsrSlot.title = tip;
+            runtime.recavsrSlot.style.cursor = recavsrAvailable ? "default" : "help";
+        }
+        runtime.recavsrButton.style.fontWeight = "700";
+        runtime.recavsrButton.style.opacity = recavsrAvailable ? "1" : ".45";
+        runtime.recavsrButton.style.pointerEvents = recavsrAvailable ? "auto" : "none";
+        runtime.recavsrButton.style.border = recavsrActive
+            ? "1px solid rgba(120,204,196,.78)"
+            : "1px solid rgba(255,255,255,.18)";
+        runtime.recavsrButton.style.background = recavsrActive
+            ? "rgba(36,110,112,.38)"
+            : "rgba(255,255,255,.055)";
+        runtime.recavsrButton.style.boxShadow = recavsrActive
+            ? "0 0 0 1px rgba(72,150,148,.18) inset"
+            : "none";
+    }
+    if (runtime.recavsrPanel) {
+        runtime.recavsrPanel.style.display = boolValue(runtime.state.recavsr_enabled, false) ? "block" : "none";
+        const shouldOpen = Boolean(runtime.recavsrSettingsOpen);
+        if (runtime.recavsrPanel.open !== shouldOpen) runtime.recavsrPanel.open = shouldOpen;
+    }
+    if (runtime.recavsrScaleInput) {
+        runtime.recavsrScaleInput.value = String(runtime.recavsrScaleWidget?.value ?? 2.0);
+        runtime.recavsrScaleInput.disabled = recavsrUiBusy;
+    }
+    if (runtime.recavsrSeedInput) {
+        runtime.recavsrSeedInput.value = String(runtime.recavsrSeedWidget?.value ?? 42);
+        runtime.recavsrSeedInput.disabled = recavsrUiBusy;
+    }
+    if (runtime.recavsrColorFixInput) {
+        runtime.recavsrColorFixInput.value = String(runtime.recavsrColorFixWidget?.value || "none");
+        runtime.recavsrColorFixInput.disabled = recavsrUiBusy;
+    }
+    if (runtime.recavsrTargetLabel) {
+        const target = currentRecavsrTargetResolution(node, runtime);
+        runtime.recavsrTargetLabel.textContent = target
+            ? `Final video: ${target.width} × ${target.height}`
+            : "Final video: —";
+    }
     const sourceVideo = activeContinueVideoDescriptor(runtime);
     if (runtime.generationModeWidget) runtime.generationModeWidget.value = fl2vaMode ? "fl2va" : "ref2va";
     if (runtime.motionContextWidget) runtime.motionContextWidget.value = state.motion_context !== false;
@@ -7291,7 +7424,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         const actualH = Number(node.size?.[1] || h);
         const available = Math.max(uiMinH, actualH - y - BOTTOM_PAD);
         runtime.root.style.height = `${available}px`;
-        runtime.cards.style.height = `${Math.max(340, available - 55 - (runtime.state?.refine_enabled ? 66 : 0) - REF_SECTION_HEIGHT)}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55 - upscalePanelExtra(runtime.state) - REF_SECTION_HEIGHT)}px`;
         runtime.cards.style.flex = "0 0 auto";
         runtime.cards.style.minHeight = "";
         runtime.domHeight = available;
@@ -7400,6 +7533,10 @@ function buildUi(node) {
     const refineScaleWidget = getWidget(node, "refine_scale") || { name: "refine_scale", value: 1.5 };
     const refineStepsWidget = getWidget(node, "refine_steps") || { name: "refine_steps", value: 4 };
     const refineDenoiseWidget = getWidget(node, "refine_denoise") || { name: "refine_denoise", value: 0.30 };
+    const recavsrEnabledWidget = getWidget(node, "recavsr_enabled") || { name: "recavsr_enabled", value: false };
+    const recavsrScaleWidget = getWidget(node, "recavsr_scale") || { name: "recavsr_scale", value: 2.0 };
+    const recavsrColorFixWidget = getWidget(node, "recavsr_color_fix") || { name: "recavsr_color_fix", value: "none" };
+    const recavsrSeedWidget = getWidget(node, "recavsr_seed") || { name: "recavsr_seed", value: 42 };
     const contextLengthWidget = getWidget(node, "context_length");
     const audioContextLengthWidget = getWidget(node, "audio_context_length");
     if (!jsonWidget || !refsWidget || !generationModeWidget || !motionContextWidget) return null;
@@ -7411,6 +7548,10 @@ function buildUi(node) {
     if (getWidget(node, "refine_scale")) hideNativeWidget(node, refineScaleWidget);
     if (getWidget(node, "refine_steps")) hideNativeWidget(node, refineStepsWidget);
     if (getWidget(node, "refine_denoise")) hideNativeWidget(node, refineDenoiseWidget);
+    if (getWidget(node, "recavsr_enabled")) hideNativeWidget(node, recavsrEnabledWidget);
+    if (getWidget(node, "recavsr_scale")) hideNativeWidget(node, recavsrScaleWidget);
+    if (getWidget(node, "recavsr_color_fix")) hideNativeWidget(node, recavsrColorFixWidget);
+    if (getWidget(node, "recavsr_seed")) hideNativeWidget(node, recavsrSeedWidget);
 
     // The color match widgets are appended after every legacy widget, so a
     // workflow saved before this feature arrives without a value for them and
@@ -7421,6 +7562,13 @@ function buildUi(node) {
 
     const state = parseState(jsonWidget.value);
     state.refine_enabled = boolValue(refineEnabledWidget.value, false);
+    state.recavsr_enabled = boolValue(recavsrEnabledWidget.value, false);
+    // The two upscalers are exclusive. A hand-edited workflow that carries both
+    // keeps the established Refine path and drops RECAVSR.
+    if (state.refine_enabled && state.recavsr_enabled) {
+        recavsrEnabledWidget.value = false;
+        state.recavsr_enabled = false;
+    }
     // Initial node construction can happen before a saved workflow has been
     // configured. This state is display-only until loadedGraphNode hydrates it
     // from the native serialized widgets.
@@ -7620,6 +7768,12 @@ function buildUi(node) {
         }
         refineEnabledWidget.value = next;
         runtime.state.refine_enabled = next;
+        if (next) {
+            // Exclusive upscalers: RECAVSR is export-only, so leaving it costs
+            // no clips; Refine then invalidates as usual.
+            recavsrEnabledWidget.value = false;
+            runtime.state.recavsr_enabled = false;
+        }
         invalidateRefineUi(next ? "Latent Refine ON • generated clips invalidated" : "Latent Refine OFF • generated clips invalidated");
     });
 
@@ -7695,6 +7849,142 @@ function buildUi(node) {
     refinePanel.addEventListener("toggle", () => {
         if (!runtime || runtime.hydrating || isH3GraphConfiguring()) return;
         persistRefineSettingsOpen(node, runtime, refinePanel.open);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
+    const recavsrButton = document.createElement("button");
+    recavsrButton.type = "button";
+    recavsrButton.title = "Upscale the finished final video with ReCaVSR (export only; the clip cache is kept)";
+    recavsrButton.style.fontWeight = "700";
+    // A disabled control drops its own tooltip in Chromium, so the wrapper span
+    // carries the hint while the button stays unclickable.
+    const recavsrSlot = document.createElement("span");
+    recavsrSlot.style.display = "inline-flex";
+    recavsrSlot.style.alignItems = "center";
+    recavsrSlot.append(recavsrButton);
+    recavsrButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (projectBusy(runtime)) return;
+        const next = toggleUpscaleMode(runtime.state, "recavsr");
+        if (!next.recavsr_enabled) {
+            recavsrEnabledWidget.value = false;
+            runtime.state.recavsr_enabled = false;
+            runtime.statusText = "ReCaVSR OFF • the final video stays as decoded";
+        } else {
+            if (next.refine_enabled === false && boolValue(refineEnabledWidget.value, false)) {
+                // Refine owns the latent geometry, so leaving it is a real
+                // invalidation, exactly like pressing REFINE OFF.
+                refineEnabledWidget.value = false;
+                runtime.state.refine_enabled = false;
+                invalidateRefineUi("Latent Refine OFF • generated clips invalidated");
+            }
+            recavsrEnabledWidget.value = true;
+            runtime.state.recavsr_enabled = true;
+            runtime.statusText = "ReCaVSR ON • the finished video is upscaled at Final Decode";
+        }
+        updateHidden(node, runtime);
+        captureNativeWorkflowState(node, runtime);
+        render(node, runtime);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
+    const initialRecavsrSettingsOpen = recavsrSettingsOpenFromNode(node);
+    const recavsrPanel = document.createElement("details");
+    recavsrPanel.open = initialRecavsrSettingsOpen;
+    recavsrPanel.style.margin = "0 0 7px";
+    recavsrPanel.style.padding = "7px 9px";
+    recavsrPanel.style.border = "1px solid rgba(120,204,196,.55)";
+    recavsrPanel.style.borderRadius = "8px";
+    recavsrPanel.style.background = "rgba(30,92,96,.22)";
+    recavsrPanel.style.boxShadow = "0 0 0 1px rgba(72,150,148,.12) inset";
+    const recavsrSummary = document.createElement("summary");
+    recavsrSummary.textContent = "⚙  RECAVSR SETTINGS";
+    recavsrSummary.title = "ReCaVSR scale, colour fix and seed for the finished final video";
+    recavsrSummary.style.cursor = "pointer";
+    recavsrSummary.style.fontSize = "12px";
+    recavsrSummary.style.fontWeight = "750";
+    recavsrSummary.style.letterSpacing = ".035em";
+    recavsrSummary.style.padding = "2px 1px";
+    recavsrSummary.style.userSelect = "none";
+    const recavsrControls = document.createElement("div");
+    recavsrControls.style.display = "flex";
+    recavsrControls.style.flexWrap = "wrap";
+    recavsrControls.style.alignItems = "center";
+    recavsrControls.style.gap = "10px 14px";
+    recavsrControls.style.padding = "9px 1px 2px";
+    const makeRecavsrNumber = (labelText, widget, min, max, step, integer) => {
+        const label = document.createElement("label");
+        label.style.fontSize = "11px";
+        label.style.fontWeight = "600";
+        label.style.display = "flex";
+        label.style.alignItems = "center";
+        label.style.gap = "6px";
+        label.textContent = labelText;
+        const input = document.createElement("input");
+        input.type = "number";
+        input.min = String(min);
+        input.max = String(max);
+        input.step = String(step);
+        input.value = String(widget.value);
+        input.style.width = integer ? "96px" : "72px";
+        input.style.height = "24px";
+        input.style.boxSizing = "border-box";
+        input.style.padding = "2px 5px";
+        input.style.border = "1px solid rgba(255,255,255,.20)";
+        input.style.borderRadius = "5px";
+        input.style.background = "rgba(10,10,10,.50)";
+        input.addEventListener("change", () => {
+            let value = Number(input.value);
+            if (!Number.isFinite(value)) value = Number(widget.value);
+            value = Math.max(Number(min), Math.min(Number(max), value));
+            if (integer) value = Math.round(value);
+            widget.value = value;
+            input.value = String(value);
+            // ReCaVSR is export-only: no cache invalidation here.
+            if (runtime) runtime.statusText = "ReCaVSR settings changed • clips are kept";
+        });
+        label.append(input);
+        recavsrControls.append(label);
+        return input;
+    };
+    const recavsrScaleInput = makeRecavsrNumber("Scale", recavsrScaleWidget, 1.0, 4.0, 0.05, false);
+    const recavsrSeedInput = makeRecavsrNumber("Seed", recavsrSeedWidget, 0, 4294967295, 1, true);
+    const recavsrColorLabel = document.createElement("label");
+    recavsrColorLabel.style.fontSize = "11px";
+    recavsrColorLabel.style.fontWeight = "600";
+    recavsrColorLabel.style.display = "flex";
+    recavsrColorLabel.style.alignItems = "center";
+    recavsrColorLabel.style.gap = "6px";
+    recavsrColorLabel.textContent = "Colour fix";
+    const recavsrColorFixInput = document.createElement("select");
+    for (const option of ["none", "adain", "wavelet"]) {
+        const element = document.createElement("option");
+        element.value = option;
+        element.textContent = option;
+        recavsrColorFixInput.append(element);
+    }
+    recavsrColorFixInput.value = String(recavsrColorFixWidget.value || "none");
+    recavsrColorFixInput.style.height = "24px";
+    recavsrColorFixInput.style.border = "1px solid rgba(255,255,255,.20)";
+    recavsrColorFixInput.style.borderRadius = "5px";
+    recavsrColorFixInput.style.background = "rgba(10,10,10,.50)";
+    recavsrColorFixInput.addEventListener("change", () => {
+        recavsrColorFixWidget.value = String(recavsrColorFixInput.value || "none");
+        if (runtime) runtime.statusText = "ReCaVSR settings changed • clips are kept";
+    });
+    recavsrColorLabel.append(recavsrColorFixInput);
+    recavsrControls.append(recavsrColorLabel);
+    const recavsrTargetLabel = document.createElement("span");
+    recavsrTargetLabel.style.fontSize = "11px";
+    recavsrTargetLabel.style.fontWeight = "650";
+    recavsrTargetLabel.style.opacity = ".88";
+    recavsrTargetLabel.style.whiteSpace = "nowrap";
+    recavsrTargetLabel.textContent = "Final video: —";
+    recavsrControls.append(recavsrTargetLabel);
+    recavsrPanel.append(recavsrSummary, recavsrControls);
+    recavsrPanel.addEventListener("toggle", () => {
+        if (!runtime || runtime.hydrating || isH3GraphConfiguring()) return;
+        persistRecavsrSettingsOpen(node, runtime, recavsrPanel.open);
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
     });
 
@@ -7784,7 +8074,7 @@ function buildUi(node) {
     status.style.maxWidth = "55%";
 
     toolbar.append(
-        modeButton, motionButton, refineButton, add, remove, newProjectButton,
+        modeButton, motionButton, refineButton, recavsrSlot, add, remove, newProjectButton,
         saveProjectButton, loadProjectButton, interruptButton, counter, status,
         projectFileInput,
     );
@@ -7841,10 +8131,10 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - (state?.refine_enabled ? 66 : 0) - REF_SECTION_HEIGHT)}px`;
+    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - upscalePanelExtra(state) - REF_SECTION_HEIGHT)}px`;
     cards.style.minHeight = `${cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE}px`;
 
-    root.append(toolbar, refinePanel, refsSection, cards, refFileInput, frameFileInput);
+    root.append(toolbar, refinePanel, recavsrPanel, refsSection, cards, refFileInput, frameFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
@@ -7873,6 +8163,10 @@ function buildUi(node) {
         refineScaleWidget,
         refineStepsWidget,
         refineDenoiseWidget,
+        recavsrEnabledWidget,
+        recavsrScaleWidget,
+        recavsrColorFixWidget,
+        recavsrSeedWidget,
         contextLengthWidget,
         audioContextLengthWidget,
         modeButton,
@@ -7884,6 +8178,17 @@ function buildUi(node) {
         refineStepsInput,
         refineDenoiseInput,
         refineTargetLabel,
+        recavsrButton,
+        recavsrSlot,
+        recavsrPanel,
+        recavsrSettingsOpen: initialRecavsrSettingsOpen,
+        recavsrScaleInput,
+        recavsrSeedInput,
+        recavsrColorFixInput,
+        recavsrTargetLabel,
+        recavsrChecked: false,
+        recavsrNodeAvailable: recavsrNodeAvailable(),
+        recavsrTransformer: "",
         pendingRefSlot: -1,
         pendingFrameClip: -1,
         pendingFrameKind: "",
@@ -8428,6 +8733,18 @@ app.registerExtension({
             if (Object.prototype.hasOwnProperty.call(info, "motion_context")) {
                 runtime.state.motion_context = boolValue(info.motion_context, true);
                 if (runtime.motionContextWidget) runtime.motionContextWidget.value = runtime.state.motion_context;
+            }
+            if (Object.prototype.hasOwnProperty.call(info, "recavsr_node_available")) {
+                runtime.recavsrChecked = true;
+                runtime.recavsrNodeAvailable = Boolean(info.recavsr_node_available);
+                runtime.recavsrTransformer = String(info.recavsr_transformer || "");
+                // The backend cannot run the pass without the node, so never
+                // leave the mode armed against a missing install.
+                if (!runtime.recavsrNodeAvailable && boolValue(runtime.recavsrEnabledWidget?.value, false)) {
+                    runtime.recavsrEnabledWidget.value = false;
+                    runtime.state.recavsr_enabled = false;
+                    runtime.statusText = "ReCaVSR is not installed • RECAVSR turned OFF";
+                }
             }
             if (info.refs_json) {
                 runtime.refsWidget.value = info.refs_json;

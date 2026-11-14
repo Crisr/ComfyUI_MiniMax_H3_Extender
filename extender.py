@@ -65,6 +65,10 @@ from .context_protection import (
 from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
 from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
 from .latent_upscaler import target_dimensions
+from .recavsr_pass import (
+    normalize_settings as _normalize_recavsr_settings,
+    status as _recavsr_status,
+)
 from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
 from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
 from .motion_context_disk import (
@@ -2665,6 +2669,16 @@ def _refine_settings_changed(manifest, payload):
     return dict(previous) != dict(payload)
 
 
+def _recavsr_ui_state(payload):
+    """ReCaVSR mode plus what the UI needs to disable the button honestly."""
+    state = _recavsr_status()
+    return {
+        "recavsr_mode": dict(payload) if isinstance(payload, dict) else {},
+        "recavsr_node_available": bool(state.get("node")),
+        "recavsr_transformer": str(state.get("transformer") or ""),
+    }
+
+
 def _resize_context_latent_spatial(latent, width: int, height: int):
     """Transiently resize a cached refined AV latent for base-resolution Motion Context."""
     video, audio = _streams_from_latent(latent, "samples")
@@ -5021,6 +5035,7 @@ PROJECT_SETTING_NAMES = (
     "resolution_mode", "megapixels", "refs_json", "generation_mode", "motion_context",
     "context_protection", "protection_keystone", "protection_capstone",
     "protection_late_step", "protection_noise_strength", "protection_noise_ease",
+    "recavsr_enabled", "recavsr_scale", "recavsr_color_fix", "recavsr_seed",
 )
 
 
@@ -5265,6 +5280,26 @@ class MiniMaxH3Extender:
                 "BOOLEAN",
                 {"default": True, "tooltip": "Ease Context Noise toward zero at the newest held slot."},
             ),
+            # Appended after every legacy widget. ReCaVSR upscales the finished
+            # final video instead of the latent, so these values never change
+            # cache geometry and never invalidate generated clips. The frontend
+            # presents them as the RECAVSR button and its settings panel.
+            "recavsr_enabled": (
+                "BOOLEAN",
+                {"default": False, "tooltip": "Upscale the finished final video with ReCaVSR. Needs the ComfyUI-ReCaVSR node. Never invalidates generated clips."},
+            ),
+            "recavsr_scale": (
+                "FLOAT",
+                {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05},
+            ),
+            "recavsr_color_fix": (
+                ["none", "adain", "wavelet"],
+                {"default": "none"},
+            ),
+            "recavsr_seed": (
+                "INT",
+                {"default": 42, "min": 0, "max": 0xFFFFFFFF, "step": 1},
+            ),
         }
 
         # Audio and video references remain external sockets. Image refs continue
@@ -5490,6 +5525,7 @@ class MiniMaxH3Extender:
         refine_steps=4,
         refine_denoise=0.30,
         color_match=None,
+        recavsr=None,
     ):
         if fl2va_model is None:
             raise ValueError(
@@ -5591,6 +5627,7 @@ class MiniMaxH3Extender:
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
         manifest = dict(manifest)
         manifest["refine_mode"] = dict(refine_payload)
+        manifest["recavsr_mode"] = _normalize_recavsr_settings(recavsr)
         manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
         manifest["color_match"] = dict(color_match_spec)
         manifest["updated_at"] = time.time()
@@ -6100,6 +6137,7 @@ class MiniMaxH3Extender:
             "prompt_pack_signature": str(active_prompt_pack_signature or ""),
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "color_match": dict(color_match_spec),
+            **_recavsr_ui_state(recavsr),
             "build": BUILD,
         }
         return {
@@ -6149,6 +6187,10 @@ class MiniMaxH3Extender:
         protection_late_step=1,
         protection_noise_strength=0.5,
         protection_noise_ease=True,
+        recavsr_enabled=False,
+        recavsr_scale=2.0,
+        recavsr_color_fix="none",
+        recavsr_seed=42,
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -6161,6 +6203,14 @@ class MiniMaxH3Extender:
         refine_scale = max(1.0, min(2.0, float(refine_scale)))
         refine_steps = max(1, int(refine_steps))
         refine_denoise = max(0.01, min(1.0, float(refine_denoise)))
+        # ReCaVSR is export-only: no geometry check and no cache invalidation
+        # follows from these values.
+        recavsr_payload = _normalize_recavsr_settings({
+            "enabled": recavsr_enabled,
+            "scale": recavsr_scale,
+            "color_fix": recavsr_color_fix,
+            "seed": recavsr_seed,
+        })
         external_sigmas = kwargs.get("sigmas")
         sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
         protection_settings = normalize_protection_settings(
@@ -6260,6 +6310,7 @@ class MiniMaxH3Extender:
                 refine_enabled=refine_enabled, refine_scale=refine_scale,
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
                 color_match=color_match_spec,
+                recavsr=recavsr_payload,
             )
 
         if not motion_context:
@@ -6283,6 +6334,7 @@ class MiniMaxH3Extender:
                 refine_enabled=refine_enabled, refine_scale=refine_scale,
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
                 color_match=color_match_spec,
+                recavsr=recavsr_payload,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -6492,6 +6544,7 @@ class MiniMaxH3Extender:
             ref.get("id") if isinstance(ref, dict) else None for ref in refs
         ]
         manifest["refine_mode"] = dict(refine_payload)
+        manifest["recavsr_mode"] = dict(recavsr_payload)
         manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
         manifest["color_match"] = dict(color_match_spec)
         manifest["updated_at"] = time.time()
@@ -7337,6 +7390,7 @@ class MiniMaxH3Extender:
             "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "color_match": dict(color_match_spec),
+            **_recavsr_ui_state(recavsr_payload),
             "build": BUILD,
         }
 
