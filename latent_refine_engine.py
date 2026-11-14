@@ -7,10 +7,12 @@ from .latent_upscaler import upscale_video_latent
 from .motion_context_ram import _streams_from_latent
 
 
-def upscale_for_refine(sampled, scale: float, progress=None):
+def upscale_for_refine(sampled, scale: float, progress=None, upscaler="learned"):
     """Upscale only H3 video latent; preserve first-pass audio exactly."""
     video, audio = _streams_from_latent(sampled, "samples")
-    up_video, width, height = upscale_video_latent(video, scale, progress=progress)
+    up_video, width, height = upscale_video_latent(
+        video, scale, progress=progress, method=upscaler
+    )
     audio = audio.to(device=comfy.model_management.intermediate_device())
     up_video = up_video.to(device=audio.device)
     latent = sampled.copy()

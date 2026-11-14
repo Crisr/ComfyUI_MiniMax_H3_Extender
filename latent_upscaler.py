@@ -288,8 +288,16 @@ def target_dimensions(width: int, height: int, scale: float):
     return w, h
 
 
+UPSCALER_METHODS = ("learned", "trilinear")
+
+
+def normalize_upscaler_method(method) -> str:
+    value = str(method or "").strip().lower()
+    return value if value in UPSCALER_METHODS else "learned"
+
+
 @torch.inference_mode()
-def upscale_video_latent(video: torch.Tensor, scale: float, progress=None):
+def upscale_video_latent(video: torch.Tensor, scale: float, progress=None, method="learned"):
     if not torch.is_tensor(video) or video.ndim != 5 or int(video.shape[1]) != 24:
         raise ValueError("MiniMax H3 Extender: expected H3 video latent [B,24,T,H,W]")
     dev = mm.get_torch_device()
@@ -299,6 +307,18 @@ def upscale_video_latent(video: torch.Tensor, scale: float, progress=None):
     h2, w2 = target_h_px // VAE_DOWNSAMPLE, target_w_px // VAE_DOWNSAMPLE
     if (h2, w2) == (h, w):
         return video, target_w_px, target_h_px
+    if normalize_upscaler_method(method) == "trilinear":
+        # No model, no VRAM swap: interpolate the latent directly. Faster, but
+        # the result is softer, so it usually needs a higher refine denoise.
+        if progress is not None:
+            progress(f"Trilinear latent upscale {w}x{h} -> {w2}x{h2}")
+        out = torch.nn.functional.interpolate(
+            video.to(dev),
+            size=(int(t), int(h2), int(w2)),
+            mode="trilinear",
+            align_corners=False,
+        )
+        return out.to(device=orig_device, dtype=orig_dtype), target_w_px, target_h_px
     path = ensure_upscale_model(progress=progress)
     patcher = _load_model(path, dev)
     loaded = False

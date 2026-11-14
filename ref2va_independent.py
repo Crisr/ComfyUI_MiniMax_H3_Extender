@@ -627,6 +627,7 @@ def run(
     refine_scale=1.5,
     refine_steps=8,
     refine_denoise=0.30,
+    refine_upscaler="learned",
     color_match=None,
     recavsr=None,
 ):
@@ -690,7 +691,8 @@ def run(
         if refine_enabled else (resolved_width, resolved_height)
     )
     refine_payload = e._refine_settings_payload(
-        refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas
+        refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas,
+        upscaler=refine_upscaler,
     )
     if manifest.get("segments"):
         geometry_changed = bool(
@@ -1066,6 +1068,7 @@ def run(
                 selected_audio_slots=selected_audio_slots, audio_native_offset=audio_native_offset,
                 seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                 refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
+                refine_upscaler=refine_upscaler,
                 external_sigmas=sigmas, motion=None, previous_refined_proxy=None,
             )
             del first_pass

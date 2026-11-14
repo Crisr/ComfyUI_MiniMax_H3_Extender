@@ -44,9 +44,10 @@ Refine settings include:
 - **Scale Factor**
 - **Refine Steps**
 - **Refine Denoise**
+- **Upscaler** — `learned` (default, the 3D conv latent upscaler) or `trilinear` (interpolates the latent directly, skipping the model pass; faster and lighter on VRAM, but softer, so raise Refine Denoise to about 0.35–0.40)
 - automatic display of the resulting final video resolution
 
-The same H3 model is reused for both passes, and the required latent upscaler model is downloaded automatically on first use.
+The same H3 model is reused for both passes, and the required latent upscaler model is downloaded automatically on first use. The `trilinear` upscaler needs no model download.
 
 ---
 

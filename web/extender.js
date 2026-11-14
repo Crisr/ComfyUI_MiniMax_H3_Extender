@@ -99,6 +99,7 @@ const PROJECT_WIDGETS = [
     "refine_scale",
     "refine_steps",
     "refine_denoise",
+    "refine_upscaler",
     "context_protection",
     "protection_keystone",
     "protection_capstone",
@@ -2062,6 +2063,8 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
         .lg-node-widget:has([name="refine_steps"]),
         .lg-node-widget:has([aria-label="refine_denoise"]),
         .lg-node-widget:has([name="refine_denoise"]),
+        .lg-node-widget:has([aria-label="refine_upscaler"]),
+        .lg-node-widget:has([name="refine_upscaler"]),
         .lg-node-widget:has([aria-label="recavsr_enabled"]),
         .lg-node-widget:has([name="recavsr_enabled"]),
         .lg-node-widget:has([aria-label="recavsr_scale"]),
@@ -6116,6 +6119,11 @@ function render(node, runtime) {
         runtime.refineDenoiseInput.value = String(runtime.refineDenoiseWidget?.value ?? 0.30);
         runtime.refineDenoiseInput.disabled = refineUiBusy;
     }
+    if (runtime.refineUpscalerInput) {
+        const upscaler = String(runtime.refineUpscalerWidget?.value ?? "learned");
+        runtime.refineUpscalerInput.value = upscaler === "trilinear" ? "trilinear" : "learned";
+        runtime.refineUpscalerInput.disabled = refineUiBusy;
+    }
     if (runtime.refineTargetLabel) {
         const target = currentRefineTargetResolution(node, runtime);
         runtime.refineTargetLabel.textContent = target
@@ -7533,6 +7541,7 @@ function buildUi(node) {
     const refineScaleWidget = getWidget(node, "refine_scale") || { name: "refine_scale", value: 1.5 };
     const refineStepsWidget = getWidget(node, "refine_steps") || { name: "refine_steps", value: 4 };
     const refineDenoiseWidget = getWidget(node, "refine_denoise") || { name: "refine_denoise", value: 0.30 };
+    const refineUpscalerWidget = getWidget(node, "refine_upscaler") || { name: "refine_upscaler", value: "learned" };
     const recavsrEnabledWidget = getWidget(node, "recavsr_enabled") || { name: "recavsr_enabled", value: false };
     const recavsrScaleWidget = getWidget(node, "recavsr_scale") || { name: "recavsr_scale", value: 2.0 };
     const recavsrColorFixWidget = getWidget(node, "recavsr_color_fix") || { name: "recavsr_color_fix", value: "none" };
@@ -7548,6 +7557,7 @@ function buildUi(node) {
     if (getWidget(node, "refine_scale")) hideNativeWidget(node, refineScaleWidget);
     if (getWidget(node, "refine_steps")) hideNativeWidget(node, refineStepsWidget);
     if (getWidget(node, "refine_denoise")) hideNativeWidget(node, refineDenoiseWidget);
+    if (getWidget(node, "refine_upscaler")) hideNativeWidget(node, refineUpscalerWidget);
     if (getWidget(node, "recavsr_enabled")) hideNativeWidget(node, recavsrEnabledWidget);
     if (getWidget(node, "recavsr_scale")) hideNativeWidget(node, recavsrScaleWidget);
     if (getWidget(node, "recavsr_color_fix")) hideNativeWidget(node, recavsrColorFixWidget);
@@ -7788,7 +7798,7 @@ function buildUi(node) {
     refinePanel.style.boxShadow = "0 0 0 1px rgba(120,88,185,.10) inset";
     const refineSummary = document.createElement("summary");
     refineSummary.textContent = "⚙  REFINE SETTINGS";
-    refineSummary.title = "Scale factor, refine steps and refine denoise";
+    refineSummary.title = "Scale factor, refine steps, refine denoise and upscaler";
     refineSummary.style.cursor = "pointer";
     refineSummary.style.fontSize = "12px";
     refineSummary.style.fontWeight = "750";
@@ -7838,6 +7848,44 @@ function buildUi(node) {
     const refineScaleInput = makeRefineNumber("Scale", refineScaleWidget, 1.0, 2.0, 0.05);
     const refineStepsInput = makeRefineNumber("Steps", refineStepsWidget, 1, 100, 1);
     const refineDenoiseInput = makeRefineNumber("Denoise", refineDenoiseWidget, 0.01, 1.0, 0.01);
+    const makeRefineSelect = (labelText, widget, options) => {
+        const label = document.createElement("label");
+        label.style.fontSize = "11px";
+        label.style.fontWeight = "600";
+        label.style.display = "flex";
+        label.style.alignItems = "center";
+        label.style.gap = "6px";
+        label.textContent = labelText;
+        const select = document.createElement("select");
+        for (const option of options) {
+            const item = document.createElement("option");
+            item.value = option;
+            item.textContent = option;
+            select.append(item);
+        }
+        const initial = options.includes(String(widget.value)) ? String(widget.value) : options[0];
+        select.value = initial;
+        // A workflow saved before this widget existed has no value yet. Seed the
+        // default so the native widget and the serialized state agree.
+        widget.value = initial;
+        select.style.height = "24px";
+        select.style.padding = "2px 5px";
+        select.style.border = "1px solid rgba(255,255,255,.20)";
+        select.style.borderRadius = "5px";
+        select.style.background = "rgba(10,10,10,.50)";
+        select.addEventListener("change", () => {
+            const value = options.includes(select.value) ? select.value : options[0];
+            widget.value = value;
+            select.value = value;
+            if (boolValue(refineEnabledWidget.value, false)) invalidateRefineUi();
+        });
+        label.append(select);
+        refineControls.append(label);
+        return select;
+    };
+    const refineUpscalerInput = makeRefineSelect(
+        "Upscaler", refineUpscalerWidget, ["learned", "trilinear"]
+    );
     const refineTargetLabel = document.createElement("span");
     refineTargetLabel.style.fontSize = "11px";
     refineTargetLabel.style.fontWeight = "650";
@@ -8163,6 +8211,7 @@ function buildUi(node) {
         refineScaleWidget,
         refineStepsWidget,
         refineDenoiseWidget,
+        refineUpscalerWidget,
         recavsrEnabledWidget,
         recavsrScaleWidget,
         recavsrColorFixWidget,
@@ -8177,6 +8226,7 @@ function buildUi(node) {
         refineScaleInput,
         refineStepsInput,
         refineDenoiseInput,
+        refineUpscalerInput,
         refineTargetLabel,
         recavsrButton,
         recavsrSlot,

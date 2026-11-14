@@ -64,7 +64,7 @@ from .context_protection import (
 )
 from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
 from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
-from .latent_upscaler import target_dimensions
+from .latent_upscaler import normalize_upscaler_method, target_dimensions
 from .recavsr_pass import (
     normalize_settings as _normalize_recavsr_settings,
     status as _recavsr_status,
@@ -2642,7 +2642,7 @@ def _sample_h3(
 
 
 
-def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=None):
+def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=None, upscaler="learned"):
     enabled = bool(enabled)
     if not enabled:
         return {"enabled": False}
@@ -2651,7 +2651,7 @@ def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=Non
     if torch.is_tensor(external_sigmas):
         vals = external_sigmas.detach().float().reshape(-1).cpu().tolist()
         sig_signature = hashlib.sha1(",".join(f"{float(v):.8g}" for v in vals).encode("utf-8")).hexdigest()[:20]
-    return {
+    payload = {
         "enabled": True,
         "scale": round(float(scale), 6),
         "steps": int(steps),
@@ -2660,6 +2660,12 @@ def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=Non
         "sigma_count": sig_count,
         "sigma_signature": sig_signature,
     }
+    # Only record a non-default upscaler, so every cache written before this
+    # widget existed keeps the signature it was generated with.
+    method = str(upscaler or "learned").strip().lower()
+    if method != "learned":
+        payload["upscaler"] = method
+    return payload
 
 
 def _refine_settings_changed(manifest, payload):
@@ -2804,6 +2810,7 @@ def _refine_ref2va_sample(
     context_length="22", audio_context_length=0,
     protection_source_latent=None, protection_settings=None,
     protection_source_id=None, protection_source_index=None,
+    refine_upscaler="learned",
 ):
     """Direct upscale+refine; returns the sole final sample and refine trim."""
     _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
@@ -2811,6 +2818,7 @@ def _refine_ref2va_sample(
         sampled,
         float(refine_scale),
         progress=lambda msg: _refine_progress(owner, clip_index, clip_count, msg),
+        upscaler=refine_upscaler,
     )
     refine_positive, _unused = _make_ref2va_conditioning(
         clip_text_encoder, vae, prompt, out_w, out_h, frame_count,
@@ -2887,12 +2895,14 @@ def _refine_fl2va_sample(
     *, owner, clip_index, clip_count, sampled, clip_model, clip_text_encoder, vae,
     prompt, frame_count, first_frame, last_frame, guide_frames, seed,
     sampler_name, scheduler, refine_scale, refine_steps, refine_denoise, external_sigmas,
+    refine_upscaler="learned",
 ):
     _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
     up_latent, out_w, out_h, first_audio = upscale_for_refine(
         sampled,
         float(refine_scale),
         progress=lambda msg: _refine_progress(owner, clip_index, clip_count, msg),
+        upscaler=refine_upscaler,
     )
     refine_positive, _ = make_fl2va_conditioning(
         clip_text_encoder, vae, prompt, out_w, out_h, frame_count,
@@ -5031,6 +5041,7 @@ def _import_project_archive(owner_id, archive_path):
 PROJECT_SETTING_NAMES = (
     "run_mode", "width", "height", "ref_image_size", "steps", "sampler_name",
     "scheduler", "denoise", "refine_enabled", "refine_scale", "refine_steps", "refine_denoise",
+    "refine_upscaler",
     "context_length", "audio_context_length", "clips_json",
     "resolution_mode", "megapixels", "refs_json", "generation_mode", "motion_context",
     "context_protection", "protection_keystone", "protection_capstone",
@@ -5300,6 +5311,13 @@ class MiniMaxH3Extender:
                 "INT",
                 {"default": 42, "min": 0, "max": 0xFFFFFFFF, "step": 1},
             ),
+            # Appended after every legacy widget. Selects how Refine enlarges
+            # the video latent: the learned 3D conv upscaler, or a direct
+            # trilinear interpolation that skips the model pass entirely.
+            "refine_upscaler": (
+                ["learned", "trilinear"],
+                {"default": "learned", "tooltip": "Refine upscaler. 'learned' runs the H3 3D conv latent upscaler; 'trilinear' skips it for a faster, softer interpolation. Changing this invalidates generated clips."},
+            ),
         }
 
         # Audio and video references remain external sockets. Image refs continue
@@ -5524,6 +5542,7 @@ class MiniMaxH3Extender:
         refine_scale=1.5,
         refine_steps=4,
         refine_denoise=0.30,
+        refine_upscaler="learned",
         color_match=None,
         recavsr=None,
     ):
@@ -5587,7 +5606,8 @@ class MiniMaxH3Extender:
             if refine_enabled else (resolved_width, resolved_height)
         )
         refine_payload = _refine_settings_payload(
-            refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas
+            refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas,
+            upscaler=refine_upscaler,
         )
         if manifest.get("segments"):
             geometry_changed = bool(
@@ -5910,6 +5930,7 @@ class MiniMaxH3Extender:
                     first_frame=first_frame, last_frame=last_frame, guide_frames=guide_frames,
                     seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                     refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
+                    refine_upscaler=refine_upscaler,
                     external_sigmas=sigmas,
                 )
                 del first_pass
@@ -6178,6 +6199,7 @@ class MiniMaxH3Extender:
         refine_scale=1.5,
         refine_steps=4,
         refine_denoise=0.30,
+        refine_upscaler="learned",
         color_match_space="LAB",
         color_match_factor=1.0,
         color_match_process_clip0=False,
@@ -6203,6 +6225,7 @@ class MiniMaxH3Extender:
         refine_scale = max(1.0, min(2.0, float(refine_scale)))
         refine_steps = max(1, int(refine_steps))
         refine_denoise = max(0.01, min(1.0, float(refine_denoise)))
+        refine_upscaler = normalize_upscaler_method(refine_upscaler)
         # ReCaVSR is export-only: no geometry check and no cache invalidation
         # follows from these values.
         recavsr_payload = _normalize_recavsr_settings({
@@ -6309,6 +6332,7 @@ class MiniMaxH3Extender:
                 sigmas=external_sigmas,
                 refine_enabled=refine_enabled, refine_scale=refine_scale,
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
+                refine_upscaler=refine_upscaler,
                 color_match=color_match_spec,
                 recavsr=recavsr_payload,
             )
@@ -6333,6 +6357,7 @@ class MiniMaxH3Extender:
                 sigmas=external_sigmas,
                 refine_enabled=refine_enabled, refine_scale=refine_scale,
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
+                refine_upscaler=refine_upscaler,
                 color_match=color_match_spec,
                 recavsr=recavsr_payload,
             )
@@ -6487,7 +6512,8 @@ class MiniMaxH3Extender:
             if refine_enabled else (resolved_width, resolved_height)
         )
         refine_payload = _refine_settings_payload(
-            refine_enabled, refine_scale, refine_steps, refine_denoise, external_sigmas
+            refine_enabled, refine_scale, refine_steps, refine_denoise, external_sigmas,
+            upscaler=refine_upscaler,
         )
         refine_mode_changed = bool(
             cache_has_segments and _refine_settings_changed(manifest, refine_payload)
@@ -7021,6 +7047,10 @@ class MiniMaxH3Extender:
                             int(audio_context_length),
                             refine_scale,
                         )
+                        # source_video is backed by an open mmap of the cache data
+                        # file. Keeping it alive makes the join's f.truncate() fail
+                        # with PermissionError on Windows. The plan holds clones.
+                        del source_video
                         base_sample_model = install_protection_wrapper(
                             clip_model, protection_plan
                         )
@@ -7111,6 +7141,7 @@ class MiniMaxH3Extender:
                     selected_audio_slots=selected_audio_slots, audio_native_offset=audio_native_offset,
                     seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                     refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
+                    refine_upscaler=refine_upscaler,
                     external_sigmas=external_sigmas, motion=(motion if clip_motion else None),
                     previous_refined_proxy=(previous_proxy if clip_motion else None),
                     context_length=context_length, audio_context_length=audio_context_length,
