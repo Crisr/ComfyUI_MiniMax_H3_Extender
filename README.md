@@ -25,6 +25,11 @@ The two modes are exclusive: turning one on turns the other off. RECAVSR setting
 
 Full explanation, requirements and limits: [docs/RECAVSR_UPSCALE.md](docs/RECAVSR_UPSCALE.md).
 
+Two output fixes come with this release:
+
+- **Filename tokens now expand.** The Final Decode builds its own filenames, so `%date:yyyy-MM-dd%` used to stay literal. It now expands `%date:...%` and `%time:...%`, and a prefix with a slash creates that subfolder.
+- **A locked output file no longer aborts a run.** In `clip_by_clip`, if the previous autosave is still open in a player, the video goes to the next free numbered name instead of failing with `WinError 5`.
+
 ---
 
 ### 🚀 New: v3.0.5 — Latent Refine / Upscale

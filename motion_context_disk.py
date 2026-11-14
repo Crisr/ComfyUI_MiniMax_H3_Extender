@@ -18,6 +18,7 @@ unchanged. This module only changes persistence/execution and final streaming.
 """
 
 import asyncio
+from datetime import datetime
 import json
 import logging
 import math
@@ -1568,18 +1569,89 @@ def _h264_encode_args(ffmpeg, crf, preset, *, force_cpu=False):
     ]
 
 
+_DATE_TOKEN = re.compile(r"%(date|time):([^%]*)%", re.IGNORECASE)
+_JAVA_DATE_PARTS = (
+    ("yyyy", "%Y"), ("yy", "%y"),
+    ("MM", "%m"), ("dd", "%d"),
+    ("HH", "%H"), ("hh", "%I"),
+    ("mm", "%M"), ("ss", "%S"),
+)
+
+
+def _expand_filename_tokens(prefix):
+    """Expand ComfyUI-style %date:yyyy-MM-dd% and %time:HH-mm-ss% tokens.
+
+    The Final Decode builds its own filenames, so ComfyUI never expands the
+    prefix for it. Unknown tokens stay untouched.
+    """
+    def replace(match):
+        pattern = match.group(2)
+        if not pattern.strip():
+            return match.group(0)
+        for token, directive in _JAVA_DATE_PARTS:
+            pattern = pattern.replace(token, directive)
+        try:
+            return datetime.now().strftime(pattern)
+        except ValueError:
+            return match.group(0)
+
+    return _DATE_TOKEN.sub(replace, str(prefix))
+
+
+def _relative_output_parts(prefix):
+    """Safe relative path parts; subfolders are kept, '..' and absolutes drop."""
+    text = _expand_filename_tokens(prefix).replace("\\", "/")
+    parts = [part for part in text.split("/") if part.strip() not in ("", ".", "..")]
+    parts = [_safe_name(part) for part in parts if part.strip()]
+    return parts or ["h3_video"]
+
+
+def _output_target(output_dir, prefix, extension):
+    """Resolve a prefix to one output Path, creating any dated subfolder."""
+    parts = _relative_output_parts(prefix)
+    directory = Path(output_dir)
+    if len(parts) > 1:
+        directory = directory.joinpath(*parts[:-1])
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{parts[-1]}.{extension}"
+
+
 def _next_output_path(output_dir, prefix, extension):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = _safe_name(prefix)
-    first = output_dir / f"{stem}.{extension}"
+    first = _output_target(output_dir, prefix, extension)
     if not first.exists():
         return first
     for i in range(1, 1000000):
-        p = output_dir / f"{stem}_{i:05d}.{extension}"
+        p = first.parent / f"{first.stem}_{i:05d}.{extension}"
         if not p.exists():
             return p
     raise RuntimeError("Disk Final Decode: could not allocate output filename.")
+
+
+def _replace_locked_source(tmp, destination, *, attempts=3, delay=0.4):
+    """os.replace, but a locked destination costs a new name, not the whole run.
+
+    Windows raises WinError 5 when a player, a preview pane or a scanner still
+    holds the previous autosave open. After a few retries the file goes to the
+    next free numbered name instead.
+    """
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, destination)
+            return destination
+        except PermissionError as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay * (attempt + 1))
+    fallback = _next_output_path(
+        destination.parent, destination.stem, destination.suffix.lstrip(".")
+    )
+    os.replace(tmp, fallback)
+    _LOG.warning(
+        "H3 Final Decode: %s is locked (%s); wrote %s instead",
+        destination, last_error, fallback,
+    )
+    return fallback
 
 
 def _replace_output_from_preview(
@@ -1592,8 +1664,8 @@ def _replace_output_from_preview(
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    destination = output_dir / f"{_safe_name(filename_prefix)}.mp4"
-    tmp = output_dir / f".{destination.stem}.{uuid.uuid4().hex[:10]}.tmp.mp4"
+    destination = _output_target(output_dir, filename_prefix, "mp4")
+    tmp = destination.parent / f".{destination.stem}.{uuid.uuid4().hex[:10]}.tmp.mp4"
     try:
         if ffmpeg is not None and _timeline_has_color(color_timeline):
             _apply_color_timeline_to_file(
@@ -1609,14 +1681,13 @@ def _replace_output_from_preview(
                 os.link(Path(preview_path), tmp)
             except OSError:
                 shutil.copy2(Path(preview_path), tmp)
-        os.replace(tmp, destination)
+        return _replace_locked_source(tmp, destination)
     finally:
         try:
             if tmp.exists():
                 tmp.unlink()
         except OSError:
             pass
-    return destination
 
 
 def _start_video_encoder(

@@ -77,6 +77,10 @@ Two files stay on disk:
 The Final Decode node returns the upscaled file, and the workflow metadata is
 embedded in it.
 
+The `filename_prefix` token `%date:yyyy-MM-dd%` and `%time:...%` are expanded by
+the Extender itself, and a slash in the prefix creates that subfolder. Without a
+prefix, files go straight into the output directory.
+
 ReCaVSR encodes the upscaled video with its own encoder. The Final Decode
 `codec`, `crf` and `preset` therefore describe the **source** file only.
 
