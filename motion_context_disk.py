@@ -2837,8 +2837,10 @@ def _embed_final_metadata_in_place(source_path, workflow=None, prompt=None):
             raise RuntimeError(
                 f"H3 Final Decode metadata embedding failed with ffmpeg code {proc.returncode}.\n{tail}"
             )
-        os.replace(temp_path, source)
-        return source
+        # A player, a preview pane or a scanner can hold the finished MP4
+        # open on Windows and make os.replace fail with WinError 5. The
+        # retrying helper keeps the run alive and falls back to a new name.
+        return _replace_locked_source(temp_path, source)
     finally:
         for path in (metadata_path, log_path, temp_path):
             try:
@@ -6883,7 +6885,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             out_dir=out_dir,
             filename_prefix=filename_prefix,
         )
-        _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+        output_path = _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
         project_autosave_info = _maybe_auto_save_project(
             cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames
         )
