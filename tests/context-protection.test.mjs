@@ -87,3 +87,23 @@ test("serialized workflow keeps the per-clip protection source", () => {
         [null, "a", null],
     );
 });
+
+test("invalid restored widget values fall back to their declared defaults", () => {
+    const context = makeContext();
+    const repair = (name, value) =>
+        vm.runInContext(`repairedWidgetValue(${JSON.stringify(name)}, ${JSON.stringify(value)})`, context);
+    // The exact shift a stale positional restore produced in the field.
+    assert.equal(repair("protection_noise_fade", "learned"), "auto");
+    assert.equal(repair("protection_noise_fade", ""), "auto");
+    assert.equal(repair("protection_audio_feather", "both"), 0);
+    assert.equal(repair("protection_late_lock_slots", "learned"), "both");
+    // Valid values pass through, and numbers are clamped, not replaced.
+    assert.equal(repair("protection_noise_fade", "ethanfel"), "ethanfel");
+    assert.equal(repair("protection_audio_feather", "8"), 8);
+    assert.equal(repair("protection_audio_feather", 99), 64);
+    assert.equal(repair("protection_noise_strength", "0.75"), 0.75);
+    assert.equal(repair("protection_noise_strength", 2), 1);
+    assert.equal(repair("protection_late_step", "abc"), 1);
+    assert.equal(repair("refine_upscaler", "learned"), "learned");
+    assert.equal(repair("refine_upscaler", "nearest"), "learned");
+});

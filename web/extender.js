@@ -2367,6 +2367,55 @@ function seedProtectionWidgets(node) {
     }
 }
 
+// ComfyUI restores `widgets_values` by position. A workflow saved while this
+// node had a different widget order therefore arrives with values shifted onto
+// neighbouring names, and ComfyUI rejects the whole prompt at validation. Each
+// rule below is the same contract the Python INPUT_TYPES declares, so an
+// impossible value is replaced by its default instead of blocking the run.
+const WIDGET_VALUE_RULES = {
+    refine_upscaler: { choices: ["learned", "trilinear"], fallback: "learned" },
+    protection_noise_fade: {
+        choices: ["auto", "linear", "ease", "ethanfel"],
+        fallback: "auto",
+    },
+    protection_late_lock_slots: {
+        choices: ["both", "capstone", "keystone"],
+        fallback: "both",
+    },
+    protection_late_step: { min: 0, max: 999, integer: true, fallback: 1 },
+    protection_audio_feather: { min: 0, max: 64, integer: true, fallback: 0 },
+    protection_noise_strength: { min: 0, max: 1, fallback: 0.5 },
+};
+
+function repairedWidgetValue(name, raw) {
+    const rule = WIDGET_VALUE_RULES[name];
+    if (!rule) return raw;
+    if (rule.choices) return rule.choices.includes(raw) ? raw : rule.fallback;
+    const text = typeof raw === "string" ? raw.trim() : raw;
+    const number = Number(text);
+    if (text === "" || text === null || text === undefined || !Number.isFinite(number)) {
+        return rule.fallback;
+    }
+    const clamped = Math.min(rule.max, Math.max(rule.min, number));
+    return rule.integer ? Math.round(clamped) : clamped;
+}
+
+function repairProtectionWidgetValues(node) {
+    for (const name of Object.keys(WIDGET_VALUE_RULES)) {
+        const widget = getWidget(node, name);
+        if (!widget) continue;
+        const current = widget.value;
+        if (current === undefined || current === null || current === "") continue;
+        const fixed = repairedWidgetValue(name, current);
+        if (fixed === current) continue;
+        console.warn(
+            `[H3 Extender] ${name} held ${JSON.stringify(current)}; reset to ${JSON.stringify(fixed)}. ` +
+            "The saved workflow was written with a different widget order."
+        );
+        setWidgetValue(node, name, fixed);
+    }
+}
+
 // Nodes 2.0 renders each native widget as a row inside an explicit-row CSS grid
 // ([data-testid="node-widgets"]). The grid's children are one section div per
 // widget, auto-placed in DOM order, so moving a section to the front of the grid
@@ -7577,6 +7626,7 @@ function buildUi(node) {
     // the space row would render empty instead of LAB. Seed the defaults here,
     // at node construction; the mode sync then pushes them into the Vue store.
     seedColorMatchWidgets(node);
+    repairProtectionWidgetValues(node);
     seedProtectionWidgets(node);
 
     const state = parseState(jsonWidget.value);
@@ -8465,6 +8515,11 @@ function buildUi(node) {
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {
         const result = oldConfigure ? oldConfigure.apply(this, arguments) : undefined;
+
+        // Repair values a stale positional restore put on the wrong widget.
+        // This runs after LGraphNode.configure() restored the native values and
+        // before ComfyUI can queue a prompt with them.
+        repairProtectionWidgetValues(this);
 
         // Keep only the legacy resolution migration here. Native ComfyUI
         // configure() already restored clips_json/refs_json/generation_mode by
