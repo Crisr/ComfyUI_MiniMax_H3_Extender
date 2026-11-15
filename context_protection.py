@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from typing import Any
 
 import torch
@@ -28,6 +29,16 @@ class MaskedContext:
     trim_frames: int
 
 
+# Fade shapes for the held-context ramp. "auto" follows the legacy
+# protection_noise_ease switch, so a saved project reproduces its old output.
+NOISE_FADE_CHOICES = ("auto", "linear", "ease", "ethanfel")
+LATE_LOCK_SLOT_CHOICES = ("both", "capstone", "keystone")
+# ethanfel's drift_control recipe: full weight over the held run, then a taper
+# of this many latents down to zero at the join.
+ETHANFEL_TAPER = 4
+AUDIO_FEATHER_MAX = 64
+
+
 @dataclass(frozen=True)
 class ProtectionSettings:
     enabled: bool
@@ -36,6 +47,10 @@ class ProtectionSettings:
     late_step: int
     noise_strength: float
     noise_ease: bool
+    # Appended with defaults: positional constructions keep working.
+    noise_fade: str = "auto"
+    audio_feather: int = 0
+    late_lock_slots: str = "both"
 
 
 def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
@@ -56,6 +71,11 @@ def _clamp_float(value: Any, default: float, low: float, high: float) -> float:
     return max(low, min(high, number))
 
 
+def _choice(value: Any, default: str, choices) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in choices else default
+
+
 def normalize_protection_settings(
     enabled=False,
     keystone=True,
@@ -63,6 +83,9 @@ def normalize_protection_settings(
     late_step=1,
     noise_strength=0.5,
     noise_ease=True,
+    noise_fade="auto",
+    audio_feather=0,
+    late_lock_slots="both",
 ) -> ProtectionSettings:
     return ProtectionSettings(
         enabled=bool(enabled),
@@ -71,7 +94,70 @@ def normalize_protection_settings(
         late_step=_clamp_int(late_step, 1, 0, 999),
         noise_strength=_clamp_float(noise_strength, 0.5, 0.0, 1.0),
         noise_ease=bool(noise_ease),
+        noise_fade=_choice(noise_fade, "auto", NOISE_FADE_CHOICES),
+        audio_feather=_clamp_int(audio_feather, 0, 0, AUDIO_FEATHER_MAX),
+        late_lock_slots=_choice(late_lock_slots, "both", LATE_LOCK_SLOT_CHOICES),
     )
+
+
+def resolve_noise_fade(settings: ProtectionSettings) -> str:
+    """Return the concrete ramp shape, keeping "auto" legacy-compatible."""
+    mode = str(settings.noise_fade or "auto").strip().lower()
+    if mode in ("linear", "ease", "ethanfel"):
+        return mode
+    return "ease" if settings.noise_ease else "linear"
+
+
+def ethanfel_weights(count: int, taper: int = ETHANFEL_TAPER) -> list:
+    """Hold at full weight, then taper the last slots down to zero at the join."""
+    steps = max(0, int(count))
+    edge = max(1, int(taper))
+    weights = []
+    for index in range(steps):
+        remaining = steps - 1 - index
+        weights.append(1.0 if remaining >= edge else remaining / float(edge))
+    return weights
+
+
+def audio_feather_weights(ticks: int, length: int) -> list:
+    """Half-cosine release over the last ``ticks`` held audio steps.
+
+    The first weight sits next to the free side of the join and is close to 1;
+    deeper steps fall to 0. Same shape Geiru applies with audio_feather_ticks.
+    """
+    count = max(0, min(int(ticks), int(length)))
+    weights = []
+    for index in range(count):
+        phase = (count - index) / float(count + 1)
+        weights.append(0.5 - 0.5 * math.cos(math.pi * phase))
+    return weights
+
+
+def build_context_noise_mask(
+    count: int,
+    strength: float,
+    ease: bool,
+    *,
+    device=None,
+    dtype=torch.float32,
+    fade=None,
+) -> torch.Tensor:
+    """Build a held-context ramp that reaches zero at the newest slot."""
+    steps = max(0, int(count))
+    peak = _clamp_float(strength, 0.5, 0.0, 1.0)
+    mode = _choice(fade, "ease" if ease else "linear", NOISE_FADE_CHOICES)
+    if mode == "auto":
+        mode = "ease" if ease else "linear"
+    if mode == "ethanfel":
+        weights = ethanfel_weights(steps)
+    else:
+        weights = []
+        for index in range(steps):
+            position = index / max(1, steps - 1)
+            remaining = 1.0 - position
+            weights.append(remaining * remaining if mode == "ease" else remaining)
+    values = [peak * weight for weight in weights]
+    return torch.tensor(values, device=device, dtype=dtype).reshape(1, 1, steps, 1, 1)
 
 
 def capstone_index(video_latent_length: int) -> int:
@@ -82,26 +168,6 @@ def capstone_index(video_latent_length: int) -> int:
     return 5 * ((length - 1) // 5)
 
 
-def build_context_noise_mask(
-    count: int,
-    strength: float,
-    ease: bool,
-    *,
-    device=None,
-    dtype=torch.float32,
-) -> torch.Tensor:
-    """Build a held-context ramp that reaches zero at the newest slot."""
-    steps = max(0, int(count))
-    peak = _clamp_float(strength, 0.5, 0.0, 1.0)
-    values = []
-    for index in range(steps):
-        position = index / max(1, steps - 1)
-        remaining = 1.0 - position
-        weight = remaining * remaining if ease else remaining
-        values.append(peak * weight)
-    return torch.tensor(values, device=device, dtype=dtype).reshape(1, 1, steps, 1, 1)
-
-
 def build_masked_context(
     target_video,
     target_audio,
@@ -110,6 +176,8 @@ def build_masked_context(
     noise_strength=0.5,
     noise_ease=True,
     trim_frames=0,
+    noise_fade=None,
+    audio_feather=0,
 ) -> MaskedContext:
     """Overlay exact held latent values and their sampling masks."""
     if target_video.ndim != 5 or held_video.ndim != 5:
@@ -146,6 +214,7 @@ def build_masked_context(
         noise_ease,
         device=target_video.device,
         dtype=target_video.dtype,
+        fade=noise_fade,
     )
     video_mask[:, :, :held_steps] = ramp
 
@@ -155,6 +224,12 @@ def build_masked_context(
         dtype=target_audio.dtype,
     )
     audio_mask[..., :held_audio_steps] = 0.0
+    # Feather the free edge of the held audio: the last steps hand the sound
+    # over to the sampler instead of cutting it dead at the join.
+    for index, weight in enumerate(
+        audio_feather_weights(audio_feather, held_audio_steps)
+    ):
+        audio_mask[..., held_audio_steps - 1 - index] = weight
     return MaskedContext(
         video=video,
         audio=audio,
@@ -177,11 +252,23 @@ class ProtectionPlan:
     source_clip_id: str
     source_index: int
     signature: str
+    # Appended with defaults so existing constructions keep working.
+    noise_fade: str = "linear"
+    noise_strength: float = 0.5
+    audio_feather: int = 0
+    late_lock_slots: str = "both"
+
+
+def late_step_fits(settings: ProtectionSettings, sigmas) -> bool:
+    """True when the configured Late Lock step exists in this sigma schedule."""
+    count = int(len(sigmas)) if sigmas is not None else 0
+    step = int(settings.late_step)
+    return 0 <= step < count - 1
 
 
 def validate_late_step(settings: ProtectionSettings, sigmas) -> None:
-    count = int(len(sigmas)) if sigmas is not None else 0
-    if int(settings.late_step) < 0 or int(settings.late_step) >= count - 1:
+    if not late_step_fits(settings, sigmas):
+        count = int(len(sigmas)) if sigmas is not None else 0
         raise ValueError(
             "Context protection: Late Lock step "
             f"{int(settings.late_step)} is outside the active sigma schedule "
@@ -212,8 +299,16 @@ def make_protection_plan(
     context_length,
     audio_context_length,
     refine_scale=1.0,
+    clamp_late_step=False,
 ) -> ProtectionPlan:
-    validate_late_step(settings, sigmas)
+    # The base pass owns the hard error: a step the user configured must exist
+    # there. The refine pass often runs fewer steps, so it clamps instead and
+    # keeps the keystone locked for the whole pass.
+    if clamp_late_step:
+        late_step = int(settings.late_step) if late_step_fits(settings, sigmas) else 0
+    else:
+        validate_late_step(settings, sigmas)
+        late_step = int(settings.late_step)
     if not torch.is_tensor(source_video) or source_video.ndim != 5:
         raise ValueError("Context protection: source must be a 5D video latent.")
     if int(source_video.shape[2]) < 1:
@@ -255,10 +350,14 @@ def make_protection_plan(
         masked=updated,
         keystone=keystone,
         capstone=capstone,
-        late_step=int(settings.late_step),
+        late_step=int(late_step),
         source_clip_id=str(source_clip_id),
         source_index=int(source_index),
         signature=signature,
+        noise_fade=resolve_noise_fade(settings),
+        noise_strength=float(settings.noise_strength),
+        audio_feather=int(settings.audio_feather),
+        late_lock_slots=str(settings.late_lock_slots),
     )
 
 
@@ -323,7 +422,8 @@ def make_late_lock_mask_function(plan: ProtectionPlan):
             return mask
         sigmas = (extra_options or {}).get("sigmas")
         step = resolve_sampler_step(sigma, sigmas)
-        value = 1.0 if step < int(plan.late_step) else 0.0
+        opens = str(plan.late_lock_slots) in ("both", "keystone")
+        value = 1.0 if (opens and step < int(plan.late_step)) else 0.0
         video = plan.masked.video
         channels, steps, height, width = (int(v) for v in video.shape[1:])
         n_video = channels * steps * height * width
@@ -368,6 +468,29 @@ def _fit_mask_length(mask, length, dim):
     return torch.cat((mask, tail), dim=dim)
 
 
+def _ethanfel_step_mask(plan, held, step, sigmas, like):
+    """Rebuild the held ramp for this step, scaled by the step's noise drop.
+
+    ethanfel's drift_control recipe: full weight across the held run, a short
+    taper to the join, then scale by next/current sigma so the ramp follows the
+    sampler instead of staying fixed for the whole run.
+    """
+    weights = ethanfel_weights(held)
+    scale = 1.0
+    if torch.is_tensor(sigmas) and int(sigmas.numel()) > 0:
+        flat = sigmas.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+        index = max(0, min(int(step), int(flat.numel()) - 1))
+        current = float(flat[index])
+        following = float(flat[index + 1]) if index + 1 < int(flat.numel()) else 0.0
+        if current > 0.0:
+            scale = max(0.0, min(1.0, following / current))
+    peak = float(plan.noise_strength)
+    values = [peak * weight * scale for weight in weights]
+    return torch.tensor(values, device=like.device, dtype=like.dtype).reshape(
+        1, 1, len(values), 1, 1
+    )
+
+
 def make_protection_wrapper(plan: ProtectionPlan):
     def wrapper(
         executor,
@@ -400,12 +523,22 @@ def make_protection_wrapper(plan: ProtectionPlan):
             plan_prefix = _fit_mask_length(
                 plan_video_mask, int(video.shape[2]), 2
             )[:, :, :held]
-            active_video_mask[:, :, :held] = torch.maximum(
-                active_video_mask[:, :, :held], plan_prefix
-            )
+            if str(plan.noise_fade) == "ethanfel":
+                # This ramp is rebuilt for the step, so it owns the prefix
+                # instead of merging with the fixed ramp already installed.
+                active_video_mask[:, :, :held] = _ethanfel_step_mask(
+                    plan, held, step, sigmas, active_video_mask
+                )
+            else:
+                active_video_mask[:, :, :held] = torch.maximum(
+                    active_video_mask[:, :, :held], plan_prefix
+                )
             # Late Lock owns the keystone slot: locked before the step, free at
             # and after it. Existing caller masks remain chained elsewhere.
-            active_video_mask[:, :, 0] = 1.0 if step < int(plan.late_step) else 0.0
+            opens = str(plan.late_lock_slots) in ("both", "keystone")
+            active_video_mask[:, :, 0] = (
+                1.0 if (opens and step < int(plan.late_step)) else 0.0
+            )
         active_audio_mask = audio_denoise_mask
 
         if step < int(plan.late_step):
@@ -477,10 +610,20 @@ def restore_samples(samples, plan):
     restored_audio = audio.clone()
     restored_video[:, :, :plan.masked.video_steps] = plan.masked.held_video
     restored_audio[..., :plan.masked.audio_steps] = plan.masked.held_audio
+    # Hand the feathered steps back to the sampler: the held value keeps
+    # (1 - w) of the step and the generated value takes w. A hard restore would
+    # otherwise undo the mask feather.
+    for index, weight in enumerate(
+        audio_feather_weights(plan.audio_feather, plan.masked.audio_steps)
+    ):
+        column = plan.masked.audio_steps - 1 - index
+        kept = plan.masked.held_audio[..., column] * (1.0 - weight)
+        generated = audio[..., column] * weight
+        restored_audio[..., column] = (kept + generated).to(restored_audio.dtype)
     if isinstance(samples, tuple):
-        return (restored_video, *samples[1:])
+        return (restored_video, restored_audio, *samples[2:])
     if isinstance(samples, list):
-        return [restored_video, *samples[1:]]
+        return [restored_video, restored_audio, *samples[2:]]
     if bool(getattr(samples, "is_nested", False)):
         tensors = list(samples.tensors)
         tensors[0] = restored_video
@@ -562,6 +705,9 @@ def protection_signature(
         "late_step": int(settings.late_step),
         "noise_strength": float(settings.noise_strength),
         "noise_ease": bool(settings.noise_ease),
+        "noise_fade": resolve_noise_fade(settings),
+        "audio_feather": int(settings.audio_feather),
+        "late_lock_slots": str(settings.late_lock_slots),
         "sigmas": sigma_values,
         "context_length": str(context_length),
         "audio_context_length": int(audio_context_length),

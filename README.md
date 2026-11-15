@@ -14,6 +14,30 @@ Apart from possible bug fixes or compatibility corrections, I do not currently p
 
 ---
 
+### 🚀 New: v3.2.0 — Context protection upgrades
+
+Context protection gained three opt-in options, taken from a study of the
+[Geiru Context Suite](https://github.com/roycho87/geiru_context_suite):
+
+- **`protection_noise_fade`** — the held-context curve: `auto`, `linear`, `ease`
+  or `ethanfel`. `ethanfel` rebuilds the ramp on every sampler step, with a
+  4-step taper to the join scaled by the sigma drop.
+- **`protection_audio_feather`** — a half-cosine release over N held audio steps.
+  The sound hands over to the sampler instead of stopping dead at the join.
+- **`protection_late_lock_slots`** — whether Late Lock owns `both` slots, the
+  `capstone` only, or the `keystone` only.
+
+The defaults (`auto`, `0`, `both`) reproduce the previous output exactly.
+`auto` reads the old `protection_noise_ease` switch.
+
+Two defects are fixed in the same pass: `restore_samples` returned the restored
+audio only for nested sample containers, and one mask test expected the wrong
+value at the join.
+
+Full explanation and the Geiru comparison: [docs/CONTEXT_PROTECTION.md](docs/CONTEXT_PROTECTION.md).
+
+---
+
 ### 🚀 New: v3.1.0 — ReCaVSR final-video upscale
 
 An optional **RECAVSR** button now sits right after **REFINE** in the Extender toolbar.

@@ -52,6 +52,22 @@ test("options expose only earlier clips plus None", () => {
     assert.deepEqual(Array.from(options, (item) => item.value), ["", "a", "b"]);
 });
 
+test("protection widgets ship the opt-in defaults", () => {
+    const context = makeContext();
+    const defaults = vm.runInContext("PROTECTION_WIDGET_DEFAULTS", context);
+    assert.equal(defaults.protection_noise_fade, "auto");
+    assert.equal(defaults.protection_audio_feather, 0);
+    assert.equal(defaults.protection_late_lock_slots, "both");
+    const widgets = Array.from(vm.runInContext("PROJECT_WIDGETS", context));
+    for (const name of [
+        "protection_noise_fade",
+        "protection_audio_feather",
+        "protection_late_lock_slots",
+    ]) {
+        assert.ok(widgets.includes(name), `${name} missing from PROJECT_WIDGETS`);
+    }
+});
+
 test("serialized workflow keeps the per-clip protection source", () => {
     const context = makeContext();
     context.runtime = {

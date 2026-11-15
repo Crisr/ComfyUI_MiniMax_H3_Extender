@@ -60,6 +60,7 @@ from .context_protection import (
     protection_signature,
     resolve_source_index,
     restore_samples,
+    late_step_fits,
     validate_late_step,
 )
 from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
@@ -2840,7 +2841,12 @@ def _refine_ref2va_sample(
         refine_sigmas = _effective_sample_sigmas(
             clip_model, external_sigmas, refine_denoise, scheduler, refine_steps
         )
-        validate_late_step(protection_settings, refine_sigmas)
+        if not late_step_fits(protection_settings, refine_sigmas):
+            _LOG.info(
+                "Context protection: Late Lock inactive on the refine pass "
+                "(%d sigma values).",
+                int(len(refine_sigmas)),
+            )
         if motion is None:
             raise RuntimeError(
                 "MiniMax H3 Extender: Context Protection refine requires Motion Context."
@@ -2861,6 +2867,8 @@ def _refine_ref2va_sample(
             int(audio_context_length),
             protection_settings.noise_strength,
             protection_settings.noise_ease,
+            noise_fade=protection_settings.noise_fade,
+            audio_feather=protection_settings.audio_feather,
         )
         protection_plan = make_protection_plan(
             masked,
@@ -2872,6 +2880,7 @@ def _refine_ref2va_sample(
             str(context_length),
             int(audio_context_length),
             refine_scale,
+            clamp_late_step=True,
         )
         clip_model = install_protection_wrapper(clip_model, protection_plan)
         del refined_source
@@ -5046,6 +5055,7 @@ PROJECT_SETTING_NAMES = (
     "resolution_mode", "megapixels", "refs_json", "generation_mode", "motion_context",
     "context_protection", "protection_keystone", "protection_capstone",
     "protection_late_step", "protection_noise_strength", "protection_noise_ease",
+    "protection_noise_fade", "protection_audio_feather", "protection_late_lock_slots",
     "recavsr_enabled", "recavsr_scale", "recavsr_color_fix", "recavsr_seed",
 )
 
@@ -5310,6 +5320,21 @@ class MiniMaxH3Extender:
             "recavsr_seed": (
                 "INT",
                 {"default": 42, "min": 0, "max": 0xFFFFFFFF, "step": 1},
+            ),
+            # Appended after every legacy widget. These refine the latent
+            # protection only, and their defaults keep older projects on the
+            # exact output they had before the widgets existed.
+            "protection_noise_fade": (
+                ["auto", "linear", "ease", "ethanfel"],
+                {"default": "auto", "tooltip": "Shape of the held-context noise ramp. 'auto' follows the protection_noise_ease switch; 'ethanfel' tapers the last 4 latents and rescales every step. Changing this invalidates protected clips."},
+            ),
+            "protection_audio_feather": (
+                "INT",
+                {"default": 0, "min": 0, "max": 64, "step": 1, "tooltip": "Half-cosine release over this many held audio steps at the join. 0 keeps the hard edge, 8 is about 0.2 s. Changing this invalidates protected clips."},
+            ),
+            "protection_late_lock_slots": (
+                ["both", "capstone", "keystone"],
+                {"default": "both", "tooltip": "Which slot Late Lock opens before protection_late_step. 'capstone' keeps the keystone locked for the whole pass, so the pose stays free."},
             ),
             # Appended after every legacy widget. Selects how Refine enlarges
             # the video latent: the learned 3D conv upscaler, or a direct
@@ -6213,6 +6238,9 @@ class MiniMaxH3Extender:
         recavsr_scale=2.0,
         recavsr_color_fix="none",
         recavsr_seed=42,
+        protection_noise_fade="auto",
+        protection_audio_feather=0,
+        protection_late_lock_slots="both",
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -6243,6 +6271,9 @@ class MiniMaxH3Extender:
             late_step=protection_late_step,
             noise_strength=protection_noise_strength,
             noise_ease=protection_noise_ease,
+            noise_fade=protection_noise_fade,
+            audio_feather=protection_audio_feather,
+            late_lock_slots=protection_late_lock_slots,
         )
         protection_sigmas = sample_sigmas
         if (
@@ -6674,8 +6705,14 @@ class MiniMaxH3Extender:
                     refine_scale,
                 )
                 validate_late_step(protection_settings, protection_sigmas)
-                if refine_enabled:
-                    validate_late_step(protection_settings, refine_protection_sigmas)
+                if refine_enabled and not late_step_fits(
+                    protection_settings, refine_protection_sigmas
+                ):
+                    _LOG.info(
+                        "Context protection: Late Lock inactive on the refine "
+                        "pass (%d sigma values).",
+                        int(len(refine_protection_sigmas)),
+                    )
 
             # Refresh manifest state every iteration because Disk Join can
             # truncate or append the physical chain.
@@ -7035,6 +7072,8 @@ class MiniMaxH3Extender:
                             int(audio_context_length),
                             protection_settings.noise_strength,
                             protection_settings.noise_ease,
+                            noise_fade=protection_settings.noise_fade,
+                            audio_feather=protection_settings.audio_feather,
                         )
                         protection_plan = make_protection_plan(
                             masked,

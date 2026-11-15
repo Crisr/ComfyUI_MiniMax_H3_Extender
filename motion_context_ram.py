@@ -574,6 +574,8 @@ class MiniMaxH3MotionContextRAM:
         audio_context_length,
         noise_strength=0.5,
         noise_ease=True,
+        noise_fade=None,
+        audio_feather=0,
     ):
         """Copy held AV context into the target latent; no conditioning change."""
         target_video, target_audio = _streams_from_latent(latent, "latent")
@@ -622,6 +624,8 @@ class MiniMaxH3MotionContextRAM:
             noise_strength=noise_strength,
             noise_ease=noise_ease,
             trim_frames=span,
+            noise_fade=noise_fade,
+            audio_feather=audio_feather,
         )
         _LOG.info(
             "MiniMax H3 Motion Context RAM: masked %d video and %d audio "

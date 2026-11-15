@@ -6,18 +6,23 @@ import torch
 
 from context_protection import (
     ProtectionSettings,
+    _ethanfel_step_mask,
     apply_masked_samples,
+    audio_feather_weights,
     build_context_noise_mask,
     build_masked_context,
     capstone_index,
+    ethanfel_weights,
     make_late_lock_mask_function,
     make_protection_plan,
     make_protection_wrapper,
+    late_step_fits,
     normalize_protection_settings,
     normalize_protection_source,
     protected_denoise_mask,
     protection_cache_mismatch,
     protection_signature,
+    resolve_noise_fade,
     resolve_sampler_step,
     resolve_source_index,
     restore_samples,
@@ -105,7 +110,9 @@ class MaskedContextTests(unittest.TestCase):
         self.assertTrue(torch.equal(ctx.audio[..., :15], held_audio))
         self.assertTrue(torch.equal(ctx.audio[..., 15:], target_audio[..., 15:]))
         self.assertEqual(ctx.video_mask.shape, (1, 1, 6, 4, 4))
-        self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 1.0, 1.0, 1.0, 1.0])
+        # The ramp reaches 0 at the newest held slot, so the join frame is kept
+        # clean and only the frames the shot makes start at 1.
+        self.assertEqual(ctx.video_mask[0, 0, :, 0, 0].tolist(), [0.5, 0.25, 0.0, 1.0, 1.0, 1.0])
         self.assertEqual(ctx.audio_mask.shape, (1, 1, 1, 30))
         self.assertEqual(ctx.audio_mask[0, 0, 0, :16].tolist(), [0.0] * 15 + [1.0])
         self.assertEqual(ctx.trim_frames, 9)
@@ -164,6 +171,23 @@ class ProtectionPlanTests(unittest.TestCase):
                 masked, torch.zeros(1, 2, 22, 4, 4), "clip_1", 0, settings,
                 torch.tensor([1.0, 0.5, 0.0]), "22", 0,
             )
+
+    def test_plan_clamps_late_step_for_a_short_refine_schedule(self):
+        # The refine pass can run fewer steps than the base pass. It must not
+        # refuse to sample; it keeps the keystone locked for the whole pass.
+        settings = ProtectionSettings(True, True, False, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.0]), "22", 0,
+            clamp_late_step=True,
+        )
+        self.assertEqual(plan.late_step, 0)
+
+    def test_late_step_fits_reports_the_short_schedule(self):
+        settings = ProtectionSettings(True, True, False, 1, 0.5, True)
+        self.assertTrue(late_step_fits(settings, torch.tensor([1.0, 0.5, 0.0])))
+        self.assertFalse(late_step_fits(settings, torch.tensor([1.0, 0.0])))
+        self.assertFalse(late_step_fits(settings, None))
 
     def test_plan_skips_capstone_for_short_source(self):
         settings = ProtectionSettings(True, True, True, 1, 0.5, True)
@@ -347,6 +371,140 @@ class ProtectionPlanTests(unittest.TestCase):
         self.assertEqual(float(before_video[0, :, 0].max()), 1.0)
         self.assertEqual(float(after_video[0, :, 0].max()), 0.0)
         self.assertEqual(float(before[:, :, 2 * 6 * 4 * 4 :].min()), 1.0)
+
+
+class ProtectionFadeTests(unittest.TestCase):
+    @staticmethod
+    def _masked(**overrides):
+        options = dict(noise_strength=0.5, noise_ease=False, trim_frames=9)
+        options.update(overrides)
+        return build_masked_context(
+            torch.zeros(1, 2, 6, 4, 4), torch.zeros(1, 2, 2, 30),
+            torch.ones(1, 2, 3, 4, 4), torch.ones(1, 2, 2, 15),
+            **options,
+        )
+
+    @staticmethod
+    def _plan(settings, masked=None):
+        return make_protection_plan(
+            masked if masked is not None else ProtectionFadeTests._masked(),
+            torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0,
+        )
+
+    def test_defaults_keep_the_previous_behaviour(self):
+        settings = normalize_protection_settings(enabled=True)
+        self.assertEqual(settings.noise_fade, "auto")
+        self.assertEqual(settings.audio_feather, 0)
+        self.assertEqual(settings.late_lock_slots, "both")
+        self.assertEqual(resolve_noise_fade(settings), "ease")
+        legacy = build_context_noise_mask(5, 0.5, True)[0, 0, :, 0, 0].tolist()
+        auto = build_context_noise_mask(5, 0.5, True, fade="auto")[0, 0, :, 0, 0].tolist()
+        self.assertEqual(auto, legacy)
+
+    def test_auto_fade_follows_the_legacy_ease_switch(self):
+        self.assertEqual(
+            resolve_noise_fade(ProtectionSettings(True, True, True, 1, 0.5, False)),
+            "linear",
+        )
+        self.assertEqual(
+            resolve_noise_fade(ProtectionSettings(True, True, True, 1, 0.5, True, "ethanfel")),
+            "ethanfel",
+        )
+
+    def test_linear_fade_is_evenly_spaced(self):
+        values = build_context_noise_mask(5, 1.0, True, fade="linear")[0, 0, :, 0, 0].tolist()
+        self.assertEqual(values, [1.0, 0.75, 0.5, 0.25, 0.0])
+
+    def test_ethanfel_holds_then_tapers_to_the_join(self):
+        self.assertEqual(
+            ethanfel_weights(8), [1.0, 1.0, 1.0, 1.0, 0.75, 0.5, 0.25, 0.0]
+        )
+
+    def test_ethanfel_mask_follows_the_step_sigma_drop(self):
+        plan = self._plan(ProtectionSettings(True, False, False, 1, 1.0, True, "ethanfel"))
+        sigmas = torch.tensor([1.0, 0.5, 0.0])
+        like = torch.zeros(1, 1, 6, 4, 4)
+        first = _ethanfel_step_mask(plan, 3, 0, sigmas, like)[0, 0, :, 0, 0].tolist()
+        last = _ethanfel_step_mask(plan, 3, 1, sigmas, like)[0, 0, :, 0, 0].tolist()
+        self.assertEqual(first, [0.25, 0.125, 0.0])
+        self.assertEqual(last, [0.0, 0.0, 0.0])
+
+    def test_audio_feather_releases_the_join(self):
+        ctx = self._masked(audio_feather=3)
+        values = ctx.audio_mask[0, 0, 0, :16].tolist()
+        self.assertEqual(values[:12], [0.0] * 12)
+        self.assertAlmostEqual(values[12], 0.1464, places=3)
+        self.assertAlmostEqual(values[13], 0.5, places=3)
+        self.assertAlmostEqual(values[14], 0.8536, places=3)
+        self.assertEqual(values[15], 1.0)
+
+    def test_audio_feather_survives_restore_as_a_blend(self):
+        plan = self._plan(
+            ProtectionSettings(True, False, True, 1, 1.0, True, audio_feather=2)
+        )
+        restored = restore_samples(
+            (torch.zeros(1, 2, 6, 4, 4), torch.zeros(1, 2, 2, 30)), plan
+        )
+        self.assertAlmostEqual(float(restored[1][0, 0, 0, 14]), 0.25, places=4)
+        self.assertAlmostEqual(float(restored[1][0, 0, 0, 13]), 0.75, places=4)
+        self.assertEqual(float(restored[1][0, 0, 0, 12]), 1.0)
+
+    def test_zero_feather_keeps_the_hard_edge(self):
+        ctx = self._masked()
+        self.assertEqual(
+            ctx.audio_mask[0, 0, 0, :16].tolist(), [0.0] * 15 + [1.0]
+        )
+
+    def test_capstone_only_late_lock_keeps_the_keystone_locked(self):
+        plan = self._plan(
+            ProtectionSettings(True, True, False, 1, 0.5, True, late_lock_slots="capstone")
+        )
+        lock = make_late_lock_mask_function(plan)
+        before = lock(
+            torch.tensor(1.0), torch.zeros(1, 1, 6, 4, 4),
+            {"sigmas": torch.tensor([1.0, 0.5, 0.0])},
+        )
+        self.assertEqual(float(before[0, 0, 0].max()), 0.0)
+
+    def test_keystone_only_late_lock_still_opens_the_front_slot(self):
+        plan = self._plan(
+            ProtectionSettings(True, True, False, 1, 0.5, True, late_lock_slots="keystone")
+        )
+        lock = make_late_lock_mask_function(plan)
+        before = lock(
+            torch.tensor(1.0), torch.zeros(1, 1, 6, 4, 4),
+            {"sigmas": torch.tensor([1.0, 0.5, 0.0])},
+        )
+        self.assertEqual(float(before[0, 0, 0].max()), 1.0)
+
+    def test_signature_changes_with_fade_feather_and_slots(self):
+        sigmas = torch.tensor([1.0, 0.5, 0.0])
+        base = protection_signature(
+            "clip_1", ProtectionSettings(True, True, True, 1, 0.5, True), sigmas, "22", 0
+        )
+        self.assertNotEqual(
+            base,
+            protection_signature(
+                "clip_1", ProtectionSettings(True, True, True, 1, 0.5, True, "ethanfel"),
+                sigmas, "22", 0,
+            ),
+        )
+        self.assertNotEqual(
+            base,
+            protection_signature(
+                "clip_1", ProtectionSettings(True, True, True, 1, 0.5, True, audio_feather=4),
+                sigmas, "22", 0,
+            ),
+        )
+        self.assertNotEqual(
+            base,
+            protection_signature(
+                "clip_1",
+                ProtectionSettings(True, True, True, 1, 0.5, True, late_lock_slots="capstone"),
+                sigmas, "22", 0,
+            ),
+        )
 
 
 class SourceResolutionTests(unittest.TestCase):

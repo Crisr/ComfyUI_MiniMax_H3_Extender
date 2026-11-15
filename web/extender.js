@@ -106,6 +106,9 @@ const PROJECT_WIDGETS = [
     "protection_late_step",
     "protection_noise_strength",
     "protection_noise_ease",
+    "protection_noise_fade",
+    "protection_audio_feather",
+    "protection_late_lock_slots",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -2315,6 +2318,9 @@ const PROTECTION_WIDGET_DEFAULTS = {
     protection_late_step: 1,
     protection_noise_strength: 0.5,
     protection_noise_ease: true,
+    protection_noise_fade: "auto",
+    protection_audio_feather: 0,
+    protection_late_lock_slots: "both",
 };
 const COLOR_MATCH_SPACE_VALUES = ["LAB", "YCbCr", "RGB", "LUV", "YUV", "XYZ"];
 const COLOR_MATCH_FALLBACK_FACTOR = 1.0;
