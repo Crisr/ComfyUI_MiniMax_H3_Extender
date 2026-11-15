@@ -2356,10 +2356,13 @@ function seedColorMatchWidgets(node) {
 }
 
 function seedProtectionWidgets(node) {
-    // Older positional workflow arrays predate these appended widgets.
+    // Older positional workflow arrays predate these appended widgets, so the
+    // restore can leave them undefined or empty.
     for (const [name, value] of Object.entries(PROTECTION_WIDGET_DEFAULTS)) {
         const widget = getWidget(node, name);
-        if (!widget || widget.value !== undefined) continue;
+        if (!widget) continue;
+        const current = widget.value;
+        if (current !== undefined && current !== null && current !== "") continue;
         setWidgetValue(node, name, value);
     }
 }

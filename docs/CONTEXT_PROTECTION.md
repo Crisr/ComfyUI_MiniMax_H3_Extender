@@ -145,6 +145,11 @@ previous output exactly:
 `protection_signature` includes the three values, so changing one drops stale
 protected clips from the cache.
 
+ComfyUI restores a saved workflow's widget values by position, not by name. A
+widget inserted anywhere before the end of `INPUT_TYPES["required"]` therefore
+shifts every older value onto the wrong widget. New widgets belong at the very
+end of that dict; `tests/test_widget_order.py` enforces this.
+
 ## Clip length advice
 
 Geiru notes that H3 audio runs 40 steps a second against 24 video frames. A

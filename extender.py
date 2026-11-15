@@ -5321,9 +5321,19 @@ class MiniMaxH3Extender:
                 "INT",
                 {"default": 42, "min": 0, "max": 0xFFFFFFFF, "step": 1},
             ),
-            # Appended after every legacy widget. These refine the latent
-            # protection only, and their defaults keep older projects on the
-            # exact output they had before the widgets existed.
+            # Appended after every legacy widget. Selects how Refine enlarges
+            # the video latent: the learned 3D conv upscaler, or a direct
+            # trilinear interpolation that skips the model pass entirely.
+            "refine_upscaler": (
+                ["learned", "trilinear"],
+                {"default": "learned", "tooltip": "Refine upscaler. 'learned' runs the H3 3D conv latent upscaler; 'trilinear' skips it for a faster, softer interpolation. Changing this invalidates generated clips."},
+            ),
+            # Appended after every legacy widget, `refine_upscaler` included.
+            # ComfyUI restores saved widget values by position, so a widget that
+            # lands in the middle of this dict shifts the older values onto the
+            # wrong names. New widgets belong at the very end. These refine the
+            # latent protection only, and their defaults keep older projects on
+            # the exact output they had before the widgets existed.
             "protection_noise_fade": (
                 ["auto", "linear", "ease", "ethanfel"],
                 {"default": "auto", "tooltip": "Shape of the held-context noise ramp. 'auto' follows the protection_noise_ease switch; 'ethanfel' tapers the last 4 latents and rescales every step. Changing this invalidates protected clips."},
@@ -5335,13 +5345,6 @@ class MiniMaxH3Extender:
             "protection_late_lock_slots": (
                 ["both", "capstone", "keystone"],
                 {"default": "both", "tooltip": "Which slot Late Lock opens before protection_late_step. 'capstone' keeps the keystone locked for the whole pass, so the pose stays free."},
-            ),
-            # Appended after every legacy widget. Selects how Refine enlarges
-            # the video latent: the learned 3D conv upscaler, or a direct
-            # trilinear interpolation that skips the model pass entirely.
-            "refine_upscaler": (
-                ["learned", "trilinear"],
-                {"default": "learned", "tooltip": "Refine upscaler. 'learned' runs the H3 3D conv latent upscaler; 'trilinear' skips it for a faster, softer interpolation. Changing this invalidates generated clips."},
             ),
         }
 
