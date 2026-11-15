@@ -107,3 +107,19 @@ test("invalid restored widget values fall back to their declared defaults", () =
     assert.equal(repair("refine_upscaler", "learned"), "learned");
     assert.equal(repair("refine_upscaler", "nearest"), "learned");
 });
+
+test("an empty restored widget value is reset instead of skipped", () => {
+    const context = makeContext();
+    const node = {
+        widgets: [
+            { name: "protection_noise_fade", value: "" },
+            { name: "protection_audio_feather", value: "" },
+            { name: "protection_late_lock_slots", value: "" },
+        ],
+    };
+    context.__node = node;
+    vm.runInContext("repairProtectionWidgetValues(__node)", context);
+    assert.equal(node.widgets[0].value, "auto");
+    assert.equal(node.widgets[1].value, 0);
+    assert.equal(node.widgets[2].value, "both");
+});

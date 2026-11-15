@@ -2405,7 +2405,9 @@ function repairProtectionWidgetValues(node) {
         const widget = getWidget(node, name);
         if (!widget) continue;
         const current = widget.value;
-        if (current === undefined || current === null || current === "") continue;
+        // An empty string is a real invalid value here: ComfyUI writes it when a
+        // saved workflow carries fewer widget values than the node now has.
+        if (current === undefined || current === null) continue;
         const fixed = repairedWidgetValue(name, current);
         if (fixed === current) continue;
         console.warn(
@@ -6120,6 +6122,9 @@ function restorePromptUiState(prompt, runtime, clipId) {
 
 function render(node, runtime) {
     const { state, cards, counter, status } = runtime;
+    // ComfyUI's configure() writes widget values after buildUi, so repair again
+    // here: every render path then hands the graph a valid value set.
+    repairProtectionWidgetValues(node);
     // render() rebuilds every card. Capture textarea-local UI state first so
     // long prompts do not jump back to the top after progress/status updates.
     capturePromptUiState(runtime);
