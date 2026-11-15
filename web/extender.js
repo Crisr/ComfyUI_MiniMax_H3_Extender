@@ -7628,6 +7628,12 @@ function buildUi(node) {
     seedColorMatchWidgets(node);
     repairProtectionWidgetValues(node);
     seedProtectionWidgets(node);
+    console.info(
+        "[H3 Extender] widget repair active. protection_noise_fade=%o protection_audio_feather=%o protection_late_lock_slots=%o",
+        getWidget(node, "protection_noise_fade")?.value,
+        getWidget(node, "protection_audio_feather")?.value,
+        getWidget(node, "protection_late_lock_slots")?.value,
+    );
 
     const state = parseState(jsonWidget.value);
     state.refine_enabled = boolValue(refineEnabledWidget.value, false);

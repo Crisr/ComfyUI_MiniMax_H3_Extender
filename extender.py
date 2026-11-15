@@ -6278,6 +6278,14 @@ class MiniMaxH3Extender:
             audio_feather=protection_audio_feather,
             late_lock_slots=protection_late_lock_slots,
         )
+        _LOG.info(
+            "H3 protection inputs: fade=%r feather=%r slots=%r late_step=%s strength=%s",
+            protection_settings.noise_fade,
+            protection_settings.audio_feather,
+            protection_settings.late_lock_slots,
+            protection_settings.late_step,
+            protection_settings.noise_strength,
+        )
         protection_sigmas = sample_sigmas
         if (
             generation_mode == "ref2va"
