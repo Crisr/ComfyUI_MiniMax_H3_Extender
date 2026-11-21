@@ -63,6 +63,7 @@ from .context_protection import (
     late_step_fits,
     validate_late_step,
 )
+from .patcher_keepalive import keep_loaded_patcher
 from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
 from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
 from .latent_upscaler import normalize_upscaler_method, target_dimensions
@@ -2578,6 +2579,14 @@ def _effective_sample_sigmas(model, external_sigmas, denoise, scheduler, steps):
     return resolved
 
 
+# ComfyUI stores a LoadedModel entry for the patcher that load_models_gpu()
+# receives. H3 sampling runs on a temporary patcher: the protection clone from
+# install_protection_wrapper(), or the per-clip LoRA clone. When this function
+# drops that patcher, the entry becomes "dead": the nn.Module is still alive in
+# the executor cache, so cleanup_models() cannot remove the entry and
+# can_unload() skips it. The entry then lives forever and cleanup_models_gc()
+# logs "Potential memory leak" on every later load. Holding the patcher keeps
+# its entry valid until the next load replaces it.
 def _sample_h3(
     model,
     conditioning,
@@ -2621,16 +2630,20 @@ def _sample_h3(
         model, sigmas.shape[-1] - 1, x0_output
     )
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-    samples = guider.sample(
-        noise,
-        latent_image,
-        sampler,
-        sigmas,
-        denoise_mask=noise_mask,
-        callback=callback,
-        disable_pbar=disable_pbar,
-        seed=int(seed),
-    )
+    try:
+        samples = guider.sample(
+            noise,
+            latent_image,
+            sampler,
+            sigmas,
+            denoise_mask=noise_mask,
+            callback=callback,
+            disable_pbar=disable_pbar,
+            seed=int(seed),
+        )
+    finally:
+        # Runs also on interrupt: the entry must stay bound to a live patcher.
+        keep_loaded_patcher(model)
     if protection is not None:
         samples = restore_samples(samples, protection)
     samples = samples.to(comfy.model_management.intermediate_device())
