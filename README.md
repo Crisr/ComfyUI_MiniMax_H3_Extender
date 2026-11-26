@@ -38,16 +38,14 @@ Full explanation and the Geiru comparison: [docs/CONTEXT_PROTECTION.md](docs/CON
 
 ---
 
-### 🚀 New: v3.1.0 — ReCaVSR final-video upscale
+### 🚀 New: v3.1.0 — DENSEREFINE refine mode
 
-An optional **RECAVSR** button now sits right after **REFINE** in the Extender toolbar.
+A second refine button, **DENSEREFINE**, now sits right after **REFINE** in the Extender toolbar.
 
-- **REFINE** upscales the H3 latent before sampling. It changes the cache geometry and invalidates generated clips.
-- **RECAVSR** upscales the finished final video with the separate **ComfyUI-ReCaVSR** custom node. It runs after Final Decode, never touches the cache, and keeps the original file on disk beside the upscaled one.
+- **REFINE** upscales the H3 latent before sampling and runs the refine pass with Veda sparse attention.
+- **DENSEREFINE** runs the same pass with the same settings, but asks for the model's own full attention. Use it when sparse attention runs out of VRAM and would fall back to many small chunks.
 
-The two modes are exclusive: turning one on turns the other off. RECAVSR settings are **Scale**, **Colour fix** and **Seed**, plus the resulting final-video resolution. When the ReCaVSR node is not installed, the button is disabled and its tooltip reads **Install ReCaVSR first.**
-
-Full explanation, requirements and limits: [docs/RECAVSR_UPSCALE.md](docs/RECAVSR_UPSCALE.md).
+Both buttons share the **REFINE SETTINGS** panel. They are exclusive: turning one on turns the other off. Changing either invalidates generated clips, because the refine pass writes the final latent.
 
 Two output fixes come with this release:
 

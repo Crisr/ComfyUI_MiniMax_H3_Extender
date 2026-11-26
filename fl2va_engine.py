@@ -25,8 +25,6 @@ import comfy.utils
 import node_helpers
 from PIL import Image
 
-from .recavsr_pass import apply_recavsr as _apply_recavsr
-
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -2040,15 +2038,6 @@ def export_fl2va_final(
         manifest=manifest,
     )
 
-    # ReCaVSR is export-only: upscale the finished container, then embed the
-    # workflow metadata into the file the user receives. The source stays on
-    # disk beside the upscaled file.
-    output_path = _apply_recavsr(
-        output_path,
-        manifest.get("recavsr_mode"),
-        out_dir=out_dir,
-        filename_prefix=filename_prefix,
-    )
     d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
     project_autosave_info = d._maybe_auto_save_project(
         cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames

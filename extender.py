@@ -67,10 +67,6 @@ from .patcher_keepalive import keep_loaded_patcher
 from .motion_context_ram import MiniMaxH3MotionContextRAM, _streams_from_latent
 from .latent_refine_engine import upscale_for_refine, preserve_first_pass_audio
 from .latent_upscaler import normalize_upscaler_method, target_dimensions
-from .recavsr_pass import (
-    normalize_settings as _normalize_recavsr_settings,
-    status as _recavsr_status,
-)
 from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
 from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
 from .motion_context_disk import (
@@ -2598,6 +2594,8 @@ def _sample_h3(
     denoise: float,
     sigmas=None,
     protection=None,
+    dense_attention: bool = False,
+    vram_tag: str = "",
 ):
     guider = _BasicGuider(model)
     guider.set_conds(conditioning)
@@ -2626,10 +2624,32 @@ def _sample_h3(
     noise = comfy.sample.prepare_noise(latent_image, int(seed), batch_inds)
 
     x0_output = {}
-    callback = latent_preview.prepare_callback(
+    preview_callback = latent_preview.prepare_callback(
         model, sigmas.shape[-1] - 1, x0_output
     )
+    vram_logged = False
+
+    def callback(step, x0, total_steps):
+        # The first step runs after ComfyUI has staged the weights, so this is
+        # the first reading that describes the sampling state, not the idle one.
+        nonlocal vram_logged
+        if vram_tag and not vram_logged:
+            vram_logged = True
+            _log_vram_state(f"{vram_tag} step {step}")
+        preview_callback(step, x0, total_steps)
+
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
+    # DenseRefine: ask every Veda patch on this patcher for the model's own
+    # full attention. The key rides in transformer_options, so it only reaches
+    # this sampling run, and it is removed again below.
+    dense_options = None
+    dense_restore = None
+    if dense_attention:
+        model_options = getattr(model, "model_options", None)
+        if isinstance(model_options, dict):
+            dense_options = model_options.setdefault("transformer_options", {})
+            dense_restore = dense_options.get("veda_force_dense")
+            dense_options["veda_force_dense"] = True
     try:
         samples = guider.sample(
             noise,
@@ -2642,6 +2662,11 @@ def _sample_h3(
             seed=int(seed),
         )
     finally:
+        if dense_options is not None:
+            if dense_restore is None:
+                dense_options.pop("veda_force_dense", None)
+            else:
+                dense_options["veda_force_dense"] = dense_restore
         # Runs also on interrupt: the entry must stay bound to a live patcher.
         keep_loaded_patcher(model)
     if protection is not None:
@@ -2656,7 +2681,7 @@ def _sample_h3(
 
 
 
-def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=None, upscaler="learned"):
+def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=None, upscaler="learned", dense=False):
     enabled = bool(enabled)
     if not enabled:
         return {"enabled": False}
@@ -2679,6 +2704,10 @@ def _refine_settings_payload(enabled, scale, steps, denoise, external_sigmas=Non
     method = str(upscaler or "learned").strip().lower()
     if method != "learned":
         payload["upscaler"] = method
+    # Dense and sparse attention produce different pixels, so the two passes
+    # must never share a cache entry.
+    if dense:
+        payload["attention"] = "dense"
     return payload
 
 
@@ -2687,16 +2716,6 @@ def _refine_settings_changed(manifest, payload):
     if previous is None:
         previous = {"enabled": False}
     return dict(previous) != dict(payload)
-
-
-def _recavsr_ui_state(payload):
-    """ReCaVSR mode plus what the UI needs to disable the button honestly."""
-    state = _recavsr_status()
-    return {
-        "recavsr_mode": dict(payload) if isinstance(payload, dict) else {},
-        "recavsr_node_available": bool(state.get("node")),
-        "recavsr_transformer": str(state.get("transformer") or ""),
-    }
 
 
 def _resize_context_latent_spatial(latent, width: int, height: int):
@@ -2775,6 +2794,28 @@ def _release_models_before_refine(clip_model):
         _LOG.info("H3 Refine preflight: offloaded via ComfyUI: %s", ", ".join(released))
 
 
+def _log_vram_state(tag):
+    """Log the memory views that Veda sizes its chunk budget from.
+
+    `mem_get_info` is the driver/pool view and can read 0 while ComfyUI still
+    holds reserved blocks. Veda's floor then takes over. Never raises: a
+    diagnostic must not break a generation.
+    """
+    try:
+        free = total = reserved = allocated = 0
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            reserved = torch.cuda.memory_reserved()
+            allocated = torch.cuda.memory_allocated()
+        _LOG.info(
+            "H3 VRAM [%s]: mem_get_info free=%.0f / %.0f MB | "
+            "torch reserved=%.0f allocated=%.0f MB",
+            tag, free / 2**20, total / 2**20, reserved / 2**20, allocated / 2**20,
+        )
+    except Exception as exc:  # diagnostics only
+        _LOG.info("H3 VRAM [%s]: unavailable (%s)", tag, exc)
+
+
 
 def _cleanup_full_batch_aimdo_between_clips(generation_mode, clip_index):
     """Mirror ComfyUI's AIMDO per-node cleanup at a Full Batch clip boundary.
@@ -2824,7 +2865,7 @@ def _refine_ref2va_sample(
     context_length="22", audio_context_length=0,
     protection_source_latent=None, protection_settings=None,
     protection_source_id=None, protection_source_index=None,
-    refine_upscaler="learned",
+    refine_upscaler="learned", dense_attention=False,
 ):
     """Direct upscale+refine; returns the sole final sample and refine trim."""
     _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
@@ -2894,6 +2935,7 @@ def _refine_ref2va_sample(
             int(audio_context_length),
             refine_scale,
             clamp_late_step=True,
+            clip_index=clip_index,
         )
         clip_model = install_protection_wrapper(clip_model, protection_plan)
         del refined_source
@@ -2902,12 +2944,15 @@ def _refine_ref2va_sample(
             refine_positive, up_latent, previous_refined_proxy,
             str(context_length), int(audio_context_length),
         )
-    _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
+    _refine_progress(owner, clip_index, clip_count,
+                     f"{'Dense refining' if dense_attention else 'Refining'} clip {clip_index + 1}/{clip_count}")
     _release_models_before_refine(clip_model)
+    _log_vram_state("refine ref2va pre-load")
     refined = _sample_h3(
         clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
         int(refine_steps), float(refine_denoise), sigmas=refine_sigmas,
-        protection=protection_plan,
+        protection=protection_plan, dense_attention=dense_attention,
+        vram_tag="refine ref2va",
     )
     refined = preserve_first_pass_audio(refined, first_audio)
     return refined, refine_trim, out_w, out_h
@@ -2917,7 +2962,7 @@ def _refine_fl2va_sample(
     *, owner, clip_index, clip_count, sampled, clip_model, clip_text_encoder, vae,
     prompt, frame_count, first_frame, last_frame, guide_frames, seed,
     sampler_name, scheduler, refine_scale, refine_steps, refine_denoise, external_sigmas,
-    refine_upscaler="learned",
+    refine_upscaler="learned", dense_attention=False,
 ):
     _refine_progress(owner, clip_index, clip_count, f"Latent upscale clip {clip_index + 1}/{clip_count}")
     up_latent, out_w, out_h, first_audio = upscale_for_refine(
@@ -2931,11 +2976,15 @@ def _refine_fl2va_sample(
         first_frame=first_frame, last_frame=last_frame, guide_frames=guide_frames,
     )
     refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
-    _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
+    _refine_progress(owner, clip_index, clip_count,
+                     f"{'Dense refining' if dense_attention else 'Refining'} clip {clip_index + 1}/{clip_count}")
     _release_models_before_refine(clip_model)
+    _log_vram_state("refine fl2va pre-load")
     refined = _sample_h3(
         clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
         int(refine_steps), float(refine_denoise), sigmas=refine_sigmas,
+        dense_attention=dense_attention,
+        vram_tag="refine fl2va",
     )
     return preserve_first_pass_audio(refined, first_audio), out_w, out_h
 
@@ -5069,7 +5118,7 @@ PROJECT_SETTING_NAMES = (
     "context_protection", "protection_keystone", "protection_capstone",
     "protection_late_step", "protection_noise_strength", "protection_noise_ease",
     "protection_noise_fade", "protection_audio_feather", "protection_late_lock_slots",
-    "recavsr_enabled", "recavsr_scale", "recavsr_color_fix", "recavsr_seed",
+    "dense_refine_enabled",
 )
 
 
@@ -5314,23 +5363,29 @@ class MiniMaxH3Extender:
                 "BOOLEAN",
                 {"default": True, "tooltip": "Ease Context Noise toward zero at the newest held slot."},
             ),
-            # Appended after every legacy widget. ReCaVSR upscales the finished
-            # final video instead of the latent, so these values never change
-            # cache geometry and never invalidate generated clips. The frontend
-            # presents them as the RECAVSR button and its settings panel.
-            "recavsr_enabled": (
+            # Appended after every legacy widget. DenseRefine runs the same
+            # latent refine pass as REFINE, with the same scale, steps, denoise
+            # and upscaler, but asks for the model's own full attention instead
+            # of Veda's sparse approximation. The frontend presents it as the
+            # DENSEREFINE button, exclusive with REFINE.
+            "dense_refine_enabled": (
                 "BOOLEAN",
-                {"default": False, "tooltip": "Upscale the finished final video with ReCaVSR. Needs the ComfyUI-ReCaVSR node. Never invalidates generated clips."},
+                {"default": False, "tooltip": "Refine with full attention. Same settings as REFINE, without sparse attention. Slower at small sizes; faster and lighter when Veda runs out of VRAM. Changing this invalidates generated clips."},
             ),
-            "recavsr_scale": (
+            # Reserved widget slots. DenseRefine replaced the old four-widget
+            # RECAVSR block, and ComfyUI restores saved widget values by
+            # position. These keep every widget after them in place for
+            # projects saved before the switch. The frontend hides them and
+            # nothing reads them.
+            "reserved_float": (
                 "FLOAT",
                 {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.05},
             ),
-            "recavsr_color_fix": (
+            "reserved_choice": (
                 ["none", "adain", "wavelet"],
                 {"default": "none"},
             ),
-            "recavsr_seed": (
+            "reserved_int": (
                 "INT",
                 {"default": 42, "min": 0, "max": 0xFFFFFFFF, "step": 1},
             ),
@@ -5585,7 +5640,7 @@ class MiniMaxH3Extender:
         refine_denoise=0.30,
         refine_upscaler="learned",
         color_match=None,
-        recavsr=None,
+        dense_refine_enabled=False,
     ):
         if fl2va_model is None:
             raise ValueError(
@@ -5646,9 +5701,10 @@ class MiniMaxH3Extender:
             target_dimensions(resolved_width, resolved_height, refine_scale)
             if refine_enabled else (resolved_width, resolved_height)
         )
+        dense_refine_enabled = bool(dense_refine_enabled) and bool(refine_enabled)
         refine_payload = _refine_settings_payload(
             refine_enabled, refine_scale, refine_steps, refine_denoise, sigmas,
-            upscaler=refine_upscaler,
+            upscaler=refine_upscaler, dense=dense_refine_enabled,
         )
         if manifest.get("segments"):
             geometry_changed = bool(
@@ -5688,7 +5744,6 @@ class MiniMaxH3Extender:
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
         manifest = dict(manifest)
         manifest["refine_mode"] = dict(refine_payload)
-        manifest["recavsr_mode"] = _normalize_recavsr_settings(recavsr)
         manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
         manifest["color_match"] = dict(color_match_spec)
         manifest["updated_at"] = time.time()
@@ -5972,6 +6027,7 @@ class MiniMaxH3Extender:
                     seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                     refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
                     refine_upscaler=refine_upscaler,
+                    dense_attention=dense_refine_enabled,
                     external_sigmas=sigmas,
                 )
                 del first_pass
@@ -6199,7 +6255,6 @@ class MiniMaxH3Extender:
             "prompt_pack_signature": str(active_prompt_pack_signature or ""),
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "color_match": dict(color_match_spec),
-            **_recavsr_ui_state(recavsr),
             "build": BUILD,
         }
         return {
@@ -6250,10 +6305,10 @@ class MiniMaxH3Extender:
         protection_late_step=1,
         protection_noise_strength=0.5,
         protection_noise_ease=True,
-        recavsr_enabled=False,
-        recavsr_scale=2.0,
-        recavsr_color_fix="none",
-        recavsr_seed=42,
+        dense_refine_enabled=False,
+        reserved_float=2.0,
+        reserved_choice="none",
+        reserved_int=42,
         protection_noise_fade="auto",
         protection_audio_feather=0,
         protection_late_lock_slots="both",
@@ -6270,14 +6325,7 @@ class MiniMaxH3Extender:
         refine_steps = max(1, int(refine_steps))
         refine_denoise = max(0.01, min(1.0, float(refine_denoise)))
         refine_upscaler = normalize_upscaler_method(refine_upscaler)
-        # ReCaVSR is export-only: no geometry check and no cache invalidation
-        # follows from these values.
-        recavsr_payload = _normalize_recavsr_settings({
-            "enabled": recavsr_enabled,
-            "scale": recavsr_scale,
-            "color_fix": recavsr_color_fix,
-            "seed": recavsr_seed,
-        })
+        dense_refine_enabled = bool(dense_refine_enabled) and refine_enabled
         external_sigmas = kwargs.get("sigmas")
         sample_sigmas = _resolve_sample_sigmas(external_sigmas, denoise)
         protection_settings = normalize_protection_settings(
@@ -6389,7 +6437,7 @@ class MiniMaxH3Extender:
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
                 refine_upscaler=refine_upscaler,
                 color_match=color_match_spec,
-                recavsr=recavsr_payload,
+                dense_refine_enabled=dense_refine_enabled,
             )
 
         if not motion_context:
@@ -6414,7 +6462,7 @@ class MiniMaxH3Extender:
                 refine_steps=refine_steps, refine_denoise=refine_denoise,
                 refine_upscaler=refine_upscaler,
                 color_match=color_match_spec,
-                recavsr=recavsr_payload,
+                dense_refine_enabled=dense_refine_enabled,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -6568,7 +6616,7 @@ class MiniMaxH3Extender:
         )
         refine_payload = _refine_settings_payload(
             refine_enabled, refine_scale, refine_steps, refine_denoise, external_sigmas,
-            upscaler=refine_upscaler,
+            upscaler=refine_upscaler, dense=dense_refine_enabled,
         )
         refine_mode_changed = bool(
             cache_has_segments and _refine_settings_changed(manifest, refine_payload)
@@ -6625,7 +6673,6 @@ class MiniMaxH3Extender:
             ref.get("id") if isinstance(ref, dict) else None for ref in refs
         ]
         manifest["refine_mode"] = dict(refine_payload)
-        manifest["recavsr_mode"] = dict(recavsr_payload)
         manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
         manifest["color_match"] = dict(color_match_spec)
         manifest["updated_at"] = time.time()
@@ -7109,6 +7156,7 @@ class MiniMaxH3Extender:
                             str(context_length),
                             int(audio_context_length),
                             refine_scale,
+                            clip_index=i,
                         )
                         # source_video is backed by an open mmap of the cache data
                         # file. Keeping it alive makes the join's f.truncate() fail
@@ -7179,6 +7227,7 @@ class MiniMaxH3Extender:
                 f"Rendering clip {i + 1}/{len(clips)}",
             )
 
+            _log_vram_state("first pass pre-load")
             sampled = _sample_h3(
                 base_sample_model,
                 positive,
@@ -7190,6 +7239,7 @@ class MiniMaxH3Extender:
                 float(denoise),
                 sigmas=sample_sigmas,
                 protection=protection_plan,
+                vram_tag="first pass",
             )
             if base_sample_model is not clip_model:
                 del base_sample_model
@@ -7205,6 +7255,7 @@ class MiniMaxH3Extender:
                     seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                     refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
                     refine_upscaler=refine_upscaler,
+                    dense_attention=dense_refine_enabled,
                     external_sigmas=external_sigmas, motion=(motion if clip_motion else None),
                     previous_refined_proxy=(previous_proxy if clip_motion else None),
                     context_length=context_length, audio_context_length=audio_context_length,
@@ -7484,7 +7535,6 @@ class MiniMaxH3Extender:
             "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "color_match": dict(color_match_spec),
-            **_recavsr_ui_state(recavsr_payload),
             "build": BUILD,
         }
 

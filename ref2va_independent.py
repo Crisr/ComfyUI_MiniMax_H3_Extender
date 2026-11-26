@@ -629,7 +629,7 @@ def run(
     refine_denoise=0.30,
     refine_upscaler="learned",
     color_match=None,
-    recavsr=None,
+    dense_refine_enabled=False,
 ):
     """Execute Ref2VA with no Motion Context and random-access clip caches."""
     from . import extender as e
@@ -731,7 +731,6 @@ def run(
     manifest["extender_refs_signature"] = refs_signature
     manifest["extender_ref_ids"] = [ref.get("id") if isinstance(ref, dict) else None for ref in refs]
     manifest["refine_mode"] = dict(refine_payload)
-    manifest["recavsr_mode"] = e._normalize_recavsr_settings(recavsr)
     manifest["base_resolution"] = {"width": resolved_width, "height": resolved_height}
     manifest["updated_at"] = time.time()
     d._write_json_atomic(manifest_path, manifest)
@@ -1069,6 +1068,7 @@ def run(
                 seed=cfg["seed"], sampler_name=str(sampler_name), scheduler=str(scheduler),
                 refine_scale=refine_scale, refine_steps=refine_steps, refine_denoise=refine_denoise,
                 refine_upscaler=refine_upscaler,
+                dense_attention=dense_refine_enabled,
                 external_sigmas=sigmas, motion=None, previous_refined_proxy=None,
             )
             del first_pass
@@ -1289,7 +1289,6 @@ def run(
         "prompt_pack_count": int(len(external_prompt_pack.get("prompts") or [])) if external_prompt_pack is not None else 0,
         "prompt_pack_signature": str(active_prompt_pack_signature or ""),
         "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
-        **e._recavsr_ui_state(recavsr),
         "build": e.BUILD,
     }
     return {

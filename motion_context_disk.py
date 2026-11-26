@@ -61,7 +61,6 @@ from .motion_context_ram import (
     _steps_for_frames,
     _streams_from_latent,
 )
-from .recavsr_pass import apply_recavsr as _apply_recavsr
 
 BUILD = "motion-context-disk-v3.0.12"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
@@ -6682,8 +6681,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 preview_path, out_dir, filename_prefix,
                 ffmpeg=ffmpeg, color_timeline=color_timeline,
             )
-            # clip_by_clip keeps its progressive autosave un-upscaled: ReCaVSR
-            # runs only on the Full Batch final export, once per finished video.
+            # clip_by_clip keeps its progressive autosave as the exact decode;
+            # the Full Batch final export owns the finished video.
             _embed_final_metadata_in_place(autosave_path, workflow=workflow, prompt=prompt)
             progress.advance()
 
@@ -6877,14 +6876,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             manifest=manifest,
         )
 
-        # ReCaVSR runs on the finished container, after the exact segment export.
-        # It never touches the clip cache, and the source file stays on disk.
-        output_path = _apply_recavsr(
-            output_path,
-            manifest.get("recavsr_mode"),
-            out_dir=out_dir,
-            filename_prefix=filename_prefix,
-        )
         output_path = _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
         project_autosave_info = _maybe_auto_save_project(
             cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames
