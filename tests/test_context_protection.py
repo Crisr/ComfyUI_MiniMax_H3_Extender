@@ -197,6 +197,42 @@ class ProtectionPlanTests(unittest.TestCase):
         )
         self.assertIsNone(plan.capstone)
 
+    def test_plan_skips_capstone_when_source_is_the_previous_clip(self):
+        # In a forward chain the source clip's ending is already the held
+        # context at the start of this clip. Pinning it again at the end pulls
+        # the generated tail back into the previous clip's last frame, so the
+        # next clip continues from a loop-back instead of the new action.
+        settings = ProtectionSettings(True, False, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0, clip_index=1,
+        )
+        self.assertIsNone(plan.capstone)
+
+    def test_skipped_capstone_uses_the_capstone_off_signature(self):
+        # A segment rendered before this guard still carries the applied
+        # capstone. Its stored signature must not match, so the cache reports
+        # the mismatch instead of reusing the loop-back tail.
+        sigmas = torch.tensor([1.0, 0.5, 0.0])
+        source = torch.zeros(1, 2, 25, 4, 4)
+        on = ProtectionSettings(True, False, True, 1, 0.5, True)
+        off = ProtectionSettings(True, False, False, 1, 0.5, True)
+        skipped = make_protection_plan(
+            self._fake_masked(), source, "clip_1", 0, on, sigmas, "22", 0, clip_index=1,
+        )
+        disabled = make_protection_plan(
+            self._fake_masked(), source, "clip_1", 0, off, sigmas, "22", 0, clip_index=1,
+        )
+        self.assertEqual(skipped.signature, disabled.signature)
+
+    def test_plan_keeps_capstone_for_a_non_adjacent_source(self):
+        settings = ProtectionSettings(True, False, True, 1, 0.5, True)
+        plan = make_protection_plan(
+            self._fake_masked(), torch.zeros(1, 2, 25, 4, 4), "clip_1", 0, settings,
+            torch.tensor([1.0, 0.5, 0.0]), "22", 0, clip_index=2,
+        )
+        self.assertIsNotNone(plan.capstone)
+
     def test_protection_wrapper_delays_front_mask_before_late_step(self):
         settings = ProtectionSettings(True, True, True, 1, 0.5, True)
         plan = make_protection_plan(

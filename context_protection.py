@@ -7,13 +7,17 @@ cache signatures used by the masked-context path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
+import logging
 import math
 from typing import Any
 
 import torch
+
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -300,6 +304,7 @@ def make_protection_plan(
     audio_context_length,
     refine_scale=1.0,
     clamp_late_step=False,
+    clip_index=None,
 ) -> ProtectionPlan:
     # The base pass owns the hard error: a step the user configured must exist
     # there. The refine pass often runs fewer steps, so it clamps instead and
@@ -328,7 +333,29 @@ def make_protection_plan(
     # Slot 0 is owned by Keystone / Late Lock: locked unless Late Lock opens it.
     video_mask[:, :, 0] = 0.0
 
+    effective_settings = settings
     capstone = extract_capstone(source_video) if settings.capstone else None
+    if (
+        capstone is not None
+        and clip_index is not None
+        and source_index is not None
+        and int(source_index) == int(clip_index) - 1
+    ):
+        # A forward chain already holds the source clip's ending at the start of
+        # this clip. Pinning the same block at the end pulls the generated tail
+        # back into it, so the next clip continues from a loop-back frame
+        # instead of the new action. A deliberate loop-back names an older
+        # source clip and keeps its capstone.
+        capstone = None
+        effective_settings = replace(settings, capstone=False)
+        if not clamp_late_step:
+            _LOG.warning(
+                "H3 Context Protection: Capstone ignored for clip %s because its "
+                "source %r is the previous clip in the chain; that source ending is "
+                "already the held context. Turn Capstone off to silence this.",
+                int(clip_index) + 1,
+                source_clip_id,
+            )
     if capstone is not None:
         capstone = capstone.to(device=sampling_video.device, dtype=sampling_video.dtype)
     updated = MaskedContext(
@@ -343,7 +370,7 @@ def make_protection_plan(
         trim_frames=masked.trim_frames,
     )
     signature = protection_signature(
-        source_clip_id, settings, sigmas, context_length,
+        source_clip_id, effective_settings, sigmas, context_length,
         audio_context_length, refine_scale,
     )
     return ProtectionPlan(
